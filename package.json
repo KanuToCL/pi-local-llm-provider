@@ -1,0 +1,37 @@
+{
+  "name": "pi-local-llm-provider",
+  "version": "0.0.1",
+  "description": "Configs, probe, and docs for using pi-mono with local LLMs (Unsloth Studio, Ollama, LM Studio, vLLM).",
+  "license": "MIT",
+  "author": "Sergio Pena <https://sergiopena.audio> (@KanuToCL)",
+  "homepage": "https://github.com/KanuToCL/pi-local-llm-provider",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/KanuToCL/pi-local-llm-provider.git"
+  },
+  "bugs": {
+    "url": "https://github.com/KanuToCL/pi-local-llm-provider/issues"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "probe": "node scripts/probe-toolcalls.js"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-mono",
+    "pi-coding-agent",
+    "local-llm",
+    "unsloth",
+    "unsloth-studio",
+    "ollama",
+    "lm-studio",
+    "vllm",
+    "openai-compatible",
+    "qwen",
+    "qwen3",
+    "tool-calling"
+  ]
+}

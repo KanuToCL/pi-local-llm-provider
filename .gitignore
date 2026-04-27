@@ -1,0 +1,28 @@
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm/
+package-lock.json
+
+# Env / secrets — never commit
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+.config/
+
+# pi-mono dirs that might land here from local probing
+.pi/
+.audit-venv/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

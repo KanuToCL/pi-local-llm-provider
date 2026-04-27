@@ -1,0 +1,37 @@
+{
+  "_comment": "pi-mono custom-provider config for Unsloth Studio. Drop this into ~/.pi/agent/models.json (or merge with existing). Then `chmod 600 ~/.pi/agent/models.json`. Pre-req: probe-toolcalls.js exits 0 against this endpoint.",
+
+  "providers": {
+    "unsloth-studio": {
+      "type": "openai-completions",
+      "baseUrl": "http://localhost:8888/v1",
+      "apiKey": "$UNSLOTH_API_KEY",
+
+      "models": [
+        {
+          "id": "unsloth/Qwen3.6-27B-GGUF",
+          "name": "Qwen3.6 27B (Unsloth Studio, local)",
+          "contextWindow": 32768,
+          "maxTokens": 16384,
+          "tools": true,
+          "reasoning": true,
+
+          "compat": {
+            "thinkingFormat": "qwen-chat-template",
+            "supportsDeveloperRole": false,
+            "supportsReasoningEffort": false,
+            "maxTokensField": "max_tokens"
+          },
+
+          "cost": {
+            "_comment": "Required by pi-mono's calculateCost — local backends MUST declare 0 or pi will report fake dollars per turn.",
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        }
+      ]
+    }
+  }
+}
