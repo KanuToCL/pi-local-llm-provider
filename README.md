@@ -72,6 +72,34 @@ Inside an interactive `pi` session:
 
 To add another local model (e.g. a second GGUF you've loaded into Studio), just append another entry to the `models[]` array in `~/.pi/agent/models.json` and reopen `/model`.
 
+## GGUF variants (Unsloth Studio)
+
+A single Studio model id like `unsloth/Qwen3.6-27B-GGUF` is actually a *family* of GGUF quantizations (`Q3_K_M`, `Q4_K_M`, `UD-Q4_K_XL`, `Q5_K_M`, `Q8_0`, …). Studio exposes only the **base id** through its OpenAI-compat `/v1` layer — pi-mono can't see or pick a variant. Whichever variant Studio has loaded *is* what pi will hit.
+
+**Why it matters for agent work:** quantization directly affects tool-call schema fidelity. Q2/Q3 frequently omit required arguments on multi-arg tools (e.g. pi's `edit({path, edits: [...]})` shows up as `edit({path})` and pi rejects the call locally with a validation error, which then poisons the next turn). Use **Q4_K_M or UD-Q4_K_XL minimum** for coding-agent loops.
+
+### Check which variant is loaded
+
+```bash
+node scripts/studio-variant.js
+# active_model:  unsloth/Qwen3.6-27B-GGUF
+# gguf_variant:  UD-Q4_K_XL    ← this is what actually answers your requests
+# loaded:        ["unsloth/Qwen3.6-27B-GGUF"]
+```
+
+The script reads Studio's `GET /api/inference/status` and warns if a Q2/Q3 variant is loaded.
+
+### Switch variants
+
+The OpenAI `/v1` endpoint **silently ignores** any variant suffix in the model id (`unsloth/Qwen3.6-27B-GGUF:Q4_K_M`, `:UD-Q4_K_XL`, etc. all route to whatever's loaded). To change variants:
+
+1. Open Studio's web UI at `http://localhost:8888`
+2. Use the model picker to load the variant you want (e.g. `UD-Q4_K_XL`)
+3. Re-run `node scripts/studio-variant.js` to confirm
+4. pi keeps using the same `--model "unsloth/Qwen3.6-27B-GGUF"` — no config change needed
+
+If you swap variants constantly, run two Studio instances on different ports and add two providers in `models.json` (`unsloth-studio-q4` on `:8888`, `unsloth-studio-q8` on `:8889`).
+
 ## Schema notes (pi-mono ≥ 0.70)
 
 The `models.json` schema pi-mono actually reads (per `<pi-coding-agent>/docs/models.md`):
