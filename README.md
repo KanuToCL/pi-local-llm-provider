@@ -80,6 +80,9 @@ A single Studio model id like `unsloth/Qwen3.6-27B-GGUF` is actually a *family* 
 
 ### Check which variant is loaded
 
+Two ways:
+
+**Outside pi (CLI):**
 ```bash
 node scripts/studio-variant.js
 # active_model:  unsloth/Qwen3.6-27B-GGUF
@@ -87,7 +90,15 @@ node scripts/studio-variant.js
 # loaded:        ["unsloth/Qwen3.6-27B-GGUF"]
 ```
 
-The script reads Studio's `GET /api/inference/status` and warns if a Q2/Q3 variant is loaded.
+**Inside a pi session (slash command):**
+```bash
+cp extensions/studio-variant.ts ~/.pi/agent/extensions/
+# then in any pi session:
+/studio-variant
+# → unsloth/Qwen3.6-27B-GGUF · variant=UD-Q4_K_XL · reasoning=true
+```
+
+The extension auto-loads from `~/.pi/agent/extensions/` (no `pi install` needed) and uses `pi.registerCommand`. Both paths read Studio's `GET /api/inference/status` and warn if a Q2/Q3 variant is loaded.
 
 ### Switch variants
 
