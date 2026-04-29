@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>How Caterpillars Work 🐛</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800&display=swap');
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Nunito', sans-serif;
+            background: linear-gradient(135deg, #e0f7e0, #c8e6c9, #a5d6a7);
+            color: #2e3d2e;
+            min-height: 100vh;
+            overflow-x: hidden;
+        }
+
+        /* Floating leaves background */
+        body::before {
+            content: "🍃 🌿 🍀 🌱 🍃 🌿 🍀 🌱 🍃 🌿 🍀 🌱";
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            font-size: 2rem;
+            opacity: 0.15;
+            pointer-events: none;
+            z-index: 0;
+            letter-spacing: 2rem;
+            line-height: 4rem;
+        }
+
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 2rem;
+            position: relative;
+            z-index: 1;
+        }
+
+        /* ── Header ── */
+        header {
+            text-align: center;
+            padding: 3rem 0;
+            animation: fadeIn 1s ease;
+        }
+
+        header h1 {
+            font-size: 3rem;
+            font-weight: 800;
+            background: linear-gradient(135deg, #2e7d32, #66bb6a, #a5d6a7);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            margin-bottom: 0.5rem;
+        }
+
+        header p {
+            font-size: 1.2rem;
+            color: #558b5f;
+            font-weight: 600;
+        }
+
+        /* Hero caterpillar animation */
+        .hero-caterpillar {
+            text-align: center;
+            font-size: 4rem;
+            margin: 2rem 0;
+            animation: bounce 2s infinite;
+        }
+
+        /* ── Section Cards ── */
+        .section {
+            background: rgba(255, 255, 255, 0.85);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            padding: 2rem;
+            margin: 2rem 0;
+            box-shadow: 0 8px 32px rgba(46, 125, 50, 0.15);
+            border: 2px solid rgba(102, 187, 106, 0.3);
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+        }
+
+        .section:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 12px 40px rgba(46, 125, 50, 0.25);
+        }
+
+        .section h2 {
+            font-size: 1.8rem;
+            font-weight: 800;
+            color: #2e7d32;
+            margin-bottom: 1rem;
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        .section h2 .emoji {
+            font-size: 2rem;
+        }
+
+        .section p, .section li {
+            font-size: 1.05rem;
+            line-height: 1.8;
+            color: #3d5a3d;
+        }
+
+        .section ul {
+            list-style: none;
+            padding: 0;
+        }
+
+        .section ul li {
+            padding: 0.5rem 0;
+            padding-left: 1.5rem;
+            position: relative;
+        }
+
+        .section ul li::before {
+            content: "🌿";
+            position: absolute;
+            left: 0;
+        }
+
+        /* ── Lifecycle Diagram ── */
+        .lifecycle {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 1rem;
+            flex-wrap: wrap;
+            margin: 2rem 0;
+        }
+
+        .lifecycle-step {
+            background: linear-gradient(145deg, #ffffff, #e8f5e9);
+            border-radius: 16px;
+            padding: 1.5rem;
+            text-align: center;
+            width: 160px;
+            box-shadow: 0 4px 16px rgba(46, 125, 50, 0.12);
+            border: 2px solid #a5d6a7;
+            transition: transform 0.3s ease;
+        }
+
+        .lifecycle-step:hover {
+            transform: scale(1.08);
+        }
+
+        .lifecycle-step .icon {
+            font-size: 3rem;
+            display: block;
+            margin-bottom: 0.5rem;
+        }
+
+        .lifecycle-step .label {
+            font-weight: 700;
+            color: #2e7d32;
+            font-size: 0.95rem;
+        }
+
+        .lifecycle-step .duration {
+            font-size: 0.8rem;
+            color: #78909c;
+            margin-top: 0.25rem;
+        }
+
+        .arrow {
+            font-size: 2rem;
+            color: #66bb6a;
+            font-weight: bold;
+        }
+
+        /* ── Fun Facts Grid ── */
+        .fun-facts {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1.5rem;
+            margin-top: 1.5rem;
+        }
+
+        .fact-card {
+            background: linear-gradient(145deg, #f1f8e9, #dcedc8);
+            border-radius: 16px;
+            padding: 1.5rem;
+            text-align: center;
+            border: 2px solid #c5e1a5;
+            transition: transform 0.3s ease;
+        }
+
+        .fact-card:hover {
+            transform: scale(1.05);
+        }
+
+        .fact-card .fact-icon {
+            font-size: 2.5rem;
+            margin-bottom: 0.5rem;
+        }
+
+        .fact-card .fact-text {
+            font-size: 0.95rem;
+            color: #33691e;
+            font-weight: 600;
+        }
+
+        /* ── Anatomy Diagram ── */
+        .anatomy {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 1.5rem;
+            margin-top: 1.5rem;
+        }
+
+        .anatomy-part {
+            flex: 1;
+            min-width: 180px;
+            background: linear-gradient(145deg, #ffffff, #e8f5e9);
+            border-radius: 16px;
+            padding: 1.5rem;
+            border: 2px solid #a5d6a7;
+        }
+
+        .anatomy-part .part-icon {
+            font-size: 2rem;
+            margin-bottom: 0.5rem;
+        }
+
+        .anatomy-part h3 {
+            color: #2e7d32;
+            font-size: 1.1rem;
+            margin-bottom: 0.5rem;
+        }
+
+        .anatomy-part p {
+            font-size: 0.9rem;
+            color: #558b5f;
+        }
+
+        /* ── Molting Timeline ── */
+        .molting-timeline {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+            margin: 1.5rem 0;
+            flex-wrap: wrap;
+        }
+
+        .molt-stage {
+            background: linear-gradient(145deg, #e8f5e9, #c8e6c9);
+            border-radius: 12px;
+            padding: 1rem 1.2rem;
+            text-align: center;
+            border: 2px solid #81c784;
+        }
+
+        .molt-stage .number {
+            font-weight: 800;
+            color: #2e7d32;
+            font-size: 1.2rem;
+        }
+
+        .molt-stage .stage-name {
+            font-size: 0.8rem;
+            color: #558b5f;
+        }
+
+        .molt-arrow {
+            color: #66bb6a;
+            font-size: 1.5rem;
+        }
+
+        /* ── Footer ── */
+        footer {
+            text-align: center;
+            padding: 2rem;
+            color: #558b5f;
+            font-weight: 600;
+            font-size: 0.95rem;
+        }
+
+        footer .footer-emoji {
+            font-size: 1.5rem;
+            margin: 0 0.25rem;
+        }
+
+        /* ── Animations ── */
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(-20px); }
+            to   { opacity: 1; transform: translateY(0); }
+        }
+
+        @keyframes bounce {
+            0%, 100% { transform: translateY(0); }
+            50%      { transform: translateY(-15px); }
+        }
+
+        /* ── Responsive ── */
+        @media (max-width: 600px) {
+            header h1 { font-size: 2rem; }
+            .section h2 { font-size: 1.4rem; }
+            .lifecycle-step { width: 130px; padding: 1rem; }
+            .lifecycle-step .icon { font-size: 2.2rem; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+
+        <!-- ════════ HEADER ════════ -->
+        <header>
+            <h1>How Caterpillars Work</h1>
+            <p>The remarkable journey from tiny egg to butterfly</p>
+        </header>
+
+        <div class="hero-caterpillar">🐛</div>
+
+        <!-- ════════ LIFE CYCLE ════════ -->
+        <section class="section">
+            <h2><span class="emoji">🔄</span> The Life Cycle</h2>
+            <p>Caterpillars are the larval stage of butterflies and moths. Their life cycle is a stunning example of <strong>complete metamorphosis</strong> — one of nature's most dramatic transformations.</p>
+
+            <div class="lifecycle">
+                <div class="lifecycle-step">
+                    <span class="icon">🥚</span>
+                    <span class="label">Egg</span>
+                    <span class="duration">3–7 days</span>
+                </div>
+                <span class="arrow">→</span>
+                <div class="lifecycle-step">
+                    <span class="icon">🐛</span>
+                    <span class="label">Larva</span>
+                    <span class="duration">2–5 weeks</span>
+                </div>
+                <span class="arrow">→</span>
+                <div class="lifecycle-step">
+                    <span class="icon">🫗</span>
+                    <span class="label">Pupa</span>
+                    <span class="duration">1–2 weeks</span>
+                </div>
+                <span class="arrow">→</span>
+                <div class="lifecycle-step">
+                    <span class="icon">🦋</span>
+                    <span class="label">Butterfly</span>
+                    <span class="duration">2–4 weeks</span>
+                </div>
+            </div>
+
+            <p>It all begins when a female butterfly lays tiny eggs on the underside of host plant leaves. When the egg hatches, a tiny caterpillar emerges — and its first meal is often the eggshell it just broke out of!</p>
+        </section>
+
+        <!-- ════════ ANATOMY ════════ -->
+        <section class="section">
+            <h2><span class="emoji">🔬</span> Caterpillar Anatomy</h2>
+            <p>Despite their simple appearance, caterpillars have a surprisingly complex body structure built for one purpose: <strong>eat and grow</strong>.</p>
+
+            <div class="anatomy">
+                <div class="anatomy-part">
+                    <div class="part-icon">🧠</div>
+                    <h3>Head Capsule</h3>
+                    <p>Hard, protective skull-like structure housing compound eyes, antennae, and powerful mandibles for chewing leaves.</p>
+                </div>
+                <div class="anatomy-part">
+                    <div class="part-icon">💪</div>
+                    <h3>Thoracic Legs</h3>
+                    <p>Three pairs of true jointed legs on the thorax segment, used for gripping and climbing.</p>
+                </div>
+                <div class="anatomy-part">
+                    <div class="part-icon">🦶</div>
+                    <h3>Prolegs</h3>
+                    <p>Fleshy, unjointed abdominal "legs" with tiny hooks called crochets that act like velcro on surfaces.</p>
+                </div>
+                <div class="anatomy-part">
+                    <div class="part-icon">🫁</div>
+                    <h3>Spiracles</h3>
+                    <p>Small breathing holes along the sides of the body that let air directly into the tracheal system.</p>
+                </div>
+            </div>
+        </section>
+
+        <!-- ════════ FEEDING ════════ -->
+        <section class="section">
+            <h2><span class="emoji">🍃</span> Feeding &amp; Growth</h2>
+            <p>Caterpillars are eating machines. Some species consume up to <strong>20,000 times their body weight</strong> during their larval stage. This food fuels their incredible growth and eventual transformation.</p>
+
+            <ul>
+                <li>Most caterpillars are <strong>herbivores</strong>, feeding exclusively on plant leaves</li>
+                <li>Some species are <strong>monophagous</strong> — they eat only one type of plant (e.g., monarchs eat only milkweed)</li>
+                <li>Others are <strong>polyphagous</strong> and will eat a wide variety of plants</li>
+                <li>A few rare species are <strong>carnivorous</strong>, feeding on aphids or other small insects</li>
+                <li>They store energy as fat bodies, which fuel metamorphosis inside the chrysalis</li>
+            </ul>
+        </section>
+
+        <!-- ════════ MOLTING ════════ -->
+        <section class="section">
+            <h2><span class="emoji">🔄</span> Molting (Instars)</h2>
+            <p>Because their exoskeleton is rigid, caterpillars must shed it periodically to grow. Each growth phase between molts is called an <strong>instar</strong>. A typical caterpillar goes through 5 instars:</p>
+
+            <div class="molting-timeline">
+                <div class="molt-stage">
+                    <div class="number">1st</div>
+                    <div class="stage-name">Tiny hatcher</div>
+                </div>
+                <span class="molt-arrow">➜</span>
+                <div class="molt-stage">
+                    <div class="number">2nd</div>
+                    <div class="stage-name">Growing</div>
+                </div>
+                <span class="molt-arrow">➜</span>
+                <div class="molt-stage">
+                    <div class="number">3rd</div>
+                    <div class="stage-name">Coloring in</div>
+                </div>
+                <span class="molt-arrow">➜</span>
+                <div class="molt-stage">
+                    <div class="number">4th</div>
+                    <div class="stage-name">Rapid growth</div>
+                </div>
+                <span class="molt-arrow">➜</span>
+                <div class="molt-stage">
+                    <div class="number">5th</div>
+                    <div class="stage-name">Final form</div>
+                </div>
+            </div>
+
+            <p>During each molt, the caterpillar splits its old skin along the back, wriggles free, and briefly rests while the new skin hardens. After the final molt, it stops eating and prepares to pupate.</p>
+        </section>
+
+        <!-- ════════ DEFENSES ════════ -->
+        <section class="section">
+            <h2><span class="emoji">🛡️</span> Defense Mechanisms</h2>
+            <p>Caterpillars are a favorite food of birds, so they've evolved some remarkable defenses to survive:</p>
+
+            <ul>
+                <li><strong>Camouflage</strong> — Many blend perfectly into leaves, twigs, or bird droppings</li>
+                <li><strong>Mimicry</strong> — Some look like snakes or larger, more dangerous creatures</li>
+                <li><strong>Spines &amp; Hairs</strong> — Stinging setae (like gypsy moths) can irritate predators</li>
+                <li><strong>Toxicity</strong> — Monarch caterpillars store milkweed toxins, making them poisonous</li>
+                <li><strong>Startle displays</strong> — Some reveal hidden "false eyes" to shock predators</li>
+                <li><strong>Playing dead</strong> — A few species drop from branches when threatened</li>
+            </ul>
+        </section>
+
+        <!-- ════════ METAMORPHOSIS ════════ -->
+        <section class="section">
+            <h2><span class="emoji">✨</span> Metamorphosis</h2>
+            <p>The most magical stage. Inside the chrysalis (or cocoon for moths), the caterpillar essentially <strong>dissolves and rebuilds itself</strong>. Special clusters of cells called <em>imaginal discs</em> — present since birth — rapidly develop into wings, antennae, compound eyes, and the adult body plan.</p>
+
+            <p>Within about 1–2 weeks, a completely new organism emerges: a winged butterfly, ready to find a mate and start the cycle all over again. It's one of the most profound transformations in the natural world.</p>
+        </section>
+
+        <!-- ════════ FUN FACTS ════════ -->
+        <section class="section">
+            <h2><span class="emoji">🎉</span> Fun Facts</h2>
+
+            <div class="fun-facts">
+                <div class="fact-card">
+                    <div class="fact-icon">👃</div>
+                    <div class="fact-text">Caterpillars "taste" with their feet — they have chemoreceptors on their prolegs!</div>
+                </div>
+                <div class="fact-card">
+                    <div class="fact-icon">💤</div>
+                    <div class="fact-text">They sleep hanging upside down from a silk pad attached to a leaf or twig.</div>
+                </div>
+                <div class="fact-card">
+                    <div class="fact-icon">📏</div>
+                    <div class="fact-text">The largest caterpillar species can grow over 15 cm (6 inches) long.</div>
+                </div>
+                <div class="fact-card">
+                    <div class="fact-icon">🧬</div>
+                    <div class="fact-text">A caterpillar has about 4,000 muscles in its jaw — compared to humans' 20!</div>
+                </div>
+                <div class="fact-card">
+                    <div class="fact-icon">🌈</div>
+                    <div class="fact-text">Some species can change color based on temperature and diet.</div>
+                </div>
+                <div class="fact-card">
+                    <div class="fact-icon">🎵</div>
+                    <div class="fact-text">Caterpillars can hear through tiny openings on their skin — they use vibration sense.</div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ════════ FOOTER ════════ -->
+        <footer>
+            <p>
+                <span class="footer-emoji">🐛</span>
+                Made with curiosity about nature
+                <span class="footer-emoji">🦋</span>
+            </p>
+            <p style="margin-top: 0.5rem; font-size: 0.85rem; opacity: 0.7;">
+                © 2025 — Caterpillar Life Cycle Educational Page
+            </p>
+        </footer>
+
+    </div>
+</body>
+</html>
