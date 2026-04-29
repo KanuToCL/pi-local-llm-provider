@@ -2,7 +2,11 @@
 
 > Use [pi-mono](https://github.com/badlogic/pi-mono) (Mario Zechner's terminal coding agent) backed by a **local LLM** instead of paying for cloud subscriptions. Today supports [Unsloth Studio](https://unsloth.ai/), [Ollama](https://ollama.com/), [LM Studio](https://lmstudio.ai/), and [vLLM](https://vllm.ai/) — anything that speaks the OpenAI `/v1/chat/completions` shape.
 
-Status: **probe-gated**. The integration ships as a single `~/.pi/agent/models.json` config entry per backend (Tier 0). The 30-LOC probe in [`scripts/probe-toolcalls.js`](./scripts/probe-toolcalls.js) decides whether a given backend is viable for pi-mono's tool-calling agent before you commit. See [`docs/DESIGN.md`](./docs/DESIGN.md) for the full architecture + decision tree, and [`RFC.md`](./RFC.md) for the upstream pi-mono PR draft.
+Status: **probe-gated**. The integration ships as a single `~/.pi/agent/models.json` config entry per backend (Tier 0). The 30-LOC probe in [`scripts/probe-toolcalls.js`](./scripts/probe-toolcalls.js) decides whether a given backend is viable for pi-mono's tool-calling agent before you commit.
+
+- [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) — four-layer architecture (Studio → this repo → pi-mono → OpenClaw), data flow, recommended wiring path, failure-mode reference
+- [`docs/DESIGN.md`](./docs/DESIGN.md) — Tier-0 design and decision tree
+- [`RFC.md`](./RFC.md) — upstream pi-mono PR draft
 
 ## Why this exists
 
