@@ -47,6 +47,44 @@ pi --provider unsloth-studio --model "unsloth/Qwen3.6-27B-GGUF" "list files in t
 
 If `~/.pi/agent/models.json` already exists, merge by hand — pi-mono accepts multiple providers in one file.
 
+## Switching and checking models
+
+pi-mono reloads `~/.pi/agent/models.json` every time you open the picker, so no restart is needed after editing.
+
+```bash
+# List every model pi knows about (built-in + your custom providers)
+pi --list-models
+
+# Fuzzy search the list
+pi --list-models qwen
+
+# One-shot run against a specific provider/model
+pi --provider unsloth-studio --model "unsloth/Qwen3.6-27B-GGUF" -p "say hi"
+
+# Provider-prefixed shorthand (no --provider needed)
+pi --model "unsloth-studio/unsloth/Qwen3.6-27B-GGUF" -p "say hi"
+```
+
+Inside an interactive `pi` session:
+- `/model` — open the model picker (TUI)
+- `Ctrl+P` — cycle through models from `--models <patterns>` (e.g. `pi --models "unsloth-studio/*,anthropic/claude-sonnet-4*"`)
+- `/login <provider>` — OAuth/API-key login for cloud providers
+
+To add another local model (e.g. a second GGUF you've loaded into Studio), just append another entry to the `models[]` array in `~/.pi/agent/models.json` and reopen `/model`.
+
+## Schema notes (pi-mono ≥ 0.70)
+
+The `models.json` schema pi-mono actually reads (per `<pi-coding-agent>/docs/models.md`):
+
+| Field | Notes |
+|-------|-------|
+| `api` | **Not** `type`. Values: `openai-completions`, `anthropic-messages`, `google-generative-ai`, `openai-responses`. |
+| `apiKey` | Env var **name** (`"UNSLOTH_API_KEY"`), shell command (`"!op read ..."`), or literal value. No `$` prefix. |
+| `authHeader: true` | Required for `Bearer <key>` auth on OpenAI-compat endpoints. |
+| `input` | `["text"]` or `["text","image"]`. Required. |
+| `cost` | Required (use all zeros for local) or pi reports fake dollars per turn. |
+| `tools` | Not a field — tool-calling capability is decided by the backend at runtime. The probe is what verifies it. |
+
 ## Supported backends
 
 | Backend | Tested model | Status | Example config |

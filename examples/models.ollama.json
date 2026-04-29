@@ -1,32 +1,32 @@
 {
-  "_comment": "pi-mono custom-provider config for Ollama. Drop this into ~/.pi/agent/models.json (or merge with existing). Pre-req: `ollama pull qwen2.5:14b-instruct-q4_K_M` AND probe-toolcalls.js exits 0 against this endpoint.",
+  "_comment": "pi-mono custom-provider config for Ollama. Drop this into ~/.pi/agent/models.json (or merge with existing). Pre-req: `ollama pull qwen2.5:14b-instruct-q4_K_M` AND probe-toolcalls.js exits 0 against this endpoint. Schema reference: <pi-coding-agent>/docs/models.md.",
 
   "providers": {
     "ollama-local": {
-      "type": "openai-completions",
       "baseUrl": "http://localhost:11434/v1",
+      "api": "openai-completions",
       "apiKey": "ollama",
 
       "models": [
         {
           "id": "qwen2.5:14b-instruct-q4_K_M",
           "name": "Qwen2.5 14B (Ollama, local)",
+          "reasoning": false,
+          "input": ["text"],
           "contextWindow": 32768,
           "maxTokens": 8192,
-          "tools": true,
-          "reasoning": false,
-
-          "compat": {
-            "supportsDeveloperRole": false,
-            "supportsReasoningEffort": false,
-            "maxTokensField": "max_tokens"
-          },
 
           "cost": {
             "input": 0,
             "output": 0,
             "cacheRead": 0,
             "cacheWrite": 0
+          },
+
+          "compat": {
+            "supportsDeveloperRole": false,
+            "supportsReasoningEffort": false,
+            "maxTokensField": "max_tokens"
           }
         }
       ]
