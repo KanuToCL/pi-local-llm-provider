@@ -72,6 +72,15 @@ import {
   BaileysNotInstalledError,
 } from "./channels/whatsapp.js";
 import { Heartbeat, type HeartbeatSource } from "./lib/heartbeat.js";
+import {
+  acquireLock,
+  SingleInstanceLockError,
+  type SingleInstanceLockHandle,
+} from "./lib/single-instance-lock.js";
+import {
+  SessionAckTracker,
+  type SessionAckPersistedState,
+} from "./lib/session-ack-tracker.js";
 import type {
   ChannelEvent,
   ChannelId,
@@ -207,6 +216,60 @@ export async function start(opts: DaemonOpts = {}): Promise<RunningDaemon> {
   await ensureSecureDir(home);
   await ensureSecureDir(config.piCommsWorkspace);
 
+  // 2b. Pitfall #11: single-instance lock.  Refuse to start if another
+  //     daemon already holds the lock.  Stale lockfiles (PID dead) are
+  //     reaped automatically.  Acquired BEFORE IPC server bind so two
+  //     daemons cannot race to bind the same socket.  Released by the
+  //     daemon's shutdown handler; if boot itself throws, the catch
+  //     below releases.
+  const lockPath = join(home, "daemon.pid");
+  let singleInstanceLock: SingleInstanceLockHandle;
+  try {
+    singleInstanceLock = await acquireLock(lockPath);
+  } catch (err) {
+    if (err instanceof SingleInstanceLockError) {
+      throw new DaemonBootError(
+        `another pi-comms daemon (pid=${err.pid}) is already running. ` +
+          `Refusing to start to avoid conflict on ${home}.`,
+      );
+    }
+    throw err;
+  }
+
+  let bootSucceeded = false;
+  try {
+    const handle = await bootAfterLock({
+      opts,
+      config,
+      home,
+      testMode,
+      singleInstanceLock,
+    });
+    bootSucceeded = true;
+    return handle;
+  } finally {
+    if (!bootSucceeded) {
+      await singleInstanceLock.release().catch(() => undefined);
+    }
+  }
+}
+
+interface BootAfterLockArgs {
+  opts: DaemonOpts;
+  config: AppConfig;
+  home: string;
+  testMode: boolean;
+  singleInstanceLock: SingleInstanceLockHandle;
+}
+
+/** Continuation of `start()` that runs AFTER the single-instance lock
+ *  has been acquired.  Split out so the lock can be released in a
+ *  single try/finally up in `start()` whenever boot fails. */
+async function bootAfterLock(
+  args: BootAfterLockArgs,
+): Promise<RunningDaemon> {
+  const { opts, config, home, testMode, singleInstanceLock } = args;
+
   // 3. IPC auth token bootstrap. Re-using ensureTokenFile guarantees the
   //    parent dir is mode 0700 and the token file is mode 0600.
   const tokenPath = join(home, "ipc-token");
@@ -289,15 +352,21 @@ export async function start(opts: DaemonOpts = {}): Promise<RunningDaemon> {
 
   // 6. Studio readiness — both the loopback assertion and Phase 4.4 model-
   //    loaded check. Skipped in test mode so the integration smoke can boot
-  //    without a real Studio.
+  //    without a real Studio.  We also capture studioUrl + modelId for the
+  //    cold-start probe wired into SessionManager (Pitfall #20 / FIX-B-1 #4).
+  let coldStartStudioUrl: string | null = null;
+  let coldStartModelId: string | null = null;
+  const fetchFn = opts.fetchFn ?? fetch;
   if (!testMode) {
     const modelsJson = await loadModelsJsonOrFail(config, operatorLogger);
     const studioUrl = extractStudioBaseUrl(modelsJson, config.piCommsDefaultModel);
     assertLoopbackUrl(studioUrl);
+    coldStartStudioUrl = studioUrl;
+    coldStartModelId = extractModelId(config.piCommsDefaultModel);
     await waitForStudioModelLoaded({
       baseUrl: studioUrl,
-      modelId: extractModelId(config.piCommsDefaultModel),
-      fetchFn: opts.fetchFn ?? fetch,
+      modelId: coldStartModelId,
+      fetchFn,
       logger: operatorLogger,
     });
   }
@@ -315,6 +384,19 @@ export async function start(opts: DaemonOpts = {}): Promise<RunningDaemon> {
   const taskState = new TaskStateManager({
     persistencePath: join(home, "task-state.json"),
   });
+
+  // 8b. SessionAckTracker — RS-6 session-boundary detection for /unsand.
+  //     Plan v4.2 §"Session boundary precisely defined".  Replaces the v1
+  //     hardcoded `isFirstUnsandPerSession: () => true` and
+  //     `getUnsandRequiresTerminalAck: () => false` we had before.
+  const sessionAckStore = new JsonStore<SessionAckPersistedState>(
+    join(home, "session-ack-tracker.json"),
+  );
+  const sessionAckTracker = new SessionAckTracker({
+    jsonStore: sessionAckStore,
+    daemonStartTs,
+  });
+  await sessionAckTracker.load();
 
   // 9. Pending confirms registry (in-memory).
   const pendingConfirms = new PendingConfirmsRegistry();
@@ -397,6 +479,20 @@ export async function start(opts: DaemonOpts = {}): Promise<RunningDaemon> {
     onTellEmit: (ts) => {
       lockState.lastTellAt = ts;
     },
+    // Pitfall #20 / FIX-B-1 #4: cold-start suppression.  When the
+    // first auto-promote is about to fire, probe Studio for model-
+    // loaded.  If not loaded, emit "warming up" and reschedule.  In
+    // test mode we have no studio URL — omit the probe entirely so
+    // the auto-promote fires per v3 behavior.
+    isStudioModelLoaded:
+      coldStartStudioUrl && coldStartModelId
+        ? () =>
+            probeStudioModelLoaded({
+              baseUrl: coldStartStudioUrl as string,
+              modelId: coldStartModelId as string,
+              fetchFn,
+            })
+        : undefined,
   });
 
   if (!testMode) {
@@ -536,6 +632,11 @@ export async function start(opts: DaemonOpts = {}): Promise<RunningDaemon> {
     onPanicUnlock: async () => {
       lockState.locked = false;
       operatorLogger.info("unsand_disabled", { reason: "panic_unlock" });
+      // RS-6 rule (c): record the /lock+/unlock cycle so the next
+      // /unsand requires terminal-side ack (per plan v4.2 §"Session
+      // boundary precisely defined").  The tracker persists this
+      // through restart; recordTerminalAck() clears it.
+      sessionAckTracker.recordLockCycle();
     },
     onAlive: () => {
       // RS-1 dead-man heartbeat bump. Touch the file mtime so the dead-man
@@ -593,7 +694,18 @@ export async function start(opts: DaemonOpts = {}): Promise<RunningDaemon> {
       }
     },
     getLastTellAt: () => lockState.lastTellAt,
-    isFirstUnsandPerSession: () => true,
+    // RS-6: replace the v1-hardcoded callbacks with SessionAckTracker
+    // queries (FIX-B-1 #2).  `isFirstUnsandPerSession` returns true
+    // whenever ANY of rules (a)-(e) fires — which is the conservative
+    // gate the plan v4.2 §"Session boundary precisely defined" calls
+    // for.  `getUnsandRequiresTerminalAck` stays `false` because the
+    // tool-derived flag is folded into requiresTerminalAck() via the
+    // taskId-context'd rule (e) check; the slash router OR-combines
+    // both callbacks so this avoids double-gating.
+    isFirstUnsandPerSession: () =>
+      sessionAckTracker.requiresTerminalAck({
+        taskId: getCurrentTaskIdFromState(taskState),
+      }),
     getUnsandRequiresTerminalAck: () => false,
   });
 
@@ -743,7 +855,12 @@ export async function start(opts: DaemonOpts = {}): Promise<RunningDaemon> {
         clearTimeout(auditPurgeKickoffTimer);
         clearInterval(auditPurgeTimer);
 
-        // Cancel any in-flight task gracefully.
+        // Cancel any in-flight task gracefully.  FIX-B-1 #5: emit a
+        // `task_cancelled` audit row with `reason: 'shutdown'` so signal-
+        // induced shutdowns (SIGTERM/SIGINT/SIGHUP) leave a forensic
+        // trail.  Without this, post-incident review sees a daemon
+        // shutdown with no record of what happened to the in-flight
+        // task — a real gap noted by the BLESS round.
         const cur = taskState.get();
         if (cur.kind === "running" || cur.kind === "backgrounded") {
           try {
@@ -751,15 +868,29 @@ export async function start(opts: DaemonOpts = {}): Promise<RunningDaemon> {
           } catch {
             /* best-effort */
           }
+          const cancelledAt = Date.now();
           taskState.tryTransition({
             kind: "cancelled",
             taskId: cur.taskId,
             startedAt: cur.startedAt,
-            cancelledAt: Date.now(),
+            cancelledAt,
             reason: "shutdown",
           });
+          void auditLog
+            .append({
+              event: "task_cancelled",
+              task_id: cur.taskId,
+              channel: cur.channel,
+              sender_id_hash: null,
+              duration_ms: Math.max(0, cancelledAt - cur.startedAt),
+              extra: { reason: "shutdown" },
+            })
+            .catch(() => undefined);
         }
         await taskState.flush();
+        // Persist any pending session-ack-tracker writes so the next
+        // boot's RS-6 rules see consistent state.
+        await sessionAckTracker.flush().catch(() => undefined);
 
         // Close everything. Each tear-down is best-effort; we capture the
         // first error for the audit row but never re-throw.
@@ -810,6 +941,10 @@ export async function start(opts: DaemonOpts = {}): Promise<RunningDaemon> {
             },
           })
           .catch(() => undefined);
+
+        // Release the single-instance lock so the next daemon boot can
+        // succeed without needing to reap a stale lockfile (Pitfall #11).
+        await singleInstanceLock.release().catch(() => undefined);
       })();
       await shutdownInFlight;
     },
@@ -1279,6 +1414,52 @@ function sleep(ms: number): Promise<void> {
     const t = setTimeout(resolve, ms);
     t.unref?.();
   });
+}
+
+/**
+ * One-shot Studio model-loaded probe used by the SessionManager
+ * cold-start suppression hook (Pitfall #20 / FIX-B-1 #4).  Identical
+ * shape to `waitForStudioModelLoaded` but returns boolean rather than
+ * throwing — the caller wants a yes/no, not a wait.
+ */
+interface StudioProbeOpts {
+  baseUrl: string;
+  modelId: string;
+  fetchFn: typeof fetch;
+}
+
+async function probeStudioModelLoaded(
+  opts: StudioProbeOpts,
+): Promise<boolean> {
+  const root = opts.baseUrl.replace(/\/v1\/?$/, "");
+  const statusUrl = `${root}/api/inference/status`;
+  try {
+    const res = await opts.fetchFn(statusUrl, { method: "GET" });
+    if (!res.ok) return false;
+    const body = (await res.json().catch(() => ({}))) as Record<
+      string,
+      unknown
+    >;
+    const loaded = Array.isArray(body.loaded)
+      ? (body.loaded as unknown[]).map((v) => String(v))
+      : [];
+    return loaded.includes(opts.modelId);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Surface helper: pull the current taskId from a TaskStateManager
+ * without forcing the caller to widen the discriminated union.  Used
+ * by the SessionAckTracker tool-derived rule check on every /unsand.
+ */
+function getCurrentTaskIdFromState(
+  ts: TaskStateManager,
+): string | null {
+  const s = ts.get();
+  if (s.kind === "running" || s.kind === "backgrounded") return s.taskId;
+  return null;
 }
 
 // ---------------------------------------------------------------------------
