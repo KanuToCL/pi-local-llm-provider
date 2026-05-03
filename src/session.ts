@@ -145,6 +145,28 @@ export interface SessionManagerOpts {
   /** Optional injectable models.json loader (for tests). Returns void on
    *  successful validation; throws on failure. */
   validateModelsJsonOverride?: (path: string) => Promise<void>;
+  /**
+   * Optional probe: returns true when the configured Studio model is
+   * loaded and ready to serve a prompt.  Used by Pitfall #20 cold-start
+   * suppression: if false, the auto-promote is deferred and a "warming
+   * up" notice goes out instead.  Implementation in production hits
+   * `GET <studio-url>/api/inference/status` and checks `loaded[]`.  For
+   * tests, a mock returning a controllable boolean.  When omitted (or
+   * thrown), cold-start gating is skipped — the auto-promote fires
+   * normally per v3 behavior.
+   */
+  isStudioModelLoaded?: () => Promise<boolean>;
+  /**
+   * Maximum number of cold-start "warming up" reschedules before the
+   * auto-promote fires regardless.  Per Pitfall #20: 5 attempts with
+   * +30s spacing = 2.5 minutes of patience.  Each attempt emits one
+   * `system_notice` "warming up" event so the user knows pi is alive.
+   */
+  coldStartMaxRetries?: number;
+  /**
+   * Delay between cold-start retries (ms).  Default 30s per Pitfall #20.
+   */
+  coldStartRetryMs?: number;
   /** Time source (ms). Defaults to Date.now. */
   now?: () => number;
   /** setTimeout function (for fake-timer tests). Defaults to global setTimeout. */
@@ -152,6 +174,23 @@ export interface SessionManagerOpts {
   /** clearTimeout function (for fake-timer tests). Defaults to global clearTimeout. */
   clearTimeoutFn?: (handle: unknown) => void;
 }
+
+/**
+ * Auto-promote re-arm schedule, per plan v4.1 message catalog:
+ *   - First fire at t=30s (configurable via `piCommsAutoPromoteMs`)
+ *   - Second fire at t=2min (90s after first)
+ *   - Third+ fires every 5min (300s between fires)
+ *
+ * Index 0 = delay from task start (uses `piCommsAutoPromoteMs`).
+ * Index 1 = delay from FIRST fire (90s).
+ * Index 2+ = delay from PREVIOUS fire (300s, capped).
+ */
+const AUTO_PROMOTE_RE_ARM_DELAYS_MS = [
+  // index 0 is config.piCommsAutoPromoteMs (typically 30_000); used for the first fire only
+  90_000, // gap from fire 1 → fire 2 (so fire 2 is at t=2min)
+  300_000, // gap fire 2 → 3
+  300_000, // gap fire 3 → 4 (cap)
+];
 
 // ---------------------------------------------------------------------------
 // Public — SessionManager
@@ -168,6 +207,18 @@ export class SessionManager {
   private session: SdkAgentSession | null = null;
   private unsubscribe: (() => void) | null = null;
   private autoPromoteHandle: unknown = null;
+  /** Task id the active auto-promote schedule is bound to.  null when
+   *  no schedule is active.  Used as a CAS guard inside fireAutoPromote
+   *  so a captured timer handler that fires AFTER `clearAutoPromote()`
+   *  (e.g. tests holding the handler reference) is suppressed. */
+  private autoPromoteTaskId: string | null = null;
+  /** Number of auto-promote fires recorded so far for the current task.
+   *  Cleared when `clearAutoPromote()` runs (task completion / cancel /
+   *  fail). */
+  private autoPromoteFiringNumber = 0;
+  /** Cold-start retry counter for the current task.  Cleared when
+   *  `clearAutoPromote()` runs. */
+  private autoPromoteColdRetries = 0;
   /** Adapter wrapping pending-confirms.ts to satisfy confirm.ts's interface. */
   private confirmRegistryAdapter: ConfirmToolRegistryContract | null = null;
 
@@ -454,11 +505,69 @@ export class SessionManager {
   // Private — auto-promote
   // ---------------------------------------------------------------------
 
+  /**
+   * Schedule the FIRST auto-promote fire at config.piCommsAutoPromoteMs
+   * (typically 30s).  Subsequent re-arms happen inside `fireAutoPromote`
+   * via `scheduleNextAutoPromote(taskId)` — see plan v4.1 message catalog
+   * (first fire 30s, second fire 2min, then every 5min capped).
+   */
   private scheduleAutoPromote(taskId: string): void {
     this.clearAutoPromote();
+    this.autoPromoteFiringNumber = 0;
+    this.autoPromoteColdRetries = 0;
+    this.autoPromoteTaskId = taskId;
     const delay = this.opts.config.piCommsAutoPromoteMs;
     this.autoPromoteHandle = this.setTimeoutFn(() => {
-      this.fireAutoPromote(taskId);
+      void this.fireAutoPromote(taskId);
+    }, delay);
+  }
+
+  /**
+   * After a successful fire, schedule the NEXT one based on
+   * `autoPromoteFiringNumber`.  Per plan v4.1:
+   *   - After fire 1 (now firingNumber=1): next at +90s = total 2min from start
+   *   - After fire 2 (now firingNumber=2): next at +5min
+   *   - After fire 3+ (firingNumber>=3): next at +5min (cap)
+   */
+  private scheduleNextAutoPromote(taskId: string): void {
+    if (this.autoPromoteHandle !== null) {
+      // Defensive — shouldn't be set; clear before scheduling.
+      try {
+        this.clearTimeoutFn(this.autoPromoteHandle);
+      } catch {
+        /* ignore */
+      }
+      this.autoPromoteHandle = null;
+    }
+    const idx = Math.min(
+      this.autoPromoteFiringNumber - 1,
+      AUTO_PROMOTE_RE_ARM_DELAYS_MS.length - 1,
+    );
+    const delay =
+      idx >= 0
+        ? AUTO_PROMOTE_RE_ARM_DELAYS_MS[idx]
+        : this.opts.config.piCommsAutoPromoteMs;
+    this.autoPromoteHandle = this.setTimeoutFn(() => {
+      void this.fireAutoPromote(taskId);
+    }, delay);
+  }
+
+  /**
+   * Reschedule the auto-promote at +coldStartRetryMs (default 30s) when
+   * Studio reported the model is not loaded.  Per Pitfall #20.
+   */
+  private scheduleColdStartRetry(taskId: string): void {
+    if (this.autoPromoteHandle !== null) {
+      try {
+        this.clearTimeoutFn(this.autoPromoteHandle);
+      } catch {
+        /* ignore */
+      }
+      this.autoPromoteHandle = null;
+    }
+    const delay = this.opts.coldStartRetryMs ?? 30_000;
+    this.autoPromoteHandle = this.setTimeoutFn(() => {
+      void this.fireAutoPromote(taskId);
     }, delay);
   }
 
@@ -471,36 +580,111 @@ export class SessionManager {
       }
       this.autoPromoteHandle = null;
     }
+    this.autoPromoteTaskId = null;
+    this.autoPromoteFiringNumber = 0;
+    this.autoPromoteColdRetries = 0;
   }
 
   /**
    * Fire the auto-promote: if the state is STILL `running` for our taskId,
    * transition to `backgrounded` (CAS guard handled by TaskStateManager) and
-   * emit `auto_promote_notice` to the originating channel sink. If the state
-   * has advanced (completed, cancelled, backgrounded by go_background, etc.)
-   * we silently drop — this is the v4 fix for the auto-promote race.
+   * emit `auto_promote_notice` to the originating channel sink.  After a
+   * successful fire, RE-ARM via `scheduleNextAutoPromote` so the user sees
+   * follow-up "still working" pings per plan v4.1 message catalog.
+   *
+   * Cold-start suppression (Pitfall #20): before firing, optionally probe
+   * Studio for model-loaded.  If not loaded AND we have retries left,
+   * emit a `system_notice` "warming up" event and reschedule for +30s
+   * instead of firing the auto-promote.  After `coldStartMaxRetries`
+   * exhausted, fire normally to avoid leaving the user without any signal.
+   *
+   * If the state has advanced (completed, cancelled, backgrounded by
+   * go_background, etc.) we silently drop — this is the v4 fix for the
+   * auto-promote race.
    */
-  private fireAutoPromote(taskId: string): void {
+  private async fireAutoPromote(taskId: string): Promise<void> {
     this.autoPromoteHandle = null;
+    // CAS guard: the schedule has been cleared (e.g. task completed,
+    // disposed) — drop without side effects even if the captured
+    // handler still fires.  This catches the case where the timer
+    // function was captured by an external observer (tests, fake
+    // timers) and invoked AFTER `clearAutoPromote()` ran.
+    if (this.autoPromoteTaskId !== taskId) {
+      return;
+    }
     const state = this.opts.taskState.get();
-    if (state.kind !== "running" || state.taskId !== taskId) {
-      // Race won by another transition. Suppress.
+    if (
+      state.kind !== "running" &&
+      !(
+        state.kind === "backgrounded" &&
+        state.taskId === taskId &&
+        this.autoPromoteFiringNumber > 0
+      )
+    ) {
+      // Race won by another transition (or first fire and state isn't
+      // running for our taskId). Suppress.
       return;
     }
+    if (state.kind === "running" && state.taskId !== taskId) {
+      return;
+    }
+
+    // Cold-start suppression: only relevant for the FIRST fire (the
+    // model-loaded check after backgrounding is redundant because the
+    // model has already produced output by that point).
+    if (
+      this.autoPromoteFiringNumber === 0 &&
+      this.opts.isStudioModelLoaded &&
+      this.autoPromoteColdRetries < (this.opts.coldStartMaxRetries ?? 5)
+    ) {
+      let modelReady = true;
+      try {
+        modelReady = await this.opts.isStudioModelLoaded();
+      } catch {
+        // Probe failure — fall through and fire normally.  We'd rather
+        // emit a (possibly premature) "still on it" than wedge.
+        modelReady = true;
+      }
+      if (!modelReady) {
+        this.autoPromoteColdRetries += 1;
+        const sink = this.sinkFor(state.channel);
+        if (sink) {
+          const warmingEvent: ChannelEvent = {
+            type: "system_notice",
+            text: "pi: warming up model, will resume shortly",
+            level: "info",
+            ts: this.now(),
+          };
+          void sink.send(warmingEvent).catch(() => undefined);
+        }
+        this.scheduleColdStartRetry(taskId);
+        return;
+      }
+    }
+
     const promotedAt = this.now();
-    const transitionResult = this.opts.taskState.tryTransition({
-      kind: "backgrounded",
-      taskId: state.taskId,
-      startedAt: state.startedAt,
-      channel: state.channel,
-      userMessage: state.userMessage,
-      abort: state.abort,
-      promotedAt,
-      promotedBy: "auto",
-    });
-    if (!transitionResult.ok) {
-      return;
+
+    // First fire transitions running → backgrounded.  Subsequent fires
+    // do NOT re-transition — the task is already backgrounded; we just
+    // emit another "still working" notice.
+    if (this.autoPromoteFiringNumber === 0 && state.kind === "running") {
+      const transitionResult = this.opts.taskState.tryTransition({
+        kind: "backgrounded",
+        taskId: state.taskId,
+        startedAt: state.startedAt,
+        channel: state.channel,
+        userMessage: state.userMessage,
+        abort: state.abort,
+        promotedAt,
+        promotedBy: "auto",
+      });
+      if (!transitionResult.ok) {
+        return;
+      }
     }
+
+    this.autoPromoteFiringNumber += 1;
+    const firingNumber = this.autoPromoteFiringNumber;
 
     void this.opts.auditLog
       .append({
@@ -510,6 +694,7 @@ export class SessionManager {
         sender_id_hash: null,
         extra: {
           promoted_by: "auto",
+          firing_number: firingNumber,
           // task_age_ms is exposed as scalar `extra` (not the top-level
           // duration_ms field, which is reserved for terminal-state spans).
           task_age_ms: Math.max(0, promotedAt - state.startedAt),
@@ -518,15 +703,16 @@ export class SessionManager {
       .catch(() => undefined);
     this.opts.operatorLogger?.info("auto_promote_fired", {
       task_id: taskId,
+      firing_number: firingNumber,
     });
 
     const ageSeconds = Math.max(
       0,
-      Math.floor((promotedAt - state.startedAt) / 1000)
+      Math.floor((promotedAt - state.startedAt) / 1000),
     );
     const event: ChannelEvent = {
       type: "auto_promote_notice",
-      firingNumber: 1,
+      firingNumber,
       taskAgeSeconds: ageSeconds,
       ts: promotedAt,
     };
@@ -534,6 +720,10 @@ export class SessionManager {
     if (sink) {
       void sink.send(event).catch(() => undefined);
     }
+
+    // Re-arm for the next fire.  The state is now `backgrounded`; the
+    // re-arm timer's CAS guard re-checks at fire time.
+    this.scheduleNextAutoPromote(taskId);
   }
 
   // ---------------------------------------------------------------------
