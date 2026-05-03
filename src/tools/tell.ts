@@ -69,6 +69,20 @@ export interface DefineTellToolOptions {
   rateMap?: Map<ToolUrgency, number[]>;
   /** Override for time source — primarily for tests. */
   now?: () => number;
+  /**
+   * Optional sanitizer applied to `text` BEFORE fan-out.  Production wires
+   * this to `redactCredentialShapes` (RS-4 mitigation per plan §"Pitfall
+   * RS-4 tell()-credential-egress").  When omitted, text is sent as-is —
+   * tests do this to keep their assertions on raw input.
+   */
+  sanitizeOutbound?: (text: string) => string;
+  /**
+   * Optional callback fired AFTER successful fan-out (sent: true).  The
+   * daemon uses this to track `lastTellAt` for the `/status` slash
+   * command's "last tell()" line.  Best-effort — failures swallowed so
+   * an observer hiccup doesn't poison the tool result.
+   */
+  onEmit?: (ts: number) => void;
 }
 
 export interface TellResult {
@@ -133,7 +147,13 @@ export function defineTellTool(opts: DefineTellToolOptions): DefinedTool {
       },
     },
     async execute(args): Promise<TellResult> {
-      const text = String(args.text ?? "").trim();
+      const rawText = String(args.text ?? "").trim();
+      // RS-4 mitigation: redact credential shapes BEFORE the tool emits the
+      // text to channel sinks.  Cooldown dedup also runs against the
+      // sanitized text so the agent can't bypass dedup by sprinkling
+      // redacted secrets across attempts.  When opts.sanitizeOutbound is
+      // omitted (tests), text is passed through as-is.
+      const text = opts.sanitizeOutbound ? opts.sanitizeOutbound(rawText) : rawText;
       const urgencyRaw = String(args.urgency ?? "info");
       const urgency: ToolUrgency = isToolUrgency(urgencyRaw) ? urgencyRaw : "info";
 
@@ -177,6 +197,15 @@ export function defineTellTool(opts: DefineTellToolOptions): DefinedTool {
         text,
         ts,
       });
+
+      // Notify the daemon-side observer (used to update lastTellAt).
+      if (opts.onEmit) {
+        try {
+          opts.onEmit(ts);
+        } catch {
+          /* observer is best-effort */
+        }
+      }
 
       return { sent: true, deliveredTo };
     },

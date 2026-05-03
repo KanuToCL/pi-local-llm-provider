@@ -103,6 +103,14 @@ export interface DefineConfirmToolOptions {
   emitCapHitTell?: (taskId: string) => Promise<void>;
   /** Override for time source — primarily for tests. */
   now?: () => number;
+  /**
+   * Optional sanitizer applied to `action` / `rationale` / `risk` BEFORE
+   * the confirm-request event is fanned out.  Production wires this to
+   * `redactCredentialShapes` (RS-4 mitigation per plan §"Pitfall RS-4").
+   * When omitted, fields are sent as-is — tests do this to keep their
+   * assertions on raw input.
+   */
+  sanitizeOutbound?: (text: string) => string;
 }
 
 // ---------------------------------------------------------------------------
@@ -168,9 +176,14 @@ export function defineConfirmTool(opts: DefineConfirmToolOptions): DefinedTool {
       },
     },
     async execute(args): Promise<ConfirmResult> {
-      const action = String(args.action ?? "").trim();
-      const rationale = String(args.rationale ?? "").trim();
-      const risk = String(args.risk ?? "").trim();
+      const sanitize = opts.sanitizeOutbound ?? ((s: string) => s);
+      // RS-4: sanitize agent-controlled prose BEFORE it is registered into
+      // the pending-confirms registry OR fanned out to sinks.  This catches
+      // the case where the agent accidentally pastes a secret into one of
+      // the prompt fields.
+      const action = sanitize(String(args.action ?? "").trim());
+      const rationale = sanitize(String(args.rationale ?? "").trim());
+      const risk = sanitize(String(args.risk ?? "").trim());
 
       const taskId = opts.getCurrentTaskId();
       if (!taskId) {

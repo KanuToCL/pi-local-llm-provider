@@ -111,6 +111,14 @@ export interface PendingConfirmsRegistryOpts {
 
 export class PendingConfirmsRegistry {
   private readonly entries = new Map<string, RegistryEntry>();
+  /**
+   * IDs of entries that were resolved via `expire(now)`.  Consumed by
+   * `consumeTimedOut(shortId)` so the confirm adapter (src/session.ts)
+   * can distinguish "user-no" (false via resolve()) from "timeout"
+   * (false via expire()).  Entries are added on expire and removed on
+   * read — one-shot semantics.
+   */
+  private readonly recentlyTimedOut = new Set<string>();
   private readonly rng: () => number;
   private readonly now: () => number;
   private seq = 0;
@@ -211,12 +219,20 @@ export class PendingConfirmsRegistry {
    *
    * Each expired promise resolves to `false` (default-deny on timeout
    * per plan line 1131: "that operation was already declined").
+   *
+   * AUDIT-C #10: tag each expired shortId in `recentlyTimedOut` so the
+   * confirm adapter (src/session.ts) can distinguish "user-no" (false
+   * via resolve()) from "timeout" (false via expire()) when the boolean
+   * resolution otherwise loses the distinction.  Entries linger in the
+   * set until `consumeTimedOut(shortId)` is called by the adapter (which
+   * happens immediately after the awaited promise settles).
    */
   expire(now: number): readonly PendingConfirm[] {
     const expired: PendingConfirm[] = [];
     for (const e of [...this.entries.values()]) {
       if (e.expiresAt < now) {
         this.entries.delete(e.shortId);
+        this.recentlyTimedOut.add(e.shortId);
         e.resolve(false);
         expired.push({
           shortId: e.shortId,
@@ -230,6 +246,15 @@ export class PendingConfirmsRegistry {
       }
     }
     return expired;
+  }
+
+  /**
+   * AUDIT-C #10: was `shortId` resolved via timeout (vs user-no)?  Removes
+   * the entry from the recently-timed-out set on read so the second call
+   * with the same id returns false (one-shot semantics).
+   */
+  consumeTimedOut(shortId: string): boolean {
+    return this.recentlyTimedOut.delete(shortId);
   }
 
   /**
