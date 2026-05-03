@@ -11,7 +11,8 @@
  *   2. Session creation      — construct AgentSession against local Studio + 1-turn ping
  *   3. Tool registration     — register no-op `tell_test`, assert model invokes it
  *   4. AbortSignal cancel    — abort mid-stream, assert graceful shutdown
- *   5. Tool-call interception — intercept bash spawn (load-bearing for /unsand)
+ *   5. Tool-call interception — verify customTools[name='bash'] OVERRIDES pi-mono's
+ *                                built-in bash (load-bearing for /unsand + sandbox)
  *   6. Post-abort silence    — assert NO callbacks fire after abort() returns
  *
  * Output: ~/.pi-comms/sdk-spike.json + human-readable stdout summary
@@ -25,6 +26,7 @@
  */
 
 import * as fs from "node:fs";
+import { createRequire } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
 
@@ -165,9 +167,14 @@ function recommendationFor(
   }
   if (probes.tool_call_interception && !probes.tool_call_interception.passed) {
     return (
-      "Re-plan v5: same subprocess pivot as `pi.registerTool` missing path. " +
-      "Library-embed loses sandbox enforceability; subprocess regains it (we own " +
-      "spawn). Cite gemini-claw CliGeminiClient.ts:122-238."
+      "Probe 5 (rewritten) proved customTools[name='bash'] does NOT override " +
+      "pi-mono's built-in bash — sandbox + classifier + /unsand are ALL " +
+      "bypass-able as currently designed. Re-plan v5: either (a) override at a " +
+      "different SDK extension point (e.g. resource-loader/middleware if pi-mono " +
+      "exposes one), or (b) pivot to subprocess + stdout-marker (gemini-claw " +
+      "pattern, CliGeminiClient.ts:122-238) so we own spawn ourselves. " +
+      "Update src/session.ts:277-281 WARN to ERROR + fail-closed on boot until " +
+      "the redesign lands."
     );
   }
   if (probes.abort_signal && !probes.abort_signal.passed) {
@@ -488,62 +495,209 @@ async function main(): Promise<number> {
     };
   }
 
-  // ---- Probe 5: Tool-call interception (v4.2) ----------------------------
-  // Wrap the bash tool's spawn so OUR handler executes, not pi-mono's internal
-  // spawn. If this fails, sandbox + /unsand are architecturally undefined.
-  let bashInterceptCalled = false;
+  // ---- Probe 5: Tool-call interception (v4.2 — REWRITTEN BLESS-Integration HIGH) ----
+  // The OLD probe assumed `pi.registerTool` existed; Probe 1 already proved it
+  // does NOT.  The daemon (src/session.ts:264-268) actually depends on a
+  // different mechanism: pass tools via `createAgentSession({ customTools })`
+  // and trust pi-mono to let `customTools[name='bash']` REPLACE its built-in
+  // bash.  If that override does NOT take effect, the entire sandbox +
+  // classifier + /unsand architecture is bypass-able (the model would call
+  // pi-mono's raw bash and skip our wrapper entirely).  src/session.ts:277-281
+  // emits a boot-time WARN acknowledging this is unverified.  Probe 5 answers
+  // it definitively.
+  //
+  // Strategy:
+  //  1. Construct a NEW AgentSession via createAgentSession({ customTools: [ourBash] })
+  //     where ourBash is built via sdk.defineTool with name='bash'.
+  //  2. Hook child_process.spawn / spawnSync / exec / execFile BEFORE creating
+  //     the session, to count any shell processes that pi-mono's built-in
+  //     bash would launch behind our back.
+  //  3. Send a prompt that should trigger bash.
+  //  4. Assert: OUR handler ran (flag set true) AND zero shell processes were
+  //     spawned via the hooked spawn (proving pi-mono's default bash did NOT fire).
+  //  5. Restore the hook.
+  let probe5Session: any = null;
+  let probe5ModelsPath: string | null = null;
   try {
-    if (!session) throw new Error("no session — skipping");
-
-    // Strategy A: pi-mono ≥0.72 exposes BashSpawnHook on createBashToolDefinition.
-    const createBashDef = (sdk as any).createBashToolDefinition;
-    if (typeof createBashDef !== "function") {
-      throw new Error(
-        "createBashToolDefinition not exported — cannot register bash spawn hook",
-      );
+    if (typeof sdk.createAgentSession !== "function") {
+      throw new Error("createAgentSession is not a function on SDK exports");
     }
-    const hookedBash = createBashDef({
-      spawnHook: (
-        _ctx: any,
-        spawnArgs: { command: string; args: readonly string[] },
-        next: any,
+    if (typeof sdk.defineTool !== "function") {
+      throw new Error("defineTool not exported (cannot build customTools[bash])");
+    }
+
+    // ---- Build OUR bash override --------------------------------------
+    let ourBashHandlerWasCalled = false;
+    let ourBashHandlerInvocations = 0;
+    const OVERRIDE_MARKER = "OUR_OVERRIDE_FIRED";
+    const definedBashTool = sdk.defineTool({
+      name: "bash",
+      label: "Bash (spike override)",
+      description: "Execute bash command (Probe 5 override — does not actually shell out).",
+      parameters: {
+        type: "object",
+        properties: {
+          command: { type: "string", description: "Shell command line to run." },
+        },
+        required: ["command"],
+      },
+      // Match the daemon's defineTool execute(toolCallId, params, signal) shape
+      // (see src/sandbox/wrap-bash.ts:172-178).
+      execute: async (
+        _toolCallId: string,
+        _params: { command?: string },
+        _signal: AbortSignal | undefined,
       ) => {
-        bashInterceptCalled = true;
-        // Forward to default behavior so the prompt completes; we only need to
-        // observe that OUR hook ran.
-        return next(spawnArgs);
+        ourBashHandlerWasCalled = true;
+        ourBashHandlerInvocations++;
+        return {
+          content: [{ type: "text", text: OVERRIDE_MARKER }],
+          isError: false,
+        };
       },
     } as any);
 
-    const reg = (session as any).registerTool ?? (sdk as any).registerTool;
-    if (typeof reg !== "function") {
-      throw new Error("registerTool unavailable for bash override");
+    // ---- Hook child_process to detect any pi-mono raw spawns -----------
+    // We patch on the module object so any code path using
+    // `child_process.spawn(...)` / `spawnSync(...)` / `exec(...)` /
+    // `execFile(...)` is captured. This includes pi-mono's built-in bash if it
+    // bypasses our customTools override.
+    //
+    // Why createRequire: under ESM, `import * as cp from 'node:child_process'`
+    // returns a frozen module-namespace object whose properties cannot be
+    // reassigned (Cannot assign to read only property 'spawn'). The CJS
+    // module.exports object obtained via createRequire IS mutable, and pi-mono
+    // (which is itself ESM) ultimately resolves to the same underlying
+    // module-cache record — so patching the CJS view reaches every consumer.
+    const requireCjs = createRequire(import.meta.url);
+    const cpMut: Record<string, any> = requireCjs("node:child_process") as Record<string, any>;
+    const originalSpawn = cpMut.spawn;
+    const originalSpawnSync = cpMut.spawnSync;
+    const originalExec = cpMut.exec;
+    const originalExecFile = cpMut.execFile;
+
+    const rawSpawnInvocations: Array<{ fn: string; cmd: string }> = [];
+    const restoreCp = () => {
+      cpMut.spawn = originalSpawn;
+      cpMut.spawnSync = originalSpawnSync;
+      cpMut.exec = originalExec;
+      cpMut.execFile = originalExecFile;
+    };
+
+    cpMut.spawn = function patchedSpawn(this: unknown, ...args: any[]) {
+      rawSpawnInvocations.push({ fn: "spawn", cmd: String(args[0] ?? "") });
+      return originalSpawn.apply(this, args as any);
+    };
+    cpMut.spawnSync = function patchedSpawnSync(this: unknown, ...args: any[]) {
+      rawSpawnInvocations.push({ fn: "spawnSync", cmd: String(args[0] ?? "") });
+      return originalSpawnSync.apply(this, args as any);
+    };
+    cpMut.exec = function patchedExec(this: unknown, ...args: any[]) {
+      rawSpawnInvocations.push({ fn: "exec", cmd: String(args[0] ?? "") });
+      return originalExec.apply(this, args as any);
+    };
+    cpMut.execFile = function patchedExecFile(this: unknown, ...args: any[]) {
+      rawSpawnInvocations.push({ fn: "execFile", cmd: String(args[0] ?? "") });
+      return originalExecFile.apply(this, args as any);
+    };
+
+    // ---- Build a NEW session that actually carries customTools=[ourBash] ----
+    // The Probe 2 session was created without customTools, so we cannot reuse
+    // it. Build a fresh session here.
+    try {
+      probe5ModelsPath = writeTempModelsJson();
+      const result = await withTimeout(
+        () =>
+          sdk.createAgentSession({
+            cwd: process.cwd(),
+            modelsConfigPath: probe5ModelsPath,
+            providerId: "unsloth-studio",
+            customTools: [definedBashTool],
+          } as any),
+        15_000,
+        "createAgentSession(probe5 with customTools)",
+      );
+      probe5Session = (result as any)?.session ?? result;
+      if (!probe5Session) {
+        throw new Error("createAgentSession returned no session for Probe 5");
+      }
+      if (typeof probe5Session.prompt !== "function") {
+        throw new Error("Probe 5 session has no .prompt() method");
+      }
+
+      // ---- Trigger bash -------------------------------------------------
+      await withTimeout(
+        () =>
+          probe5Session.prompt(
+            "Run the bash command: echo hello",
+          ),
+        60_000,
+        "session.prompt(probe5-bash-trigger)",
+      );
+    } finally {
+      // Restore child_process BEFORE we evaluate counts so any cleanup
+      // bookkeeping doesn't get attributed to pi-mono.
+      restoreCp();
     }
-    await reg.call(session, hookedBash);
 
-    await withTimeout(
-      () =>
-        session.prompt(
-          "Run the bash command `echo pi-comms-spike-marker` and tell me the output.",
-        ),
-      60_000,
-      "session.prompt(bash-trigger)",
-    );
-
-    if (!bashInterceptCalled) {
+    // ---- Assertions ---------------------------------------------------
+    // pi-mono's built-in bash uses child_process under the hood. If our
+    // override took effect, NO raw shell process should have spawned.
+    // (We accept a small slack: if a tracing/util library spawned something
+    // unrelated, the cmd string will reveal it. For Probe 5 we treat any
+    // spawn as a violation.)
+    if (!ourBashHandlerWasCalled) {
       throw new Error(
-        "Bash spawn hook was NOT called — pi-mono spawned raw, sandbox cannot be enforced",
+        "OUR bash handler was NOT called — model may not have triggered the tool, " +
+          "OR pi-mono's customTools[name='bash'] override did NOT take effect. " +
+          `raw spawns observed: ${rawSpawnInvocations.length}`,
+      );
+    }
+    if (rawSpawnInvocations.length > 0) {
+      const sample = rawSpawnInvocations
+        .slice(0, 5)
+        .map((s) => `${s.fn}(${s.cmd.slice(0, 60)})`)
+        .join("; ");
+      throw new Error(
+        `pi-mono spawned ${rawSpawnInvocations.length} shell process(es) DESPITE our ` +
+          `customTools[bash] override (override-fired-${ourBashHandlerInvocations}-times). ` +
+          `Sandbox is bypass-able. samples: ${sample}`,
       );
     }
     probes.tool_call_interception = {
       passed: true,
-      details: "BashSpawnHook fired during bash invocation",
+      details:
+        `customTools[bash] override fired ${ourBashHandlerInvocations}x; ` +
+        "zero raw child_process spawns observed; model received OUR_OVERRIDE_FIRED",
     };
   } catch (e) {
     probes.tool_call_interception = {
       passed: false,
       error: (e as Error).message,
+      details:
+        "customTools[bash] override did NOT replace pi-mono's built-in bash, OR the " +
+        "session/model was unable to trigger the tool. If override fails, the daemon's " +
+        "sandbox + /unsand design is bypass-able and v5 must pivot to a different " +
+        "extension point (or subprocess + stdout-marker, gemini-claw pattern).",
     };
+  } finally {
+    // Best-effort cleanup of probe-5-only session + temp models.json.
+    try {
+      if (probe5Session && typeof probe5Session.close === "function") {
+        await probe5Session.close();
+      } else if (probe5Session && typeof probe5Session.shutdown === "function") {
+        await probe5Session.shutdown();
+      }
+    } catch {
+      /* ignore */
+    }
+    if (probe5ModelsPath) {
+      try {
+        fs.unlinkSync(probe5ModelsPath);
+      } catch {
+        /* ignore */
+      }
+    }
   }
 
   // ---- Probe 6: Post-abort callback silence (v4.2) -----------------------
