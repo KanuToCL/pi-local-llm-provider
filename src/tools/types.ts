@@ -1,20 +1,15 @@
 /**
  * Shared tool-side types.
  *
- * Ownership note (W2 IMPL-8):
- *   - The `Sink` interface here is a PLACEHOLDER. IMPL-12 (W3) will own the
- *     canonical `src/channels/base.ts` and the same shape will live there.
- *     When that lands, this file should re-export the channel-side type
- *     instead of declaring it locally.  For now we declare it here so
- *     tools/tell, tools/confirm, tools/go-background can compile in W2 BEFORE
- *     W3 has landed.  See plan §"Implementation: the daemon has a `Sink`
- *     interface per attached client."
+ * Ownership notes (post-IMPL-12 W3):
+ *   - `Sink` and `ChannelEvent` now live canonically in
+ *     `src/channels/base.ts`.  This module RE-EXPORTS them so existing
+ *     `import { Sink } from "../tools/types.js"` callers keep compiling.
+ *     The W2 placeholder declarations have been removed.
  *
- *   - `ChannelEvent` is the discriminated union of everything tools can
- *     emit through a sink.  IMPL-12 will receive it and route it to the
- *     concrete transport (terminal stdout, WhatsApp DM, Telegram bot).
- *     Per plan §"v4.3 simplified tell()", §"v4.2 confirm() semantics",
- *     §"Phase 1.5 — Single In-Flight Task".
+ *   - `ToolUrgency` is the canonical home HERE.  `ChannelEvent.type==='tell'`
+ *     references it from `channels/base.ts`, so the back-pointer is
+ *     `channels/base.ts -> tools/types.ts` (one-way; no cycle).
  *
  *   - `ToolContext` is a TODO stub.  Pi-mono's actual extension SDK passes a
  *     much richer `ExtensionContext` object to tool `execute()` handlers
@@ -28,75 +23,30 @@
  */
 
 // ---------------------------------------------------------------------------
-// Public — tool-emitted-event vocabulary
+// Public — tool-emitted-event vocabulary (canonical home for ToolUrgency)
 // ---------------------------------------------------------------------------
 
 export type ToolUrgency = "info" | "milestone" | "done" | "blocked" | "question";
 
-/**
- * A side-channel event a tool wants emitted to one or more sinks.
- *
- * Tools NEVER write directly to a channel; they hand a `ChannelEvent` to a
- * `Sink` and the sink owns transport.  This keeps the destructive-command
- * sandbox + redaction logic in one place (the channel layer) instead of
- * every tool needing to know about credential-shape regex etc.
- *
- * Plan §"Sink interface stays simple": WhatsApp sink receives tell + confirm
- * + go-background notice; terminal sink receives all events.
- */
-export type ChannelEvent =
-  | {
-      type: "tell";
-      urgency: ToolUrgency;
-      text: string;
-      ts: number;
-    }
-  | {
-      type: "confirm_request";
-      shortId: string;
-      question: string;
-      rationale: string;
-      risk: string;
-      expiresAt: number;
-      ts: number;
-    }
-  | {
-      type: "auto_promote_notice";
-      firingNumber: number;
-      taskAgeSeconds: number;
-      ts: number;
-    }
-  | {
-      type: "go_background_notice";
-      userMessagePreview: string;
-      ts: number;
-    };
-
 // ---------------------------------------------------------------------------
-// Public — Sink interface (PLACEHOLDER; IMPL-12 W3 owns the canonical home)
+// Public — Sink + ChannelEvent re-exports from channels/base.ts
 // ---------------------------------------------------------------------------
+//
+// These types canonically live in `src/channels/base.ts` (IMPL-12 W3 owns it).
+// We re-export here so existing `import { Sink } from "../tools/types.js"`
+// callers in W2 tool code keep compiling.  The local `SinkBag`, `fanOut`, etc.
+// below still need `Sink` and `ChannelEvent` in scope as types, so we pull
+// them in as a local import alias and also re-export them publicly.
 
-/**
- * One sink per attached client.
- *
- * TODO(IMPL-12, W3): when `src/channels/base.ts` lands, IMPL-12 should:
- *   1. define the canonical `Sink` interface in `src/channels/base.ts`
- *   2. have it match this exact shape (or a strict superset)
- *   3. re-export from this module so callers can keep
- *      `import { Sink } from "../tools/types.js"` working.
- *
- * Send semantics:
- *   - Each call MUST be best-effort. If the underlying transport is dead
- *     (WhatsApp re-pair needed, terminal client disconnected, etc.) the sink
- *     should resolve (not reject) and the failure is observable via channel
- *     state, NOT via this method's return value.  Tools fan out to multiple
- *     sinks in parallel and a single sink failing must not block the others.
- *   - Sinks SHOULD be idempotent w.r.t. duplicate event ids when they have
- *     them; tools do not pre-dedup at the sink layer.
- */
-export interface Sink {
-  send(event: ChannelEvent): Promise<void>;
-}
+import type {
+  ChannelEvent as ChannelEventCanonical,
+  ChannelId as ChannelIdCanonical,
+  Sink as SinkCanonical,
+} from "../channels/base.js";
+
+export type Sink = SinkCanonical;
+export type ChannelEvent = ChannelEventCanonical;
+export type ChannelId = ChannelIdCanonical;
 
 // ---------------------------------------------------------------------------
 // Public — ToolContext (TODO stub for what pi-mono actually passes)

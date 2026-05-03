@@ -19,22 +19,15 @@ import { createHash } from "node:crypto";
 import { sanitizeForPromptInjection } from "./sanitize.js";
 
 // ---------------------------------------------------------------------------
-// TODO(IMPL-12, W3): the canonical home for `InboundMessage` is
-// `src/channels/base.ts`. IMPL-12 will define it there and re-export from
-// this module's import path. For now we define it locally so this file
-// type-checks before W3 lands. After W3 the local definition should be
-// deleted and this file should switch to:
-//
-//   import type { InboundMessage } from '../channels/base.js';
+// `InboundMessage` lives canonically in `src/channels/base.ts` (IMPL-12 W3).
+// We import + re-export here so existing
+//   `import { InboundMessage } from "../lib/envelope.js"`
+// callers (e.g. tests/envelope.test.ts) keep compiling.
 // ---------------------------------------------------------------------------
 
-export interface InboundMessage {
-  type: "text" | "voice" | "image";
-  channel: "terminal" | "whatsapp" | "telegram";
-  sender: { id: string; name?: string };
-  payload: { text?: string; audioRef?: string; imageRef?: string };
-  ts: number;
-}
+import type { InboundMessage } from "../channels/base.js";
+
+export type { InboundMessage } from "../channels/base.js";
 
 /** Stable, non-reversible 12-hex-char hash of a sender id. */
 function hashSenderId(id: string): string {
