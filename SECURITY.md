@@ -94,6 +94,43 @@ The IDs match `docs/DESIGN.md` §7 where they overlap, and continue from there.
 
 ---
 
+## pi-comms specific risks (v0.2+)
+
+The risks below cover the pi-comms daemon surface added in v0.2 (Track 2 in the README): the long-lived TypeScript daemon that bridges Telegram + WhatsApp DMs into an embedded pi-mono session, plus its IPC server, sandbox enforcement, status pointer, audit log, and dead-man heartbeat. Read these in addition to R1-R14 (which still apply to the underlying pi CLI surface).
+
+| ID | Risk | Severity | Mitigation owner | Where addressed |
+|----|------|----------|------------------|-----------------|
+| R15 | Baileys account-ban risk — WhatsApp Terms of Service prohibit unofficial clients; Meta can ban accounts that use Baileys | HIGH | Operator | [`docs/INSTALL-WHATSAPP.md`](./docs/INSTALL-WHATSAPP.md) §"Threat-model honesty"; `second-number` identity model recommended so the ban risk lands on the bot account, not your social graph |
+| R16 | Telegram bot-token leak — `TELEGRAM_BOT_TOKEN` in `.env`, screen-recording, public gist, error frames | HIGH | Operator | `.env` is gitignored; treat token like a credential; rotate immediately if it appears in any log or screenshot via @BotFather |
+| R17 | SIM-swap attack lets the attacker re-pair WhatsApp as the bot account (RS-1 in the daemon's "Remote-Shell Threat Model" plan section) | HIGH | Operator | Use a phone number with carrier port-out PIN locked; consider eSIM-only (Airalo/Holafly) to remove SIM-swap surface; daemon detects re-pair and emits `whatsapp_reauth_needed` audit event |
+| R18 | Stolen unlocked phone with a paired Telegram/WhatsApp session can drive pi (RS-2) | HIGH | Operator | `/lock` slash command suspends inbound message processing; `/alive` requires re-auth via terminal; full plan in pi-comms `~/.pi-comms/lock-state.json` (FIX-A C1 added `lockState.locked` runtime check) |
+| R19 | Prompt-injection RCE through chat ingress — model receives attacker-controlled text via WhatsApp/Telegram and is instructed to call `bash` with destructive args (RS-3) | HIGH | This repo (mitigation) + Operator (residual) | Sandbox-by-default (`PI_COMMS_SANDBOX=on`) restricts `bash` to a workspace dir; classifier is a tripwire (NOT a security control); destructive commands require `confirm()` flow with phone-side approval; root mitigation is operator workspace hygiene (don't run pi from a dir containing secrets) |
+| R20 | `tell()` / `confirm()` credential egress — model could try to emit secrets via the channel-out tools (RS-4) | HIGH | This repo | `redactCredentialShapes` redactor wired into both `tell()` and `confirm()` tool wrappers (FIX-A C3 commit `ff56300`); regex-based redaction of bearer-shaped strings, AWS-key-shapes, GitHub-token-shapes, and high-entropy hex/b64 chunks before send |
+| R21 | IPC socket as same-UID privilege escalation vector — any process running as the user can connect to `~/.pi-comms/daemon.sock` | MEDIUM | This repo | Per-connection auth handshake (HMAC of an install-time secret in `~/.pi-comms/ipc-secret`); socket file `chmod 0600`; per-conn auth in `src/ipc/server.ts` (IMPL-13 commit `3d82a9b`) |
+| R22 | Sandbox bypass via tool-derived `/unsand` — model emits a slash-command-shaped string via `tell()` and tricks the daemon into running un-sandboxed (RS-6) | HIGH | This repo | Session-ack gate: `/unsand` ONLY accepted when posted by the user via the actual channel ingress, never when arriving through pi's tool output. Inbound message provenance tagged at the channel layer; slash router rejects tool-originated commands (FIX-B work in progress) |
+| R23 | Status pointer as injection vector — pi writes the pointer body, daemon reads it on next boot, attacker-controlled content from a previous session could be re-injected as system context | MEDIUM | This repo | Status pointer body sanitized on both write (`storage/atomic-store.ts`) and read (`session/session-manager.ts`); zod schema enforced; corrupt-quarantine to `.corrupt-<ts>` if validation fails |
+| R24 | Audit log injection — attacker controls log fields and injects a forged JSON line that looks like a different event | MEDIUM | This repo | Every audit entry serialized via `JSON.stringify(entry) + "\n"` per line; never string-concatenated; entry type validated against a typed zod schema before write (IMPL-4 commit `d7659d2`) |
+| R25 | Concurrent daemon corruption — two daemon processes for the same user race on the IPC socket and audit log | HIGH | This repo | Single-instance lock via `flock(2)` on Unix and named-mutex (`Global\PiCommsDaemon`) on Windows; OS-level autostart configured `MultipleInstancesPolicy=IgnoreNew` on Windows. **NOTE:** the runtime lock is being shipped by FIX-B-1 in this same wave — see `git log` for the actual commit |
+| R26 | Sandbox not enforceable on Windows v1 — no AppContainer wrapper implemented | HIGH | Operator (acknowledgement) | Daemon refuses to start unless `PI_COMMS_ALLOW_UNSANDBOXED_WINDOWS=true` is explicitly set. This is intentional friction so you must consciously accept the lack of OS-level isolation. Windows AppContainer support is v2 |
+| R27 | Studio at `0.0.0.0` LAN-exposure (R9 amplification) — when the daemon talks to Studio over HTTP, the requests still hit the same 0.0.0.0-bound endpoint visible to the LAN | HIGH | Operator + this repo | Daemon asserts `baseUrl` resolves to a loopback address at startup (refuses to start if it points at a non-loopback IP); operator must still launch Studio with `-H 127.0.0.1` (R9 mitigation upstream) |
+| R28 | pi-mono `customTools` override unverified — Phase -1 spike Probe 5 asserted that user-registered `tell()` / `confirm()` tools take precedence over pi-mono built-ins, but the assertion is fragile against pi-mono version drift | MEDIUM | This repo | Probe 5 in `scripts/sdk-spike.ts` runs on every `npm run spike`. **NOTE:** FIX-B-5 is rewriting Probe 5 to actually exercise the override path with a real test instead of a presence check; see that commit for the verification semantics |
+| R29 | Inbound message rate-bomb — compromised Telegram allowlist account or WhatsApp owner-JID floods inbound messages, exhausting GPU and queue capacity | MEDIUM | This repo | Single-key serial queue caps in-flight tasks at 1; per-channel inbound rate limiter (token-bucket) caps message acceptance. **NOTE:** FIX-B-3 is shipping the rate-limiter; see that commit for the cap values |
+| R30 | Audit log unbounded growth — `~/.pi-comms/audit/audit-YYYY-MM-DD.jsonl` accumulates indefinitely; `pi-comms purge` exists but there's no scheduler to invoke it | MEDIUM | This repo | `pi-comms purge` CLI command supports manual cleanup; default 90-day retention. **NOTE:** FIX-B-2 is shipping a purge scheduler that runs daily inside the daemon; see that commit for the scheduling semantics |
+
+### Severity legend (R15-R30)
+
+- **HIGH** — credential exposure, RCE, account loss, or daemon-down with no recovery
+- **MEDIUM** — defense-in-depth bypass, log integrity, resource exhaustion
+- **LOW** — operational annoyance, documentation gap
+
+### Mitigation-owner legend
+
+- **This repo** — code in `src/` or `scripts/` enforces the mitigation; CI / probes verify it
+- **Operator** — habit / configuration choice; this repo can warn but cannot enforce
+- **Upstream** — depends on pi-mono / Baileys / grammy / OS — tracked but not solvable here
+
+---
+
 ## What this repo does about R2 specifically
 
 R2 is the load-bearing risk for first-time users, because it triggers on the

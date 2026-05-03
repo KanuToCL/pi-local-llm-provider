@@ -1,0 +1,46 @@
+name: test
+
+"on":
+  push:
+    branches:
+      - main
+  pull_request:
+
+# Required-to-pass on main per the pi-comms plan §"Testing: CI specification".
+# Windows is intentionally skipped for now: the sandbox-by-default test paths
+# rely on bwrap (Linux) and sandbox-exec (macOS), neither of which exist on
+# Windows; the daemon refuses to start on Windows v1 without
+# PI_COMMS_ALLOW_UNSANDBOXED_WINDOWS=true set, which the test harness does not
+# set. Adding Windows to the matrix is a v2 item.
+
+jobs:
+  test:
+    name: node-${{ matrix.node }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        node:
+          - "20"
+          - "22"
+        os:
+          - ubuntu-latest
+          - macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test

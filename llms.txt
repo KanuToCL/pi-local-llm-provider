@@ -1,0 +1,35 @@
+# pi-local-llm-provider
+
+Configs, a 30-LOC zero-dependency probe, and a long-running TypeScript daemon (`pi-comms`) that together let you run [pi-mono](https://github.com/badlogic/pi-mono) (Mario Zechner's terminal coding agent) against a local LLM (Unsloth Studio, Ollama, LM Studio, vLLM) AND reach the same agent from Telegram + WhatsApp DMs. Two separable tracks: Track 1 ships a `models.json` + probe + safer launcher (Tier 0, stable); Track 2 ships the daemon with sandbox-by-default `bash` enforcement, channel adapters, IPC server, status pointer, audit log, and per-OS autostart (alpha, single-user, Telegram-tested, WhatsApp untested-on-Windows). Status: `v0.2.0-alpha.1`. Repository: https://github.com/KanuToCL/pi-local-llm-provider.
+
+## Overview
+
+This repo exists because pi-mono advertises "BYO model" but local LLM servers have undocumented quirks (Studio silently drops `chat_template_kwargs`, Ollama needed v0.3+ for OpenAI-shaped tool calls, LM Studio's chat-template handling for Qwen3 is version-dependent). The probe gates whether a backend can drive pi-mono's tool-calling agent loop; the configs translate between pi-mono's `models.json` schema and each backend's HTTP shape; the daemon adds the operator surface that makes the agent reachable from a phone.
+
+## Architecture
+
+Four layers: a local inference backend (Layer 1 — Studio/Ollama/LM Studio/vLLM at `localhost:8888` or similar) speaks OpenAI `/v1/chat/completions` to pi-mono (Layer 3 — the agent runtime, `@mariozechner/pi-coding-agent` v0.70.x), bridged by a `models.json` provider config (Layer 2 — what this repo's Track 1 ships). The pi-comms daemon (Layer 4 — what Track 2 adds) embeds pi-mono via `createAgentSession()` and adds channel adapters, an IPC server for terminal access, sandbox enforcement, and a status pointer. Each upper layer imports or routes to the layer beneath it; failures localize cleanly. Full diagram and data flow in `docs/ARCHITECTURE.md`.
+
+## Install
+
+Pre-requisites: Node 20+, pi-mono installed via `npm install -g @mariozechner/pi-coding-agent`, a local LLM server running, a tool-capable model loaded. Run `node scripts/probe-toolcalls.js` against your backend with the matching env vars (e.g. `UNSLOTH_API_KEY=...` for Studio); exit code 0 means the backend is viable. Copy the matching `examples/models.<backend>.json` into `~/.pi/agent/models.json`, `chmod 600`, and launch via `scripts/pi-launch.sh` (which runs `scripts/check-env.js` first to fail closed on unset env vars). For the daemon: copy `.env.example` to `.env`, fill in `TELEGRAM_BOT_TOKEN` + `TELEGRAM_ALLOWED_USER_IDS` + `UNSLOTH_API_KEY` + `PI_COMMS_DEFAULT_MODEL`, then `npm run daemon` for foreground or install the per-OS autostart layer per `docs/INSTALL.md`.
+
+## Security model
+
+Three surfaces, each documented with its own risk register: probe + config (R1-R14, covers `apiKey` env-var-name leak, Studio LAN exposure, GGUF variant args dropping, prompt-injection RCE via `bash` tool); daemon (R15-R30, covers Baileys account-ban, SIM-swap re-pair, IPC privilege escalation, sandbox bypass via tool-derived `/unsand`, status-pointer injection, audit-log injection, Windows-no-sandbox); operator discipline (workspace hygiene, `/share` discipline, key rotation). Sandbox-by-default enforced on Linux (`bwrap`) and macOS ≤25 (`sandbox-exec`); Windows v1 refuses to start unless `PI_COMMS_ALLOW_UNSANDBOXED_WINDOWS=true` is explicitly set. Full register in `SECURITY.md`. Report vulnerabilities via GitHub security advisory.
+
+## Channels
+
+Telegram via [grammy](https://github.com/grammyjs/grammy) `^1.42` — DM-only allowlist enforced (`TELEGRAM_ALLOWED_USER_IDS` is comma-separated numeric IDs); group messages silently dropped (audit-logged as `dm_only_reject`); typing indicator during agent work; `chunkOutbound()` splits replies at the 4096-char Telegram limit. WhatsApp via [Baileys](https://github.com/WhiskeySockets/Baileys) `7.0.0-rc.9` — reverse-engineered WhatsApp Web client, account-ban risk non-zero, two identity models supported (`second-number` recommended so the ban risk lands on a bot account not your social graph; `self-chat` available as fallback). Read `docs/INSTALL-WHATSAPP.md` §"Threat-model honesty" before pairing. Voice / image / document inbound stubbed in v1; whisper.cpp + Opus + ffmpeg path is v2.
+
+## Status
+
+Alpha — `v0.2.0-alpha.1`. Single-user-of-public-record (the author). Track 1 (probe + config) is stable and verified end-to-end on RTX 5070 (12 GB) + Unsloth Studio + pi-mono 0.70.6 + `unsloth/Qwen3.6-27B-GGUF` UD-Q4_K_XL. Track 2 daemon: terminal CLI works locally; Telegram channel tested with one real bot live; WhatsApp channel ships in v0.2 but has not yet been validated on Windows. Multi-user, group chats, voice/image/document I/O, and production deployment are explicitly out of scope. `private: true` in `package.json`; public GitHub repo, no `npm publish` until v1 stabilizes. Roadmap and pitfalls catalog in `~/.llms/plans/pi_comms_daemon.plan.md` (private to the author).
+
+## Prior art
+
+The pi-comms daemon lifts ~10 named patterns from [gemini-claw](https://github.com/sergiopena/gemini-claw) (a Telegram-native Gemini CLI personal AI operator with private allowlisted chats, ~4000 LOC, MIT, by Sergio Sachar / siddsachar) almost verbatim — zod env config, DM-only allowlist middleware, per-key serial queue, atomic JSON store with corrupt-quarantine, outbound chunking, OperatorLogger, AssistantTaskManager pattern, slash command set, typing indicator + tool progress reporter, `bot.catch` error handler, command argument extraction, AsyncIterable event stream. Each lift cited with file:line in `ACKNOWLEDGEMENTS.md`. pi-mono is the agent runtime; Baileys is the WhatsApp transport; grammy is the Telegram framework. All MIT.
+
+## Author
+
+Sergio Pena ([sergiopena.audio](https://sergiopena.audio), [@KanuToCL](https://github.com/KanuToCL)) — single-maintainer, best-effort response time. Issues, probe verdicts, and security findings welcome at the GitHub repo.
