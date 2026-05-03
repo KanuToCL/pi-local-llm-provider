@@ -26,3 +26,10 @@ Thumbs.db
 *.swp
 *.swo
 *~
+
+# pi-comms additions (Phase 0 onward)
+dist/
+.tsbuildinfo
+coverage/
+.vitest/
+.pi-comms/

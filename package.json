@@ -1,7 +1,7 @@
 {
   "name": "pi-local-llm-provider",
-  "version": "0.0.1",
-  "description": "Configs, probe, and docs for using pi-mono with local LLMs (Unsloth Studio, Ollama, LM Studio, vLLM).",
+  "version": "0.2.0-alpha.1",
+  "description": "Configs, probe, helpers, AND the pi-comms daemon — make pi-mono reachable on local LLMs (Unsloth Studio, Ollama, LM Studio, vLLM) and from Telegram + WhatsApp DMs.",
   "license": "MIT",
   "author": "Sergio Pena <https://sergiopena.audio> (@KanuToCL)",
   "homepage": "https://github.com/KanuToCL/pi-local-llm-provider",
@@ -13,11 +13,37 @@
     "url": "https://github.com/KanuToCL/pi-local-llm-provider/issues"
   },
   "type": "module",
+  "private": true,
   "engines": {
     "node": ">=20"
   },
   "scripts": {
-    "probe": "node scripts/probe-toolcalls.js"
+    "probe": "node scripts/probe-toolcalls.js",
+    "studio-variant": "node scripts/studio-variant.js",
+    "spike": "tsx scripts/sdk-spike.ts",
+    "daemon": "tsx src/daemon.ts",
+    "cli": "tsx bin/pi-comms.ts",
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "grammy": "^1.42.0",
+    "qrcode-terminal": "^0.12.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "@types/qrcode-terminal": "^0.12.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.5"
+  },
+  "optionalDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@whiskeysockets/baileys": "7.0.0-rc.9"
   },
   "keywords": [
     "pi-package",
@@ -25,13 +51,11 @@
     "pi-coding-agent",
     "local-llm",
     "unsloth",
-    "unsloth-studio",
     "ollama",
-    "lm-studio",
-    "vllm",
     "openai-compatible",
     "qwen",
-    "qwen3",
-    "tool-calling"
+    "telegram-bot",
+    "whatsapp-bot",
+    "coding-agent"
   ]
 }
