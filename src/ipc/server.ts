@@ -130,14 +130,20 @@ const DEFAULT_BUFFER_CAP = 1000;
 const MAX_LINE_BYTES = 256 * 1024; // 256 KB hard cap per JSON line
 
 /**
- * Event kinds the `'tell-only'` filter passes through. The WhatsApp /
+ * Event kinds the `'tell-only'` filter passes through.  The WhatsApp /
  * Telegram-style sinks should never see infrastructural noise like
- * `reply` deltas or `system_notice` boot lines — only the agent-driven
- * interrupts and confirms.
+ * `reply` deltas or daemon-internal `system_notice` lines — only the
+ * agent-driven interrupts, confirms, and task-end transitions the user
+ * actually wants to know about.
+ *
+ * AUDIT-C lower-priority: `task_completed` is a real user-facing event
+ * (the framework's "done" signal) and must pass the filter, otherwise
+ * tell-only attached clients miss the task-end notification.
  */
 const TELL_ONLY_EVENT_TYPES = new Set<ChannelEvent["type"]>([
   "tell",
   "confirm_request",
+  "task_completed",
 ]);
 
 /**
@@ -151,6 +157,15 @@ class ConnectionState implements AttachedClient {
   private readonly buffer: ChannelEvent[] = [];
   private paused = false;
   private removed = false;
+  /**
+   * AUDIT-C #12: drain-vs-send race guard.  When `resume()` starts to
+   * drain the buffer, new sendEvent() calls must NOT race directly to
+   * the wire — that would interleave the drain with fresh events,
+   * breaking FIFO ordering the buffer was meant to preserve.  While
+   * `draining` is true, sendEvent enqueues into the buffer instead of
+   * writing the wire; the drain loop catches up.
+   */
+  private draining = false;
 
   constructor(
     readonly socket: Socket,
@@ -179,7 +194,11 @@ class ConnectionState implements AttachedClient {
       // events; only an attached client is part of the fan-out set.
       return;
     }
-    if (this.paused) {
+    // AUDIT-C #12: while paused OR mid-drain, enqueue rather than racing
+    // the drain loop directly to the wire.  This preserves FIFO ordering
+    // even if a fresh event lands between resume() and the last buffered
+    // entry being flushed.
+    if (this.paused || this.draining) {
       this.buffer.push(event);
       this.enforceBufferCap();
       return;
@@ -252,10 +271,20 @@ class ConnectionState implements AttachedClient {
   }
 
   private async drainBuffered(): Promise<void> {
-    while (!this.paused && this.buffer.length > 0) {
-      const next = this.buffer.shift();
-      if (!next) break;
-      await this.writeLine(serializeEvent(next));
+    // AUDIT-C #12: mark draining so concurrent sendEvent() calls enqueue
+    // instead of racing past us.  The drain loop continues until either
+    // the buffer is empty (caught up) or pause() flips paused back on
+    // (caller wants to hold events again).
+    if (this.draining) return;
+    this.draining = true;
+    try {
+      while (!this.paused && this.buffer.length > 0) {
+        const next = this.buffer.shift();
+        if (!next) break;
+        await this.writeLine(serializeEvent(next));
+      }
+    } finally {
+      this.draining = false;
     }
   }
 }
@@ -566,13 +595,14 @@ export class IpcServer implements Sink {
     }
     conn.setAttached(stream, clientName);
     await this.replyAck(conn, "attach");
+    // AUDIT-A vocabulary fix: use a dedicated `ipc_attach` event rather
+    // than reusing `daemon_boot`.  Same forensic content; cleaner enum.
     this.auditAppend({
-      event: "daemon_boot",
+      event: "ipc_attach",
       task_id: null,
       channel: "terminal",
       sender_id_hash: null,
       extra: {
-        ipc_event: "attach",
         client_id: conn.id,
         stream,
         client_name: clientName ?? "",
@@ -594,12 +624,15 @@ export class IpcServer implements Sink {
     } catch {
       /* already closed */
     }
+    // AUDIT-A vocabulary fix: use a dedicated `ipc_detach` event rather
+    // than reusing `daemon_shutdown` (which describes a daemon-wide
+    // teardown, not one client's socket close).
     this.auditAppend({
-      event: "daemon_shutdown",
+      event: "ipc_detach",
       task_id: null,
       channel: "terminal",
       sender_id_hash: null,
-      extra: { ipc_event: "detach", client_id: conn.id, reason },
+      extra: { client_id: conn.id, reason },
     });
     this.opts.operatorLogger?.info("ipc_detach", { client: conn.id, reason });
   }

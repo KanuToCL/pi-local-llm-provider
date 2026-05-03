@@ -232,11 +232,31 @@ export class IpcClient {
       clearTimeout(pending.timer);
       this.pending = null;
       pending.resolve(parsed);
-    } else {
-      // Unsolicited reply — surface so the operator knows the daemon is
-      // out of sync with the CLI's expectations.
-      this.opts.onError?.(`unexpected ${parsed.verb} reply with no in-flight request`);
+      return;
     }
+    // AUDIT-C #11: an unexpected reply must reject the in-flight request
+    // (if any) so callers awaiting `request()` don't dangle until the
+    // 30-second timeout fires.  The spec's contract is "one in-flight at
+    // a time", so any reply we get when one is pending was either for
+    // that request (handled above) or is a daemon-side bug — either way,
+    // surfacing as a reject is correct.
+    if (this.pending) {
+      const pending = this.pending;
+      clearTimeout(pending.timer);
+      this.pending = null;
+      pending.reject(
+        new Error(
+          `unexpected ${parsed.verb} reply (expected one of: ${pending.expect.join(", ")})`,
+        ),
+      );
+      return;
+    }
+    // No request in flight — surface the unsolicited reply via onError so
+    // the operator knows the daemon is out of sync with the CLI's
+    // expectations.
+    this.opts.onError?.(
+      `unexpected ${parsed.verb} reply with no in-flight request`,
+    );
   }
 
   private async send_(req: object): Promise<void> {
