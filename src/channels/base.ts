@@ -48,19 +48,40 @@ export type ChannelId = "terminal" | "whatsapp" | "telegram";
 /**
  * One inbound user-originated message, normalized across channels.
  *
- * For voice/image, the `payload.audioRef` / `payload.imageRef` field holds
- * an absolute filesystem path under `~/.pi-comms/inbound-media/<msgId>.<ext>`
- * (per plan §"v4 changelog Accessibility — audioRef seam").  v1 does NOT
- * decode those — the channel synthesizes a textual placeholder via
- * Pitfall #21 voice-arrival policy and routes the message as `type:'text'`.
- * The audioRef/imageRef hangs around so v2 (whisper.cpp / vision) can
- * pick it up without re-plumbing the inbound path.
+ * For non-text inbound, the appropriate `payload.*Ref` field holds an
+ * absolute filesystem path written by `InboundMediaStore`
+ * (`src/lib/inbound-media.ts`) — typically under
+ * `~/.pi-comms/inbound-media/<msgId>.<ext>` per plan §"v4 changelog
+ * Accessibility — audioRef seam":
+ *   - voice notes / audio attachments       → `payload.audioRef`
+ *   - photos / image attachments            → `payload.imageRef`
+ *   - documents (PDF / docx / etc.)         → `payload.documentRef`
+ *   - videos / stickers / animated content  → `payload.videoRef`
+ *
+ * v1 does NOT decode those — the channel synthesizes a textual placeholder
+ * via Pitfall #21 voice-arrival policy so the agent surface stays uniform
+ * (`payload.text` always carries something the model can read).  The
+ * media-ref fields ARE populated by the channel layer (Telegram + WhatsApp
+ * download the buffer, hand it to InboundMediaStore.save*, and store the
+ * returned path here) so v2 (whisper.cpp / vision) can pick the file up
+ * without re-plumbing the inbound path.
+ *
+ * The `type` field still uses the v1 closed enum (text / voice / image)
+ * for back-compat with envelope.ts; documents and videos collapse to
+ * `image` in `type` but get a dedicated ref field so v2 routing can
+ * disambiguate without losing fidelity.
  */
 export interface InboundMessage {
   type: "text" | "voice" | "image";
   channel: ChannelId;
   sender: { id: string; name?: string };
-  payload: { text?: string; audioRef?: string; imageRef?: string };
+  payload: {
+    text?: string;
+    audioRef?: string;
+    imageRef?: string;
+    documentRef?: string;
+    videoRef?: string;
+  };
   ts: number;
 }
 

@@ -884,3 +884,178 @@ describe("WhatsappChannel — inbound rate limiter wiring (FIX-B-3 Wave 8)", () 
     await channel.stop();
   });
 });
+
+// ---------------------------------------------------------------------------
+// FIX-B-4 Wave 8 — audioRef / imageRef / documentRef / videoRef populated for
+// non-text inbound (closes BLESS Accessibility — v4 changelog audioRef seam)
+// ---------------------------------------------------------------------------
+
+import { InboundMediaStore } from "../src/lib/inbound-media.js";
+import { readFileSync as readFileSyncMedia, statSync as statSyncMedia } from "node:fs";
+
+describe("WhatsappChannel — non-text inbound populates the right *Ref field", () => {
+  async function buildMediaChannel(
+    identityModel: "self-chat" | "second-number",
+    opts?: { fileBuffer?: Buffer; failDownload?: boolean },
+  ): Promise<{
+    channel: WhatsappChannel;
+    socket: MockSocket;
+    proc: CapturingProcessor;
+    downloader: ReturnType<typeof vi.fn>;
+    mediaDir: string;
+  }> {
+    const buffer = opts?.fileBuffer ?? Buffer.from([0xff, 0xfb, 0x90, 0x44]);
+    const downloader = opts?.failDownload
+      ? vi.fn().mockRejectedValue(new Error("baileys-download-fail"))
+      : vi.fn().mockResolvedValue(buffer);
+    const mediaDir = join(workDir, "wa-inbound-media");
+    const proc = new CapturingProcessor();
+    const auditDir = join(workDir, "audit");
+    const audit = new AuditLog({
+      dir: auditDir,
+      daemonStartTs: Date.now() - 1000,
+    });
+    const socket = makeMockSocket();
+    const store = new InboundMediaStore({ dir: mediaDir });
+    const channel = new WhatsappChannel({
+      identityModel,
+      ownerJid: OWNER_JID,
+      botJid: identityModel === "second-number" ? BOT_JID : undefined,
+      authStateDir: join(workDir, "wa-auth"),
+      inboundProcessor: proc,
+      auditLog: audit,
+      socketFactory: makeFactory(socket),
+      inboundMediaStore: store,
+      mediaDownloader: downloader as unknown as (msg: unknown) => Promise<Buffer>,
+    });
+    return { channel, socket, proc, downloader, mediaDir };
+  }
+
+  test("voice inbound: audioRef populated, file persisted, content matches buffer", async () => {
+    const buffer = Buffer.from("OggS\x00\x02voice-bytes");
+    const { channel, socket, proc, downloader } = await buildMediaChannel(
+      "self-chat",
+      { fileBuffer: buffer },
+    );
+    await channel.start();
+    await emitOpen(socket, channel);
+
+    socket.ev.emit("messages.upsert", {
+      messages: [mkMessage({ remoteJid: OWNER_JID, fromMe: true, voice: true })],
+      type: "notify",
+    });
+    await channel.flushPending();
+
+    expect(proc.received).toHaveLength(1);
+    const got = proc.received[0]!;
+    expect(got.type).toBe("voice");
+    expect(got.payload.text).toContain("voice");
+    expect(got.payload.audioRef).toBeDefined();
+    expect(got.payload.audioRef!.endsWith(".ogg")).toBe(true);
+    const onDisk = readFileSyncMedia(got.payload.audioRef!);
+    expect(onDisk.equals(buffer)).toBe(true);
+    if (process.platform !== "win32") {
+      const st = statSyncMedia(got.payload.audioRef!);
+      expect(st.mode & 0o777).toBe(0o600);
+    }
+    expect(downloader).toHaveBeenCalledTimes(1);
+
+    await channel.stop();
+  });
+
+  test("image inbound: imageRef populated, file persisted", async () => {
+    const buffer = Buffer.from([0xff, 0xd8, 0xff, 0xe0]);
+    const { channel, socket, proc } = await buildMediaChannel("second-number", {
+      fileBuffer: buffer,
+    });
+    await channel.start();
+    await emitOpen(socket, channel);
+
+    socket.ev.emit("messages.upsert", {
+      messages: [mkMessage({ remoteJid: OWNER_JID, fromMe: false, image: true })],
+      type: "notify",
+    });
+    await channel.flushPending();
+
+    expect(proc.received).toHaveLength(1);
+    const got = proc.received[0]!;
+    expect(got.type).toBe("image");
+    expect(got.payload.imageRef).toBeDefined();
+    expect(got.payload.imageRef!.endsWith(".jpg")).toBe(true);
+    const onDisk = readFileSyncMedia(got.payload.imageRef!);
+    expect(onDisk.equals(buffer)).toBe(true);
+
+    await channel.stop();
+  });
+
+  test("document inbound: documentRef populated; payload.text still has placeholder", async () => {
+    const buffer = Buffer.from("%PDF-1.4 fake-pdf");
+    const { channel, socket, proc } = await buildMediaChannel("self-chat", {
+      fileBuffer: buffer,
+    });
+    await channel.start();
+    await emitOpen(socket, channel);
+
+    socket.ev.emit("messages.upsert", {
+      messages: [
+        mkMessage({ remoteJid: OWNER_JID, fromMe: true, document: true }),
+      ],
+      type: "notify",
+    });
+    await channel.flushPending();
+
+    expect(proc.received).toHaveLength(1);
+    const got = proc.received[0]!;
+    expect(got.type).toBe("image"); // legacy enum collapse
+    expect(got.payload.documentRef).toBeDefined();
+    expect(got.payload.text).toContain("document");
+    expect(got.payload.imageRef).toBeUndefined();
+    const onDisk = readFileSyncMedia(got.payload.documentRef!);
+    expect(onDisk.equals(buffer)).toBe(true);
+
+    await channel.stop();
+  });
+
+  test("download failure does NOT block placeholder delivery — agent still gets text", async () => {
+    const { channel, socket, proc } = await buildMediaChannel("self-chat", {
+      failDownload: true,
+    });
+    await channel.start();
+    await emitOpen(socket, channel);
+
+    socket.ev.emit("messages.upsert", {
+      messages: [mkMessage({ remoteJid: OWNER_JID, fromMe: true, voice: true })],
+      type: "notify",
+    });
+    await channel.flushPending();
+
+    expect(proc.received).toHaveLength(1);
+    const got = proc.received[0]!;
+    expect(got.type).toBe("voice");
+    expect(got.payload.text).toContain("voice");
+    expect(got.payload.audioRef).toBeUndefined();
+
+    await channel.stop();
+  });
+
+  test("text inbound is unaffected — no media downloader interaction", async () => {
+    const { channel, socket, proc, downloader } = await buildMediaChannel(
+      "second-number",
+    );
+    await channel.start();
+    await emitOpen(socket, channel);
+
+    socket.ev.emit("messages.upsert", {
+      messages: [mkMessage({ remoteJid: OWNER_JID, fromMe: false, text: "hi" })],
+      type: "notify",
+    });
+    await channel.flushPending();
+
+    expect(proc.received).toHaveLength(1);
+    expect(proc.received[0]!.payload.audioRef).toBeUndefined();
+    expect(proc.received[0]!.payload.imageRef).toBeUndefined();
+    expect(downloader).not.toHaveBeenCalled();
+
+    await channel.stop();
+  });
+});
