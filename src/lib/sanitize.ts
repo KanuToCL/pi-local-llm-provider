@@ -101,10 +101,63 @@ const CREDENTIAL_PATTERNS: Array<{ name: string; re: RegExp }> = [
     name: "github-token",
     re: /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b/g,
   },
+  // Anthropic v2 production keys: sk-ant-api03- + body.  Listed BEFORE the
+  // general sk- pattern so the more specific match wins (the redaction
+  // marker is identical, but explicit naming aids forensic review).
+  {
+    name: "anthropic-v2",
+    re: /\bsk-ant-api03-[A-Za-z0-9_\-]{20,}\b/g,
+  },
   // OpenAI / Anthropic style sk-… keys (sk-proj-, sk-ant-, sk-).
   {
     name: "sk-key",
     re: /\bsk-(?:proj-|ant-|live-)?[A-Za-z0-9_\-]{20,}\b/g,
+  },
+  // Stripe live and test secret/publishable keys.  All Stripe keys follow
+  // the `<prefix>_<env>_<24-or-more chars>` shape.
+  //   sk_live_, sk_test_, pk_live_, pk_test_, rk_live_, rk_test_
+  {
+    name: "stripe",
+    re: /\b(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9]{16,}\b/g,
+  },
+  // Slack tokens: xox[baprs]-followed by token body (≥8 chars first segment,
+  // then dash-delimited groups).  Covers bot, app, user, refresh, and
+  // workspace tokens.  Anchored on `xox[baprs]-` so we don't false-match
+  // arbitrary `xox` strings.
+  {
+    name: "slack-token",
+    re: /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g,
+  },
+  // Twilio Account/API SIDs and API Keys.
+  //   AC[a-f0-9]{32}  → AccountSid
+  //   SK[a-f0-9]{32}  → API Key SID
+  // The 32-hex tail is the canonical Twilio shape.
+  {
+    name: "twilio",
+    re: /\b(?:AC|SK)[a-f0-9]{32}\b/g,
+  },
+  // DigitalOcean personal access tokens: dop_v1_ + 64 hex chars.
+  {
+    name: "digitalocean-pat",
+    re: /\bdop_v1_[a-f0-9]{32,}\b/g,
+  },
+  // Notion integration secrets: secret_ + base64-ish body (≥32 chars).
+  // Anchored on the exact prefix so we don't false-match a benign word.
+  {
+    name: "notion-secret",
+    re: /\bsecret_[A-Za-z0-9]{32,}\b/g,
+  },
+  // Linear API tokens: lin_api_ + body (≥32 chars).
+  {
+    name: "linear-api",
+    re: /\blin_api_[A-Za-z0-9]{20,}\b/g,
+  },
+  // Sentry DSNs: https://<32-hex-public-key>@<host>/<project-id>.
+  // The DSN itself is sensitive (it's the upload credential) — redact the
+  // whole URL, not just the key.
+  {
+    name: "sentry-dsn",
+    re: /\bhttps:\/\/[a-f0-9]{32}@[A-Za-z0-9.\-]+(?::\d+)?(?:\/[A-Za-z0-9_\-/]*)?/g,
   },
   // Google API key shape: AIza + 35 url-safe chars.
   {

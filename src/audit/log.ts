@@ -31,6 +31,20 @@ import { join } from "node:path";
 
 import { AuditEntry, AuditEntrySchema } from "./schema.js";
 
+/**
+ * Hard cap on the JSON-encoded size of `extra` plus `error_class` (FIX-B-2 #3).
+ * 8KB chosen because:
+ *   - The audit log is JSONL on a single-user box; lines that approach this
+ *     are almost certainly a runaway `extra` field (stack trace dump, base64
+ *     blob, raw command output) — the kind of thing that benefits more from
+ *     a marker than from full preservation.
+ *   - 8KB still leaves comfortable headroom under the 16KB pipe-buffer
+ *     write boundary on Linux/macOS so a single append() never spans atomicity.
+ */
+const EXTRA_SIZE_CAP_BYTES = 8 * 1024;
+/** Per-string cap before any aggregate cap kicks in. */
+const PER_STRING_CAP_BYTES = 8 * 1024;
+
 export interface AuditLogOptions {
   /** Directory for `audit.YYYY-MM-DD.jsonl` files. Created if missing. */
   dir: string;
@@ -79,11 +93,16 @@ export class AuditLog {
    */
   async append(entry: Omit<AuditEntry, "ts" | "daemon_uptime_s">): Promise<void> {
     const now = new Date();
+    // FIX-B-2 #3: cap any string in `extra` and `error_class` so a runaway
+    // payload (10MB stack-trace, raw command output) cannot bloat the JSONL
+    // line beyond the 8KB budget.  We mutate a shallow copy — never the
+    // caller's object.
+    const capped = capEntrySizes(entry);
     // AUDIT-A spread-order fix: caller-provided fields go FIRST, daemon-
     // computed timestamps go LAST so a buggy caller cannot accidentally
     // forge `ts` or `daemon_uptime_s` by passing them in `entry`.
     const full: AuditEntry = {
-      ...entry,
+      ...capped,
       ts: now.toISOString(),
       daemon_uptime_s: Math.max(
         0,
@@ -178,4 +197,82 @@ function formatDateUtc(d: Date): string {
 
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {
   return error instanceof Error && "code" in error;
+}
+
+/**
+ * Truncate a string to `max` UTF-8 bytes, replacing the tail with a
+ * `[TRUNCATED:NNNbytes]` marker that records the dropped byte count.
+ *
+ * We use Buffer.byteLength because JS string `.length` counts UTF-16 code
+ * units, not bytes — an emoji or CJK char would otherwise be undercounted
+ * against the 8KB cap and the resulting JSONL line could still blow past it.
+ */
+function truncateStringToBytes(value: string, max: number): string {
+  const bytes = Buffer.byteLength(value, "utf8");
+  if (bytes <= max) return value;
+  // Reserve room for the marker so the final string fits under `max`.
+  const markerSuffix = `[TRUNCATED:${bytes}bytes]`;
+  const markerBytes = Buffer.byteLength(markerSuffix, "utf8");
+  const allowance = Math.max(0, max - markerBytes);
+  // Slice on the byte-encoded form to avoid splitting a multi-byte codepoint
+  // across the cut.
+  const buf = Buffer.from(value, "utf8");
+  let cut = Math.min(allowance, buf.length);
+  // Walk back if we're sitting in the middle of a UTF-8 continuation byte
+  // (high two bits == 10).  Up to 3 walk-backs suffice for any codepoint.
+  while (cut > 0 && (buf[cut] & 0xc0) === 0x80) cut -= 1;
+  return buf.slice(0, cut).toString("utf8") + markerSuffix;
+}
+
+/**
+ * Apply size caps before validation:
+ *   1. Each string in `extra` capped at PER_STRING_CAP_BYTES (8KB).
+ *   2. `error_class` capped at PER_STRING_CAP_BYTES.
+ *   3. If the JSON-encoded `extra` still exceeds EXTRA_SIZE_CAP_BYTES, drop
+ *      offending fields in priority order (longest first) — replace each with
+ *      a `[TRUNCATED:NNNbytes]` placeholder until the encoded blob is under
+ *      cap.  Non-string values (numbers, booleans) are tiny and not capped.
+ */
+function capEntrySizes(
+  entry: Omit<AuditEntry, "ts" | "daemon_uptime_s">,
+): Omit<AuditEntry, "ts" | "daemon_uptime_s"> {
+  const out: Omit<AuditEntry, "ts" | "daemon_uptime_s"> = { ...entry };
+
+  if (typeof out.error_class === "string") {
+    out.error_class = truncateStringToBytes(
+      out.error_class,
+      PER_STRING_CAP_BYTES,
+    );
+  }
+
+  if (out.extra) {
+    // Step 1: per-field cap.
+    const cappedExtra: Record<string, string | number | boolean> = {};
+    for (const [k, v] of Object.entries(out.extra)) {
+      if (typeof v === "string") {
+        cappedExtra[k] = truncateStringToBytes(v, PER_STRING_CAP_BYTES);
+      } else {
+        cappedExtra[k] = v;
+      }
+    }
+
+    // Step 2: aggregate cap.  Drop the longest string fields first until the
+    // serialized `extra` is under the cap.
+    while (
+      Buffer.byteLength(JSON.stringify(cappedExtra), "utf8") >
+      EXTRA_SIZE_CAP_BYTES
+    ) {
+      const stringFields = Object.entries(cappedExtra)
+        .filter(([, v]) => typeof v === "string")
+        .map(([k, v]) => ({ key: k, len: Buffer.byteLength(v as string, "utf8") }))
+        .sort((a, b) => b.len - a.len);
+      if (stringFields.length === 0) break; // only non-strings left; nothing to drop
+      const victim = stringFields[0];
+      cappedExtra[victim.key] = `[TRUNCATED:${victim.len}bytes]`;
+    }
+
+    out.extra = cappedExtra;
+  }
+
+  return out;
 }

@@ -150,4 +150,117 @@ describe("redactCredentialShapes", () => {
     expect(out).toContain(shortHex);
     expect(out).not.toContain("[REDACTED:credential-shape]");
   });
+
+  // ----- FIX-B-2 #5: extended credential coverage -----
+  //
+  // SECURITY NOTE: All tokens below are SYNTHETIC TEST FIXTURES, not real credentials.
+  // Each contains the literal marker text "EXAMPLE-FIXTURE-NOT-A-REAL-SECRET" so that
+  // (a) any human reading the file sees they're fake, and (b) GitHub's push-protection
+  // secret scanner does not match them. The redactor regexes only need the prefix
+  // (xoxb-, sk_live_, AC<hex>, sk-ant-api03-, etc.) — the suffix is shape-padding.
+
+  const FAKE = "EXAMPLE-FIXTURE-NOT-A-REAL-SECRET-DO-NOT-SCAN";
+
+  test("redacts Slack bot token (xoxb-)", () => {
+    const tok = `xoxb-${FAKE}-aaaaaaaa`;
+    const out = redactCredentialShapes(`SLACK=${tok} end`);
+    expect(out).not.toContain(tok);
+    expect(out).toContain("[REDACTED:credential-shape]");
+  });
+
+  test("redacts Slack user token (xoxp-)", () => {
+    const tok = `xoxp-${FAKE}-bbbbbbbb`;
+    const out = redactCredentialShapes(`val=${tok} done`);
+    expect(out).not.toContain(tok);
+    expect(out).toContain("[REDACTED:credential-shape]");
+  });
+
+  test("redacts Slack app/refresh/session tokens (xoxa, xoxr, xoxs)", () => {
+    for (const prefix of ["xoxa", "xoxr", "xoxs"]) {
+      const tok = `${prefix}-${FAKE}-cccc`;
+      const out = redactCredentialShapes(`x=${tok}`);
+      expect(out).not.toContain(tok);
+      expect(out).toContain("[REDACTED:credential-shape]");
+    }
+  });
+
+  test("redacts Stripe live secret key (sk_live_)", () => {
+    const key = `sk_live_${FAKE.replace(/-/g, "")}aaaaaaa`;
+    const out = redactCredentialShapes(`STRIPE=${key} done`);
+    expect(out).not.toContain(key);
+    expect(out).toContain("[REDACTED:credential-shape]");
+  });
+
+  test("redacts Stripe restricted key (rk_live_)", () => {
+    const key = `rk_live_${FAKE.replace(/-/g, "")}bbbbbbb`;
+    const out = redactCredentialShapes(`STRIPE=${key} done`);
+    expect(out).not.toContain(key);
+    expect(out).toContain("[REDACTED:credential-shape]");
+  });
+
+  test("redacts Stripe publishable key (pk_live_) and test variants (sk_test_)", () => {
+    const live = `pk_live_${FAKE.replace(/-/g, "")}ccccccc`;
+    const testKey = `sk_test_${FAKE.replace(/-/g, "")}ddddddd`;
+    const out = redactCredentialShapes(`a=${live} b=${testKey}`);
+    expect(out).not.toContain(live);
+    expect(out).not.toContain(testKey);
+    const matches = out.match(/\[REDACTED:credential-shape\]/g) ?? [];
+    expect(matches.length).toBeGreaterThanOrEqual(2);
+  });
+
+  test("redacts Twilio AccountSid (AC + 32 hex)", () => {
+    // AC followed by exactly 32 hex chars — synthetic but shape-valid
+    const sid = "AC" + "deadbeefdeadbeefdeadbeefdeadbeef";
+    expect(sid.length).toBe(34);
+    const out = redactCredentialShapes(`TWILIO=${sid} end`);
+    expect(out).not.toContain(sid);
+    expect(out).toContain("[REDACTED:credential-shape]");
+  });
+
+  test("redacts Twilio API Key SID (SK + 32 hex)", () => {
+    const sid = "SK" + "deadbeefdeadbeefdeadbeefdeadbeef";
+    expect(sid.length).toBe(34);
+    const out = redactCredentialShapes(`KEY=${sid} end`);
+    expect(out).not.toContain(sid);
+    expect(out).toContain("[REDACTED:credential-shape]");
+  });
+
+  test("redacts Anthropic v2 production key (sk-ant-api03-)", () => {
+    const key = `sk-ant-api03-${FAKE}-eeeeeeee`;
+    const out = redactCredentialShapes(`ANTHROPIC=${key} done`);
+    expect(out).not.toContain(key);
+    expect(out).toContain("[REDACTED:credential-shape]");
+  });
+
+  test("redacts DigitalOcean PAT (dop_v1_)", () => {
+    // DO PAT regex is hex-only after the prefix; FAKE alpha would not match.
+    // Use `deadbeef`-padding (synthetic hex, not a real key).
+    const tok = "dop_v1_" + "deadbeef".repeat(8); // 64 hex chars
+    const out = redactCredentialShapes(`DO=${tok} done`);
+    expect(out).not.toContain(tok);
+    expect(out).toContain("[REDACTED:credential-shape]");
+  });
+
+  test("redacts Notion integration secret (secret_)", () => {
+    const tok = `secret_${FAKE.replace(/-/g, "")}ggggggg`;
+    const out = redactCredentialShapes(`NOTION=${tok} done`);
+    expect(out).not.toContain(tok);
+    expect(out).toContain("[REDACTED:credential-shape]");
+  });
+
+  test("redacts Linear API token (lin_api_)", () => {
+    const tok = `lin_api_${FAKE.replace(/-/g, "")}hhhhhhh`;
+    const out = redactCredentialShapes(`LINEAR=${tok} done`);
+    expect(out).not.toContain(tok);
+    expect(out).toContain("[REDACTED:credential-shape]");
+  });
+
+  test("redacts Sentry DSN (https://<key>@host/project)", () => {
+    // Sentry DSN regex needs https://<32-hex>@<host>/<id>; FAKE breaks the hex match,
+    // so use deadbeef-padding to satisfy the shape without being a real secret.
+    const dsn = "https://deadbeefdeadbeefdeadbeefdeadbeef@o12345.example-fake-fixture.invalid/9999";
+    const out = redactCredentialShapes(`SENTRY_DSN=${dsn} done`);
+    expect(out).not.toContain(dsn);
+    expect(out).toContain("[REDACTED:credential-shape]");
+  });
 });

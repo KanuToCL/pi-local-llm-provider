@@ -25,6 +25,7 @@ import { homedir, platform } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 
+import { AuditLog } from "../src/audit/log.js";
 import { IpcClient } from "../src/ipc/client.js";
 import { readToken } from "../src/ipc/protocol.js";
 import {
@@ -330,6 +331,41 @@ async function runUnlock(
   }
 }
 
+/**
+ * FIX-B-2 #1: `pi-comms purge [--older-than=N]`.
+ *
+ * Construct an AuditLog pointing at `<HOME>/audit` and call
+ * `purgeOlderThan(N)`.  Default N=90 days (matches AuditLog's own default
+ * and `PI_COMMS_AUDIT_RETENTION_DAYS`).  This runs WITHOUT touching the
+ * daemon — purely filesystem-side — so an operator can reclaim disk even
+ * when the daemon is down.
+ */
+async function runPurge(olderThanDays: number): Promise<number> {
+  const auditDir = join(DEFAULT_HOME, "audit");
+  if (!existsSync(auditDir)) {
+    process.stdout.write(`pi-comms: audit dir not present (${auditDir}); nothing to purge.\n`);
+    return 0;
+  }
+  const log = new AuditLog({
+    dir: auditDir,
+    // daemonStartTs irrelevant for purge — only `dir` and the call argument matter.
+    daemonStartTs: Date.now(),
+    retentionDays: olderThanDays,
+  });
+  try {
+    const purged = await log.purgeOlderThan(olderThanDays);
+    process.stdout.write(
+      `pi-comms: purged ${purged} audit log file(s) older than ${olderThanDays} day(s).\n`,
+    );
+    return 0;
+  } catch (err) {
+    process.stderr.write(
+      `pi-comms: purge failed: ${err instanceof Error ? err.message : String(err)}\n`,
+    );
+    return 1;
+  }
+}
+
 async function runDoctor(): Promise<number> {
   const lines: string[] = [];
   let ok = true;
@@ -429,6 +465,7 @@ function printUsage(): void {
       "  pi-comms shutdown              # graceful daemon stop",
       "  pi-comms unlock                # /unlock from terminal (RS-2)",
       "  pi-comms doctor                # diagnostics (no daemon required)",
+      "  pi-comms purge [--older-than=N] # delete audit logs older than N days (default 90)",
     ].join("\n") + "\n"
   );
 }
@@ -437,8 +474,28 @@ async function main(): Promise<number> {
   const argv = process.argv.slice(2);
   const sub = argv[0];
 
-  // doctor + help do not require a token.
+  // doctor, purge, + help do not require a token (purge is purely a
+  // filesystem op; it doesn't touch the daemon).
   if (sub === "doctor") return runDoctor();
+  if (sub === "purge") {
+    const rest = argv.slice(1);
+    const parsed = parseArgs({
+      args: rest,
+      options: {
+        "older-than": { type: "string", default: "90" },
+      },
+      allowPositionals: true,
+    });
+    const raw = String(parsed.values["older-than"] ?? "90");
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n <= 0) {
+      process.stderr.write(
+        `pi-comms: --older-than must be a positive number; got '${raw}'.\n`,
+      );
+      return 2;
+    }
+    return runPurge(Math.floor(n));
+  }
   if (sub === "--help" || sub === "-h" || sub === "help") {
     printUsage();
     return 0;

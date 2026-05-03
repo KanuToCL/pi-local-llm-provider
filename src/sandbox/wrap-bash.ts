@@ -40,6 +40,8 @@
  *     decision.
  */
 
+import { createHash } from "node:crypto";
+
 import { execRaw, execSandboxed } from "./exec.js";
 import type { SandboxPolicy } from "./policy.js";
 
@@ -58,13 +60,32 @@ export interface BashClassifier {
 }
 
 /**
- * Audit-event sink. The wrapper emits `classifier_block` and
- * `classifier_confirm_required` here. We type only the methods used so
- * tests can pass a thin stub instead of dragging in `AuditLog`.
+ * Audit-event sink. The wrapper emits `classifier_block`,
+ * `classifier_confirm_required`, and (per FIX-B-2 #2) `tool_execution_start`
+ * / `tool_execution_end` here. We type only the methods used so tests can
+ * pass a thin stub instead of dragging in `AuditLog`.
  */
 export interface BashAuditSink {
   classifierBlock(cmd: string, reason: string | undefined, severity: ClassifierDecision["severity"]): void;
   classifierConfirmRequired(cmd: string, severity: ClassifierDecision["severity"]): void;
+  /**
+   * Fired immediately before exec is dispatched to the sandbox/raw shim.
+   * `cmd_hash` is SHA-256 of the raw command line so post-incident review
+   * can correlate start+end without logging the cleartext command.
+   */
+  toolExecutionStart?(args: { cmdHash: string; sandboxed: boolean }): void;
+  /**
+   * Fired after exec settles (success, failure, timeout, or abort). The
+   * `cmd_hash` matches the `start` event for the same call.  `durationMs`
+   * is wall-clock measured from immediately before the exec call.
+   */
+  toolExecutionEnd?(args: {
+    cmdHash: string;
+    durationMs: number;
+    exitCode: number | null;
+    timedOut: boolean;
+    aborted: boolean;
+  }): void;
 }
 
 /**
@@ -225,7 +246,30 @@ export async function runBash(
     timeoutMs: params.timeoutMs ?? opts.defaultTimeoutMs,
     abortSignal: signal,
   };
+  // FIX-B-2 #2: emit start/end audit events with a SHA256 cmd_hash so the
+  // log records bash latency without retaining the cleartext command.  Both
+  // calls are best-effort — never let an audit-sink throw crash the bash
+  // call itself.
+  const cmdHash = createHash("sha256").update(cmd).digest("hex");
+  try {
+    opts.audit?.toolExecutionStart?.({ cmdHash, sandboxed });
+  } catch {
+    /* audit sinks must never break the wrapper */
+  }
+  const startedAt = Date.now();
   const result = await (sandboxed ? execSandboxed(execOpts) : execRaw(execOpts));
+  const durationMs = Date.now() - startedAt;
+  try {
+    opts.audit?.toolExecutionEnd?.({
+      cmdHash,
+      durationMs,
+      exitCode: result.exitCode,
+      timedOut: result.timedOut,
+      aborted: result.aborted,
+    });
+  } catch {
+    /* audit sinks must never break the wrapper */
+  }
 
   return {
     content: [

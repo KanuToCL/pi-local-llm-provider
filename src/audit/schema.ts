@@ -85,6 +85,10 @@ export const AuditEventType = z.enum([
   "classifier_confirm_required",
   "allowlist_reject",
   "dm_only_reject",
+  // Per-sender / per-channel ingress rate limiting (FIX-B-3 Wave 8). Fires
+  // BEFORE the allowlist/DM-only checks; silent reject (no reply). `extra`
+  // carries `reason: 'per_sender' | 'per_channel'`.
+  "inbound_rate_limited",
   // Channels
   "whatsapp_connect",
   "whatsapp_disconnect",
@@ -112,6 +116,17 @@ export const AuditEventType = z.enum([
   // IPC lifecycle (separate from daemon-wide events)
   "ipc_attach",
   "ipc_detach",
+  // Tool execution latency instrumentation (FIX-B-2 #2)
+  // Per plan §"v4 Observability latency instrumentation":
+  //   bash tool emits start+end with cmd_hash + duration_ms so post-incident
+  //   review can correlate sandbox/classifier decisions with actual cost.
+  "tool_execution_start",
+  "tool_execution_end",
+  // Audit-log corruption detector (FIX-B-2 #4)
+  // Surfaced when ensureInstallSalt encounters a parse failure: write the
+  // forensic row BEFORE regenerating the salt so the audit trail records
+  // what happened.
+  "audit_log_corruption_detected",
 ]);
 
 export type AuditEventType = z.infer<typeof AuditEventType>;

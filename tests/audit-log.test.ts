@@ -278,6 +278,144 @@ describe("AuditLog rotation + retention", () => {
   });
 });
 
+describe("AuditLog 8KB size cap (FIX-B-2 #3)", () => {
+  test("caps a 10MB string field in extra and emits truncation marker", async () => {
+    const log = new AuditLog({ dir: workDir, daemonStartTs: Date.now() });
+    const huge = "x".repeat(10 * 1024 * 1024); // 10 MB
+    await log.append({
+      event: "task_started",
+      task_id: "T1",
+      channel: "terminal",
+      sender_id_hash: "h",
+      extra: { dump: huge },
+    });
+
+    const lines = readAllLines(log.currentLogPath()) as AuditEntry[];
+    expect(lines.length).toBe(1);
+    const dump = lines[0].extra?.dump as string;
+    expect(typeof dump).toBe("string");
+    // The cap forces a truncation marker on the offending field.
+    expect(dump).toMatch(/^\[TRUNCATED:\d+bytes\]/);
+    // Whole encoded line stays well under 64KB.
+    const raw = readFileSync(log.currentLogPath(), "utf8");
+    expect(raw.length).toBeLessThan(64 * 1024);
+  });
+
+  test("caps individual moderately-sized strings in extra without dropping them", async () => {
+    const log = new AuditLog({ dir: workDir, daemonStartTs: Date.now() });
+    // Pick a size that's over the per-string cap but small enough that
+    // after per-string truncation the aggregate JSON still fits — this
+    // exercises the per-string path WITHOUT the aggregate-drop fallback.
+    const big = "y".repeat(9 * 1024); // 9KB — over 8KB per-string, under 8KB encoded after truncation
+    await log.append({
+      event: "task_started",
+      task_id: "T2",
+      channel: "terminal",
+      sender_id_hash: "h",
+      extra: { trace: big },
+    });
+    const lines = readAllLines(log.currentLogPath()) as AuditEntry[];
+    const trace = lines[0].extra?.trace as string;
+    expect(typeof trace).toBe("string");
+    // Per-string cap kept the surviving bytes ≤ 8KB.
+    expect(Buffer.byteLength(trace, "utf8")).toBeLessThanOrEqual(8 * 1024);
+    // The truncation marker records the original byte count (9*1024).
+    expect(trace).toMatch(/\[TRUNCATED:\d+bytes\]$/);
+  });
+
+  test("caps oversized error_class field", async () => {
+    const log = new AuditLog({ dir: workDir, daemonStartTs: Date.now() });
+    const big = "E".repeat(20 * 1024);
+    await log.append({
+      event: "task_failed",
+      task_id: "T3",
+      channel: "terminal",
+      sender_id_hash: "h",
+      error_class: big,
+    });
+    const lines = readAllLines(log.currentLogPath()) as AuditEntry[];
+    const ec = lines[0].error_class as string;
+    expect(Buffer.byteLength(ec, "utf8")).toBeLessThanOrEqual(8 * 1024);
+    expect(ec.endsWith(`[TRUNCATED:${20 * 1024}bytes]`)).toBe(true);
+  });
+
+  test("leaves small extras untouched", async () => {
+    const log = new AuditLog({ dir: workDir, daemonStartTs: Date.now() });
+    await log.append({
+      event: "task_started",
+      task_id: "T4",
+      channel: "terminal",
+      sender_id_hash: "h",
+      extra: { reason: "user_request", small: "ok" },
+    });
+    const lines = readAllLines(log.currentLogPath()) as AuditEntry[];
+    expect(lines[0].extra?.reason).toBe("user_request");
+    expect(lines[0].extra?.small).toBe("ok");
+  });
+});
+
+describe("AuditLog new event types (FIX-B-2 #2 + #4)", () => {
+  test("accepts tool_execution_start with cmd_hash and tool_call_name", async () => {
+    const log = new AuditLog({ dir: workDir, daemonStartTs: Date.now() });
+    await log.append({
+      event: "tool_execution_start",
+      task_id: "T1",
+      channel: "terminal",
+      sender_id_hash: "h",
+      tool_call_name: "bash",
+      extra: {
+        cmd_hash: "deadbeef".repeat(8), // 64-char SHA256-shaped placeholder
+        sandboxed: true,
+      },
+    });
+    const lines = readAllLines(log.currentLogPath()) as AuditEntry[];
+    expect(lines[0].event).toBe("tool_execution_start");
+    expect(lines[0].tool_call_name).toBe("bash");
+    expect(lines[0].extra?.sandboxed).toBe(true);
+  });
+
+  test("accepts tool_execution_end with duration_ms", async () => {
+    const log = new AuditLog({ dir: workDir, daemonStartTs: Date.now() });
+    await log.append({
+      event: "tool_execution_end",
+      task_id: "T1",
+      channel: "terminal",
+      sender_id_hash: "h",
+      tool_call_name: "bash",
+      duration_ms: 1234,
+      extra: {
+        cmd_hash: "deadbeef".repeat(8),
+        exit_code: 0,
+        timed_out: false,
+        aborted: false,
+      },
+    });
+    const lines = readAllLines(log.currentLogPath()) as AuditEntry[];
+    expect(lines[0].event).toBe("tool_execution_end");
+    expect(lines[0].duration_ms).toBe(1234);
+    expect(lines[0].extra?.exit_code).toBe(0);
+  });
+
+  test("accepts audit_log_corruption_detected with file marker", async () => {
+    const log = new AuditLog({ dir: workDir, daemonStartTs: Date.now() });
+    await log.append({
+      event: "audit_log_corruption_detected",
+      task_id: null,
+      channel: "system",
+      sender_id_hash: null,
+      error_class: "SyntaxError",
+      extra: {
+        file: "install.json",
+        message: "Unexpected token } in JSON at position 12",
+      },
+    });
+    const lines = readAllLines(log.currentLogPath()) as AuditEntry[];
+    expect(lines[0].event).toBe("audit_log_corruption_detected");
+    expect(lines[0].extra?.file).toBe("install.json");
+    expect(lines[0].error_class).toBe("SyntaxError");
+  });
+});
+
 describe("AuditLog.senderIdHash", () => {
   test("is deterministic for the same input + salt", () => {
     const a = AuditLog.senderIdHash("15105551234@s.whatsapp.net", "salt-A");

@@ -116,6 +116,12 @@ const STUDIO_MODEL_WAIT_MS = 5 * 60 * 1000;
 /** Re-poll interval while waiting for the model to load. */
 const STUDIO_MODEL_POLL_MS = 5_000;
 
+/** How often the audit-log retention sweep runs (FIX-B-2 #1).  Once per 24h
+ *  is plenty: the underlying purgeOlderThan(N) deletes entire daily files,
+ *  so finer-grained scheduling buys nothing.  Runs immediately at boot too
+ *  to catch the case where the daemon was stopped for >24h. */
+const AUDIT_PURGE_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
 // ---------------------------------------------------------------------------
 // Public — error surface
 // ---------------------------------------------------------------------------
@@ -208,7 +214,11 @@ export async function start(opts: DaemonOpts = {}): Promise<RunningDaemon> {
 
   // 4. Install salt — required by AuditLog.senderIdHash. Cheap to derive once
   //    and persist; survives daemon restarts so audit hashes are stable.
-  const installSalt = await ensureInstallSalt(home);
+  //    Per FIX-B-2 #4: capture any parse-failure metadata so we can emit
+  //    a forensic `audit_log_corruption_detected` row AFTER the AuditLog
+  //    is constructed (we can't emit it here yet — auditLog doesn't exist).
+  const saltResult = await ensureInstallSalt(home);
+  const installSalt = saltResult.salt;
 
   // 5. Audit log + operator logger.
   const daemonStartTs = Date.now();
@@ -217,6 +227,26 @@ export async function start(opts: DaemonOpts = {}): Promise<RunningDaemon> {
     daemonStartTs,
     retentionDays: config.piCommsAuditRetentionDays,
   });
+
+  // 5b. FIX-B-2 #4: if install.json was corrupt, emit the forensic row
+  //     BEFORE anything else uses the audit log so post-incident review can
+  //     locate the regen event chronologically.  Best-effort; never block
+  //     boot on a logging failure.
+  if (saltResult.corruption) {
+    void auditLog
+      .append({
+        event: "audit_log_corruption_detected",
+        task_id: null,
+        channel: "system",
+        sender_id_hash: null,
+        error_class: saltResult.corruption.errorClass,
+        extra: {
+          file: "install.json",
+          message: saltResult.corruption.message.slice(0, 200),
+        },
+      })
+      .catch(() => undefined);
+  }
 
   const operatorLogger =
     opts.operatorLogger ??
@@ -664,6 +694,39 @@ export async function start(opts: DaemonOpts = {}): Promise<RunningDaemon> {
   }, PERIODIC_TICK_INTERVAL_MS);
   periodicTickTimer.unref?.();
 
+  // 18c. FIX-B-2 #1: scheduled audit-log retention sweep.  Calls
+  //      `auditLog.purgeOlderThan(config.piCommsAuditRetentionDays)` once
+  //      shortly after boot and then every 24h.  Each sweep logs the count
+  //      via the operator logger so a tail-the-log-and-grep operator can
+  //      see retention working.
+  const runAuditPurge = async (): Promise<void> => {
+    try {
+      const count = await auditLog.purgeOlderThan(
+        config.piCommsAuditRetentionDays,
+      );
+      operatorLogger.info("daemon_boot", {
+        sweep: "audit_log_purge",
+        retention_days: config.piCommsAuditRetentionDays,
+        purged: count,
+      });
+    } catch (err) {
+      operatorLogger.error("chat_error", {
+        context: "audit_log_purge",
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  };
+  // First sweep: 60s after boot so we don't burn CPU during the noisy
+  // startup window.  Subsequent sweeps: every 24h.
+  const auditPurgeKickoffTimer = setTimeout(() => {
+    void runAuditPurge();
+  }, 60_000);
+  auditPurgeKickoffTimer.unref?.();
+  const auditPurgeTimer = setInterval(() => {
+    void runAuditPurge();
+  }, AUDIT_PURGE_INTERVAL_MS);
+  auditPurgeTimer.unref?.();
+
   // 18. Signal handlers.
   const handle: RunningDaemon = {
     socketPath,
@@ -677,6 +740,8 @@ export async function start(opts: DaemonOpts = {}): Promise<RunningDaemon> {
         operatorLogger.info("daemon_shutdown", { reason });
         clearInterval(heartbeatObserveTimer);
         clearInterval(periodicTickTimer);
+        clearTimeout(auditPurgeKickoffTimer);
+        clearInterval(auditPurgeTimer);
 
         // Cancel any in-flight task gracefully.
         const cur = taskState.get();
@@ -1254,17 +1319,46 @@ async function ensureSecureDir(path: string): Promise<void> {
   }
 }
 
-async function ensureInstallSalt(home: string): Promise<string> {
+/**
+ * Per FIX-B-2 #4: structured return value so the boot path can emit a
+ * forensic `audit_log_corruption_detected` row when parse fails BEFORE we
+ * silently regen the salt.  `corruption` is `undefined` when the file was
+ * absent (cold-start case) or already valid — only set when the file existed
+ * AND failed to parse / failed schema validation.
+ */
+interface InstallSaltResult {
+  salt: string;
+  corruption?: { errorClass: string; message: string };
+}
+
+async function ensureInstallSalt(home: string): Promise<InstallSaltResult> {
   const path = join(home, "install.json");
+  let corruption: InstallSaltResult["corruption"];
   try {
     const raw = await readFile(path, "utf8");
-    const data = JSON.parse(raw) as { install_salt?: string };
-    if (
-      data.install_salt &&
-      typeof data.install_salt === "string" &&
-      data.install_salt.length >= 16
-    ) {
-      return data.install_salt;
+    try {
+      const data = JSON.parse(raw) as { install_salt?: string };
+      if (
+        data.install_salt &&
+        typeof data.install_salt === "string" &&
+        data.install_salt.length >= 16
+      ) {
+        return { salt: data.install_salt };
+      }
+      // File parsed but the salt is missing/short — treat as corruption so
+      // the regen is auditable.  Without this branch the daemon would
+      // silently rotate the salt and break sender_id_hash continuity for
+      // every conversation in the audit log.
+      corruption = {
+        errorClass: "InvalidInstallSalt",
+        message: `install.json present but install_salt missing or shorter than 16 chars`,
+      };
+    } catch (parseErr) {
+      corruption = {
+        errorClass:
+          parseErr instanceof Error ? parseErr.constructor.name : "ParseError",
+        message: parseErr instanceof Error ? parseErr.message : String(parseErr),
+      };
     }
   } catch (err) {
     if (
@@ -1272,15 +1366,22 @@ async function ensureInstallSalt(home: string): Promise<string> {
       "code" in err &&
       (err as NodeJS.ErrnoException).code !== "ENOENT"
     ) {
-      // A corrupt install.json is a forensic-relevant event — surface it
-      // upstream by recreating the salt; don't silently fall through.
+      // A read failure other than "file does not exist" is an ambient FS
+      // problem, not a corrupt-file event.  Mark it so the boot path
+      // surfaces it via the corruption audit row.
+      corruption = {
+        errorClass: err.constructor.name,
+        message: err.message,
+      };
     }
+    // ENOENT is the cold-start path — no corruption row, just regen below.
   }
+
   const salt = randomBytes(32).toString("hex");
   const payload = JSON.stringify(
     { install_salt: salt, created_at: new Date().toISOString() },
     null,
-    2
+    2,
   );
   await writeFile(path, payload, { mode: 0o600 });
   try {
@@ -1288,7 +1389,7 @@ async function ensureInstallSalt(home: string): Promise<string> {
   } catch {
     /* best-effort on Windows */
   }
-  return salt;
+  return { salt, corruption };
 }
 
 // ---------------------------------------------------------------------------
