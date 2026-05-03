@@ -381,6 +381,17 @@ export class Heartbeat {
    * - healthy → degraded/dead: pi_stuck_suspected
    * - degraded/dead → healthy: pi_heartbeat
    * - degraded → dead OR dead → degraded: pi_stuck_suspected (still bad)
+   *
+   * Per-source ages on `pi_stuck_suspected` (FIX-B-1 #6): when emitting a
+   * stuck event, include `extra.stale_source` (the oldest source name),
+   * `extra.oldest_age_ms`, and per-source ages — so post-incident review
+   * can immediately see which transport hung without correlating to
+   * other observability streams.  We compute the snapshot here rather
+   * than reusing computeState's intermediates because (a) the gauge is
+   * called from both `touchAlive` (in-memory state only) and `getState`
+   * (file + memory) and we want consistent diagnostics either way, and
+   * (b) age values must be flat scalars per audit/schema.ts `extra`
+   * constraints — we flatten to `age_ms_baileys_poll` etc.
    */
   private async maybeEmitTransition(state: HeartbeatState): Promise<void> {
     // Boot priming: until every required source has reported at least
@@ -416,10 +427,42 @@ export class Heartbeat {
       return;
     }
 
-    // Either degraded or dead.
+    // Either degraded or dead — surface per-source ages so the audit row
+    // names which transport is stale.  See class docstring above.
+    const ts = this.now();
+    const ages: Record<HeartbeatSource, number | null> = {
+      "baileys-poll": this.ageOf("baileys-poll", ts),
+      "telegram-poll": this.ageOf("telegram-poll", ts),
+      "pi-ping": this.ageOf("pi-ping", ts),
+    };
+    const { staleSource, oldestAgeMs } = pickStaleSource(
+      ages,
+      this.requiredSources,
+    );
+
+    const extra: Record<string, string | number | boolean> = {
+      from: prior,
+      to: state,
+    };
+    if (staleSource !== null) extra.stale_source = staleSource;
+    if (oldestAgeMs !== null) extra.oldest_age_ms = oldestAgeMs;
+    // Flatten per-source ages into separate scalar fields.  The audit
+    // schema's `extra` is restricted to scalars (no nested objects), so
+    // we cannot pass the `ages` map directly.  We use the source name as
+    // a key prefix with `_` substituted for the `-` so the field name is
+    // a valid identifier shape.
+    for (const [src, age] of Object.entries(ages) as [
+      HeartbeatSource,
+      number | null,
+    ][]) {
+      if (age !== null) extra[`age_ms_${src.replace(/-/g, "_")}`] = age;
+    }
+
     this.operatorLogger?.info("pi_stuck_suspected", {
       from: prior,
       to: state,
+      stale_source: staleSource ?? "unknown",
+      oldest_age_ms: oldestAgeMs ?? -1,
     });
     if (this.auditLog) {
       await this.auditLog
@@ -428,11 +471,42 @@ export class Heartbeat {
           task_id: null,
           channel: "system",
           sender_id_hash: null,
-          extra: { from: prior, to: state },
+          extra,
         })
         .catch(() => undefined);
     }
   }
+}
+
+/**
+ * Identify the staleest required source from the per-source ages map.
+ * A `null` age (source never touched) is "infinitely stale" and wins
+ * over any finite age.  Non-required sources are ignored even if older.
+ *
+ * Returns `{ staleSource: null, oldestAgeMs: null }` when no required
+ * source has a finite age and no required source is null (which happens
+ * only if the required-set is empty — defended against in the
+ * constructor).
+ */
+function pickStaleSource(
+  ages: Record<HeartbeatSource, number | null>,
+  required: readonly HeartbeatSource[],
+): { staleSource: HeartbeatSource | null; oldestAgeMs: number | null } {
+  let staleSource: HeartbeatSource | null = null;
+  let oldestAgeMs: number | null = null;
+  for (const src of required) {
+    const age = ages[src];
+    if (age === null) {
+      // A never-touched required source is the most-stale possible —
+      // pick it and stop (no other source can beat "infinity").
+      return { staleSource: src, oldestAgeMs: null };
+    }
+    if (oldestAgeMs === null || age > oldestAgeMs) {
+      oldestAgeMs = age;
+      staleSource = src;
+    }
+  }
+  return { staleSource, oldestAgeMs };
 }
 
 /** Order: healthy < degraded < dead. The "worse" of two states wins. */

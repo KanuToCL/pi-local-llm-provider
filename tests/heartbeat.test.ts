@@ -337,6 +337,46 @@ describe("Heartbeat — required-source subset", () => {
   });
 });
 
+describe("Heartbeat — pi_stuck_suspected per-source ages (FIX-B-1 #6)", () => {
+  test("audit row includes stale_source, oldest_age_ms, per-source ages", async () => {
+    const h = buildHarness();
+    // Touch all three at staggered times so pi-ping is unambiguously the
+    // oldest at the moment of the transition.
+    h.setNow(1_000_000_000_000);
+    await h.hb.touchAlive({ source: "pi-ping" });
+    h.setNow(1_000_000_000_000 + 50_000);
+    await h.hb.touchAlive({ source: "baileys-poll" });
+    await h.hb.touchAlive({ source: "telegram-poll" });
+    await h.hb.getState(); // arm at healthy
+
+    // Now advance past the degraded boundary for pi-ping (90s threshold).
+    // pi-ping was last touched at t=0; at t=100s its age is 100s.
+    // baileys+telegram were touched at t=50s, so age is 50s — still healthy.
+    h.setNow(1_000_000_000_000 + 100_000);
+    expect(await h.hb.getState()).toBe("degraded");
+
+    const stuckRows = readAuditLines(h.auditDir).filter(
+      (e: any) => e.event === "pi_stuck_suspected",
+    );
+    expect(stuckRows.length).toBeGreaterThanOrEqual(1);
+    const last = stuckRows[stuckRows.length - 1] as any;
+    // The staleSource must be pi-ping (others were just touched).
+    expect(last.extra.stale_source).toBe("pi-ping");
+    expect(typeof last.extra.oldest_age_ms).toBe("number");
+    // Per-source flat fields are present.
+    expect(typeof last.extra.age_ms_pi_ping).toBe("number");
+    expect(typeof last.extra.age_ms_baileys_poll).toBe("number");
+    expect(typeof last.extra.age_ms_telegram_poll).toBe("number");
+    // pi-ping age should be the largest.
+    expect(last.extra.age_ms_pi_ping).toBeGreaterThan(
+      last.extra.age_ms_baileys_poll,
+    );
+    expect(last.extra.age_ms_pi_ping).toBeGreaterThan(
+      last.extra.age_ms_telegram_poll,
+    );
+  });
+});
+
 describe("Heartbeat — concurrent touches", () => {
   test("simultaneous touches do not produce torn writes; file remains a single valid line", async () => {
     const h = buildHarness();
