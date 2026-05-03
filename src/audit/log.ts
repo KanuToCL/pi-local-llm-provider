@@ -79,13 +79,16 @@ export class AuditLog {
    */
   async append(entry: Omit<AuditEntry, "ts" | "daemon_uptime_s">): Promise<void> {
     const now = new Date();
+    // AUDIT-A spread-order fix: caller-provided fields go FIRST, daemon-
+    // computed timestamps go LAST so a buggy caller cannot accidentally
+    // forge `ts` or `daemon_uptime_s` by passing them in `entry`.
     const full: AuditEntry = {
+      ...entry,
       ts: now.toISOString(),
       daemon_uptime_s: Math.max(
         0,
-        Math.floor((now.getTime() - this.daemonStartTs) / 1000)
+        Math.floor((now.getTime() - this.daemonStartTs) / 1000),
       ),
-      ...entry,
     };
 
     // Validate first — throws ZodError synchronously if shape is wrong.

@@ -440,7 +440,11 @@ async function main(): Promise<number> {
   }
 
   // ---- Probe 4: AbortSignal cancellation ---------------------------------
-  // Start a streaming prompt, abort mid-stream, verify graceful exit within 5s.
+  // Start a streaming prompt, abort mid-stream, verify graceful exit within
+  // a tight post-abort threshold (10s, down from the original 36s — AUDIT-A
+  // R1: a healthy SDK should be done within seconds of abort()).  Also wrap
+  // the long-prompt promise in withTimeout so a hung SDK can't keep the
+  // spike alive past 30s + cleanup.
   let abortGracefulMs = -1;
   try {
     if (!session) throw new Error("no session — skipping");
@@ -448,10 +452,16 @@ async function main(): Promise<number> {
       throw new Error("session.abort is not a function");
     }
     const startedAt = Date.now();
-    const longPrompt = Promise.resolve().then(() =>
-      (session as any).prompt(
-        "Please count slowly from 1 to 100, one number per line, with a brief comment after each number.",
-      ),
+    // AUDIT-A R1: bound the long prompt so a hung SDK can't block the
+    // spike indefinitely.  30s budget covers the 1s pre-abort sleep +
+    // generous slack for the abort path.
+    const longPrompt = withTimeout(
+      () =>
+        (session as any).prompt(
+          "Please count slowly from 1 to 100, one number per line, with a brief comment after each number.",
+        ),
+      30_000,
+      "abort_signal/longPrompt",
     );
 
     // Yield a beat then abort.
@@ -462,9 +472,10 @@ async function main(): Promise<number> {
     await Promise.allSettled([longPrompt, abortPromise]);
     abortGracefulMs = Date.now() - startedAt;
 
-    if (abortGracefulMs > 5000 + 1000 + 30_000) {
-      // 1s pre-abort + abort path; allow generous fudge to confirm cleanup didn't hang
-      throw new Error(`abort took ${abortGracefulMs}ms — exceeds 30s+ threshold`);
+    // AUDIT-A R1: tightened threshold — healthy SDK is done within ~10s.
+    // 1s pre-abort sleep + generous abort-path budget.
+    if (abortGracefulMs > 10_000) {
+      throw new Error(`abort took ${abortGracefulMs}ms — exceeds 10s threshold`);
     }
     probes.abort_signal = {
       passed: true,

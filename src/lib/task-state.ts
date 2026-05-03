@@ -119,6 +119,14 @@ const ALLOWED_TRANSITIONS: Readonly<Record<TaskStateKind, readonly TaskStateKind
  * the `TaskStateManager`'s job. Returns `{ ok: true }` if the edge is
  * legal, otherwise `{ ok: false, reason: '...' }` with a descriptive
  * reason suitable for an audit-log `reason` field.
+ *
+ * AUDIT-B #17: tasks IDs must MATCH for transitions that semantically
+ * "continue" the same task (running→backgrounded, running→completed,
+ * running→cancelled, running→failed, backgrounded→completed/cancelled/
+ * failed).  Without this check, an auto-promote timer that captured T1
+ * could successfully background T2 if the daemon completed T1 + started
+ * T2 in the same tick — silently producing a backgrounded T2 with
+ * channel/userMessage data lifted from T1.
  */
 export function transition(current: TaskState, next: TaskState): TransitionResult {
   const fromKind = current.kind;
@@ -130,6 +138,23 @@ export function transition(current: TaskState, next: TaskState): TransitionResul
       reason: `invalid transition ${fromKind} → ${toKind}`,
     };
   }
+
+  // AUDIT-B #17: taskId-preserving transitions guard.  When both states
+  // carry a taskId, they MUST match — otherwise we are silently jumping
+  // a transition between two different tasks.
+  const currentTaskId =
+    "taskId" in current && typeof current.taskId === "string"
+      ? current.taskId
+      : null;
+  const nextTaskId =
+    "taskId" in next && typeof next.taskId === "string" ? next.taskId : null;
+  if (currentTaskId !== null && nextTaskId !== null && currentTaskId !== nextTaskId) {
+    return {
+      ok: false,
+      reason: `taskId mismatch on ${fromKind} → ${toKind}: current=${currentTaskId} next=${nextTaskId}`,
+    };
+  }
+
   return { ok: true };
 }
 

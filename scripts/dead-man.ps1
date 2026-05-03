@@ -50,7 +50,10 @@ function Write-Log {
 function Send-Ntfy {
     param([string]$Message)
     $topic = [Environment]::GetEnvironmentVariable('PI_COMMS_DEADMAN_NTFY_TOPIC')
-    $host = Get-EnvOrDefault 'PI_COMMS_DEADMAN_NTFY_HOST' 'https://ntfy.sh'
+    # AUDIT-A: rename `$host` (shadows PowerShell's automatic `$host`
+    # variable, which holds the script's `Host` runtime — overwriting
+    # it can cause subtle breakage in cmdlets that introspect it).
+    $ntfyHost = Get-EnvOrDefault 'PI_COMMS_DEADMAN_NTFY_HOST' 'https://ntfy.sh'
     if ([string]::IsNullOrWhiteSpace($topic)) {
         Write-Log "ERROR: PI_COMMS_DEADMAN_NTFY_TOPIC unset; cannot notify via ntfy"
         return $false
@@ -61,7 +64,7 @@ function Send-Ntfy {
         'Tags'     = 'warning,skull'
     }
     try {
-        Invoke-RestMethod -Method Post -Uri "$host/$topic" -Headers $headers -Body $Message | Out-Null
+        Invoke-RestMethod -Method Post -Uri "$ntfyHost/$topic" -Headers $headers -Body $Message | Out-Null
         return $true
     } catch {
         Write-Log "ERROR: ntfy POST failed: $_"

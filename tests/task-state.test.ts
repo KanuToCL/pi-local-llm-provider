@@ -399,6 +399,28 @@ describe("TaskStateManager", () => {
     expect(r.reason).toMatch(/invalid transition completed → backgrounded/);
   });
 
+  test("AUDIT-B #17: T1→T2 race — auto-promote captured T1 but T2 is now running, refuses by taskId mismatch", () => {
+    // The "race-suppression" test above only catches the kind-level race:
+    // running → completed → backgrounded fails because backgrounded is
+    // not legal from completed.  This is a SUBTLER race: the daemon
+    // completes T1 then starts T2; the auto-promote timer for T1 fires
+    // and tries `running → backgrounded` with taskId=T1.  Without the
+    // taskId-preserving guard, the kind transition would succeed and
+    // we'd silently overwrite T2's running state with T1's data.
+    const mgr = new TaskStateManager();
+    mgr.tryTransition(running("T1"));
+    mgr.tryTransition(completed("T1"));
+    mgr.tryTransition(idle()); // drain
+    mgr.tryTransition(running("T2"));
+    // Auto-promote for T1 (captured at scheduleAutoPromote time) fires:
+    const r = mgr.tryTransition(backgrounded("T1", "auto"));
+    expect(r.ok).toBe(false);
+    expect(r.reason).toMatch(/taskId mismatch/);
+    // State preserved as T2 running.
+    expect(mgr.get().kind).toBe("running");
+    expect((mgr.get() as { taskId: string }).taskId).toBe("T2");
+  });
+
   test("works with a caller-provided JsonStore (DI for tests)", async () => {
     const path = join(workDir, "custom.json");
     const store = new JsonStore<unknown>(path);
