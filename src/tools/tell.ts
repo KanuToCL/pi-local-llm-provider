@@ -18,6 +18,22 @@
  *
  * The cooldown / rate-limit state is held in caller-owned Maps so the daemon
  * can persist and inspect them, and tests can advance time deterministically.
+ *
+ * Bounded eviction (FIX-B-3 Wave 8 — Plan Pitfall #27 "bounded by ... or hard
+ * ceiling"): the cooldownMap was previously unbounded — a long-running daemon
+ * with the agent emitting many distinct tells would grow it forever. Now,
+ * before every execute() we:
+ *   1. TTL prune: drop entries older than 2 * cooldownMs (long past their
+ *      dedup-relevance window). 2x picks up ALL still-relevant entries
+ *      with comfortable headroom for clock skew + entry-creation jitter.
+ *   2. LRU cap: hard ceiling at 1000 entries; if still over after the TTL
+ *      pass, evict the oldest by insertion order until ≤ 1000. JS Maps
+ *      preserve insertion order, so this is correct without a separate
+ *      LRU data structure.
+ *
+ * 1000 is far above any realistic agent-emit rate (~1 tell / 30s burst-rate
+ * via cooldown; even at 2/min sustained that's 33 hours of distinct text
+ * before saturating).
  */
 
 import {
@@ -97,6 +113,13 @@ export interface TellResult {
 
 const DEFAULT_COOLDOWN_MS = 30_000;
 
+/**
+ * Hard ceiling on the cooldownMap (FIX-B-3 Wave 8). LRU eviction keeps the
+ * daemon's heap bounded against a chatty agent. Set high enough that
+ * legitimate burst patterns never trip it (~33 hours sustained at 2/min).
+ */
+export const COOLDOWN_MAP_HARD_CAP = 1000;
+
 const DEFAULT_RATE_CAPS_PER_MIN: Record<ToolUrgency, number> = {
   info: 60 / 90, // ≤1/90s ≈ 0.667 per minute
   milestone: 60 / 90,
@@ -159,6 +182,14 @@ export function defineTellTool(opts: DefineTellToolOptions): DefinedTool {
 
       const ts = now();
 
+      // ---- Bounded eviction (FIX-B-3 Wave 8 — Plan Pitfall #27 hard cap) ----
+      // Run BEFORE the cooldown lookup so a never-seen-text caller can't be
+      // accidentally rate-limited by a stale entry that should have aged out
+      // already. Cheap (one Map iteration past 2*cooldownMs entries + Δ
+      // overflow eviction). See the file-level comment for the rationale on
+      // 1000 + 2x cooldownMs.
+      pruneCooldownMap(opts.cooldownMap, ts, cooldownMs);
+
       // ---- Cooldown gate (normalized-hash dedup, plan §"Pitfall #27") ----
       const normHash = normalizeForDedupHash(text);
       const last = opts.cooldownMap.get(normHash);
@@ -189,6 +220,16 @@ export function defineTellTool(opts: DefineTellToolOptions): DefinedTool {
       // ---- Mark cooldown BEFORE the network fan-out so a slow sink can't
       //      let a duplicate slip through behind it. ----
       opts.cooldownMap.set(normHash, ts);
+
+      // ---- Re-enforce the LRU cap AFTER the insert (FIX-B-3 Wave 8). ----
+      // The pre-execute prune already TTL-filtered, but the new insert can
+      // push us over by 1.  Trim back to cap; the just-inserted entry is
+      // newest (insertion order) so it survives.
+      while (opts.cooldownMap.size > COOLDOWN_MAP_HARD_CAP) {
+        const oldestKey = opts.cooldownMap.keys().next().value;
+        if (oldestKey === undefined) break;
+        opts.cooldownMap.delete(oldestKey);
+      }
 
       // ---- Fan out to all configured sinks in parallel ----
       const { deliveredTo } = await fanOut(opts.sinks, {
@@ -241,4 +282,47 @@ function isToolUrgency(s: string): s is ToolUrgency {
     s === "blocked" ||
     s === "question"
   );
+}
+
+// ---------------------------------------------------------------------------
+// Internal — bounded-eviction policy for cooldownMap (FIX-B-3 Wave 8)
+// ---------------------------------------------------------------------------
+
+/**
+ * In-place TTL + LRU eviction on the caller-owned cooldownMap.
+ *
+ * 1. TTL: drop entries whose timestamp is older than `2 * cooldownMs` (well
+ *    past their dedup-relevance window). 2x leaves comfortable headroom for
+ *    clock skew + intra-window jitter; the cooldown gate uses `< cooldownMs`
+ *    so anything beyond that won't cause a re-suppress, and 2x ensures we
+ *    don't churn entries near the boundary.
+ * 2. LRU cap: if size still > COOLDOWN_MAP_HARD_CAP, drop oldest by
+ *    insertion order until ≤ cap. JS Maps preserve insertion order so the
+ *    first key is the least-recently-INSERTED. We don't track touch
+ *    semantics (re-insert on read) because the cooldownMap entries are
+ *    only ever WRITTEN (never re-read for a touch), so insertion order ==
+ *    age order.
+ *
+ * Exposed for tests; production callers should not invoke this directly.
+ */
+export function pruneCooldownMap(
+  cooldownMap: Map<string, number>,
+  now: number,
+  cooldownMs: number,
+  hardCap: number = COOLDOWN_MAP_HARD_CAP,
+): void {
+  const ttlCutoff = now - 2 * cooldownMs;
+  // Pass 1: TTL prune.
+  for (const [key, lastSeenAt] of cooldownMap) {
+    if (lastSeenAt < ttlCutoff) {
+      cooldownMap.delete(key);
+    }
+  }
+  // Pass 2: LRU cap. JS Maps iterate in insertion order, so .keys().next()
+  // returns the oldest key.
+  while (cooldownMap.size > hardCap) {
+    const oldestKey = cooldownMap.keys().next().value;
+    if (oldestKey === undefined) break;
+    cooldownMap.delete(oldestKey);
+  }
 }

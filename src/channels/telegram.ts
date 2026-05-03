@@ -28,6 +28,10 @@ import { Bot, GrammyError, HttpError } from "grammy";
 import type { Context } from "grammy";
 
 import { chunkOutbound } from "../lib/chunk-outbound.js";
+import {
+  InboundMediaStore,
+  type InboundMediaSavedRef,
+} from "../lib/inbound-media.js";
 import type {
   ChannelEvent,
   InboundMessage,
@@ -36,7 +40,24 @@ import type {
 } from "./base.js";
 import type { AuditLog } from "../audit/log.js";
 import type { AuditEntry } from "../audit/schema.js";
+import type { InboundRateLimiter } from "../lib/inbound-rate-limit.js";
 import type { OperatorLogger } from "../utils/operator-logger.js";
+
+/**
+ * Pluggable downloader used to fetch a Telegram file given its API URL.
+ * Defaults to `globalThis.fetch` (Node 20+).  Tests inject a stub so they
+ * never hit api.telegram.org / external HTTP.
+ */
+export type TelegramFileDownloader = (url: string) => Promise<Buffer>;
+
+async function defaultDownload(url: string): Promise<Buffer> {
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`telegram_file_download_http_${res.status}`);
+  }
+  const arr = await res.arrayBuffer();
+  return Buffer.from(arr);
+}
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -97,6 +118,33 @@ export interface TelegramChannelOpts {
    * itself succeeded.
    */
   onPoll?: () => void;
+  /**
+   * Optional per-sender / per-channel inbound rate limiter (FIX-B-3 Wave 8).
+   * When provided, each inbound message is checked AGAINST the limiter
+   * BEFORE the DM-only / allowlist gates so a flooding sender cannot exhaust
+   * downstream queue budget. Silent reject + audit on rate-limit; the bot
+   * still polls (heartbeat is touched first). Omit in tests that don't
+   * exercise rate-limit semantics.
+   */
+  inboundRateLimiter?: InboundRateLimiter;
+  /**
+   * Persistence backend for non-text inbound media (voice notes, photos,
+   * documents).  When provided, the channel downloads the underlying file
+   * via `bot.api.getFile` + HTTP fetch, saves it via the store, and
+   * populates the appropriate `payload.audioRef` / `imageRef` /
+   * `documentRef` field on the InboundMessage so v2 STT / vision can pick
+   * it up (per BLESS Accessibility — closes the v4 changelog audioRef seam).
+   * When omitted (typical: tests with no media coverage), the channel falls
+   * back to placeholder-only behavior — the synthesized text still goes
+   * through but no ref is populated.
+   */
+  inboundMediaStore?: InboundMediaStore;
+  /**
+   * Test-injectable HTTP downloader for Telegram file URLs.  Defaults to
+   * the global `fetch` (Node 20+).  Tests stub this to return a synthetic
+   * Buffer so they never reach api.telegram.org.
+   */
+  fileDownloader?: TelegramFileDownloader;
 }
 
 // ---------------------------------------------------------------------------
@@ -105,6 +153,7 @@ export interface TelegramChannelOpts {
 
 const DEFAULT_CHUNK_SIZE = 3900;
 const DEFAULT_TYPING_INTERVAL_MS = 4000;
+const TELEGRAM_FILE_API_BASE = "https://api.telegram.org/file/bot";
 
 // ---------------------------------------------------------------------------
 // TelegramChannel
@@ -142,6 +191,7 @@ const DEFAULT_TYPING_INTERVAL_MS = 4000;
  */
 export class TelegramChannel implements Sink {
   private readonly bot: Bot;
+  private readonly botToken: string;
   private readonly allowedUserIds: ReadonlySet<string>;
   private readonly inboundProcessor: InboundProcessor;
   private readonly chunkSize: number;
@@ -149,6 +199,17 @@ export class TelegramChannel implements Sink {
   private readonly auditLog?: AuditLog;
   private readonly operatorLogger?: OperatorLogger;
   private readonly onPoll: (() => void) | undefined;
+  private readonly inboundMediaStore: InboundMediaStore | undefined;
+  private readonly fileDownloader: TelegramFileDownloader;
+  private readonly inboundRateLimiter: InboundRateLimiter | undefined;
+  /**
+   * Tracks in-flight async media-download/save handlers spawned from the
+   * (synchronous) grammy `bot.on(...)` callback.  Tests await `flushPending()`
+   * to deterministically observe processInbound calls without tick-counting.
+   * Production callers don't observe this — the pending set is best-effort
+   * cleanup and self-empties as handlers settle.
+   */
+  private readonly pendingHandlers: Set<Promise<unknown>> = new Set();
 
   /**
    * The chat id the most-recent inbound message came from.  Outbound
@@ -173,6 +234,7 @@ export class TelegramChannel implements Sink {
     this.bot = opts.botFactory
       ? opts.botFactory(opts.botToken)
       : new Bot(opts.botToken);
+    this.botToken = opts.botToken;
     this.allowedUserIds = opts.allowedUserIds;
     this.inboundProcessor = opts.inboundProcessor;
     this.chunkSize = opts.chunkSize ?? DEFAULT_CHUNK_SIZE;
@@ -180,6 +242,9 @@ export class TelegramChannel implements Sink {
     this.auditLog = opts.auditLog;
     this.operatorLogger = opts.operatorLogger;
     this.onPoll = opts.onPoll;
+    this.inboundMediaStore = opts.inboundMediaStore;
+    this.fileDownloader = opts.fileDownloader ?? defaultDownload;
+    this.inboundRateLimiter = opts.inboundRateLimiter;
 
     this.installMiddleware();
     this.installHandlers();
@@ -352,6 +417,39 @@ export class TelegramChannel implements Sink {
       await next();
     });
 
+    // Per-sender / per-channel rate-limit gate (FIX-B-3 Wave 8).  Runs
+    // BEFORE DM-only / allowlist so a flooding sender cannot exhaust
+    // downstream queue budget regardless of allowlist status.  Silent
+    // reject + audit; the bot continues polling.
+    this.bot.use(async (ctx, next) => {
+      if (!this.inboundRateLimiter) {
+        await next();
+        return;
+      }
+      const senderId = ctx.from?.id;
+      // No senderId = malformed update; let the next middleware deal with it.
+      // (DM-only / allowlist gate already handles "no sender" as a reject.)
+      if (senderId === undefined) {
+        await next();
+        return;
+      }
+      const verdict = this.inboundRateLimiter.allow(
+        "telegram",
+        String(senderId),
+      );
+      if (!verdict.ok) {
+        await this.audit({
+          event: "inbound_rate_limited",
+          task_id: null,
+          channel: "telegram",
+          sender_id_hash: hashSenderId(senderId),
+          extra: { reason: verdict.reason },
+        });
+        return; // silent
+      }
+      await next();
+    });
+
     this.bot.use(async (ctx, next) => {
       const chatType = ctx.chat?.type;
       const senderId = ctx.from?.id;
@@ -387,35 +485,75 @@ export class TelegramChannel implements Sink {
 
   private installHandlers(): void {
     this.bot.on("message:text", (ctx) => {
-      this.handleInbound(ctx, "text", ctx.message.text);
+      this.handleInbound(ctx, "text", ctx.message.text, null);
     });
 
     this.bot.on("message:voice", (ctx) => {
       const synthetic =
         "[user sent a voice — non-text inbound is deferred; please type]";
-      this.handleInbound(ctx, "voice", synthetic);
+      const voice = ctx.message.voice;
+      const spec: TelegramMediaSpec = {
+        kind: "audio",
+        fileId: voice.file_id,
+        ext: "ogg",
+        ...(voice.mime_type !== undefined ? { mimeType: voice.mime_type } : {}),
+      };
+      this.handleInbound(ctx, "voice", synthetic, spec);
     });
 
     this.bot.on("message:photo", (ctx) => {
       const synthetic =
         "[user sent an image — non-text inbound is deferred; please type]";
-      this.handleInbound(ctx, "image", synthetic);
+      // Telegram returns multiple PhotoSize entries (thumbnails + full).
+      // Pick the largest by file_size (fallback: last entry, which is the
+      // highest-resolution variant per Telegram's documented ordering).
+      const photos = ctx.message.photo;
+      const largest = pickLargestPhoto(photos);
+      const spec: TelegramMediaSpec = {
+        kind: "image",
+        fileId: largest.file_id,
+        ext: "jpg",
+        mimeType: "image/jpeg",
+      };
+      this.handleInbound(ctx, "image", synthetic, spec);
     });
 
     this.bot.on("message:document", (ctx) => {
       const synthetic =
         "[user sent a document — non-text inbound is deferred; please type]";
-      this.handleInbound(ctx, "document", synthetic);
+      const doc = ctx.message.document;
+      const spec: TelegramMediaSpec = {
+        kind: "document",
+        fileId: doc.file_id,
+        ext: doc.file_name ?? "bin",
+        ...(doc.mime_type !== undefined ? { mimeType: doc.mime_type } : {}),
+      };
+      this.handleInbound(ctx, "document", synthetic, spec);
     });
   }
 
+  /**
+   * Build the InboundMessage and dispatch.  When `media` is non-null AND
+   * an `inboundMediaStore` is configured, the buffer is downloaded from
+   * Telegram, persisted, and the resulting absolute path is stamped into
+   * `payload.audioRef` / `imageRef` / `documentRef` so v2 STT/vision can
+   * read it (per BLESS Accessibility — closes the audioRef seam).  When
+   * no store is configured (typical: minimal-config tests), we fall
+   * through with placeholder-only behavior (back-compat).
+   *
+   * Even when media-save fails (HTTP error, disk full, store throws), we
+   * STILL deliver the placeholder text — the user's intent ("a voice
+   * arrived") must reach the agent regardless of whether v2 can read it.
+   */
   private handleInbound(
     ctx: Context,
     originalKind: "text" | "voice" | "image" | "document",
     bodyText: string,
+    media: TelegramMediaSpec | null,
   ): void {
     const senderId = ctx.from?.id;
     const chatId = ctx.chat?.id;
+    const messageId = ctx.message?.message_id;
     if (senderId === undefined || chatId === undefined) return;
 
     // Track the originating chat for outbound replies + typing.
@@ -423,14 +561,6 @@ export class TelegramChannel implements Sink {
 
     const senderName =
       ctx.from?.username ?? ctx.from?.first_name ?? undefined;
-
-    const msg: InboundMessage = {
-      type: originalKind === "document" ? "image" : originalKind, // documents collapse to "image" in the v1 inbound enum
-      channel: "telegram",
-      sender: { id: String(senderId), name: senderName },
-      payload: { text: bodyText },
-      ts: Date.now(),
-    };
 
     // Operator-side log of the inbound — the audit-event vocabulary
     // (src/audit/schema.ts) does not yet include a dedicated `inbound_received`
@@ -442,13 +572,136 @@ export class TelegramChannel implements Sink {
       sender_id_hash: hashSenderId(senderId),
     });
 
-    // Fire-and-forget — the bot must keep polling.  Errors in the
-    // processor surface as audit entries inside the daemon, NOT here.
+    if (
+      media !== null &&
+      this.inboundMediaStore !== undefined &&
+      messageId !== undefined
+    ) {
+      // Download + save async, then dispatch.  Tracked so tests can await
+      // via flushPending().
+      const handler = this.dispatchInboundWithMedia(
+        media,
+        String(messageId),
+        originalKind,
+        bodyText,
+        senderId,
+        senderName,
+      );
+      this.track(handler);
+      return;
+    }
+
+    // Fast path: text or unconfigured-store fallback — placeholder-only.
+    const msg: InboundMessage = {
+      type: originalKind === "document" ? "image" : originalKind, // documents collapse to "image" in the v1 inbound enum
+      channel: "telegram",
+      sender: { id: String(senderId), name: senderName },
+      payload: { text: bodyText },
+      ts: Date.now(),
+    };
     void this.inboundProcessor.processInbound(msg).catch((error) => {
       this.operatorLogger?.error("telegram_inbound_processor_error", {
         error_class: error instanceof Error ? error.name : "unknown",
         message: error instanceof Error ? error.message : String(error),
       });
+    });
+  }
+
+  /**
+   * Async tail of `handleInbound` for the media path: getFile → download
+   * via HTTP → save to InboundMediaStore → populate the right ref field
+   * → fire processInbound.  All failures are non-fatal at the agent layer
+   * (we still deliver the placeholder text); they surface to the operator
+   * logger for diagnostics.
+   */
+  private async dispatchInboundWithMedia(
+    media: TelegramMediaSpec,
+    msgId: string,
+    originalKind: "text" | "voice" | "image" | "document",
+    bodyText: string,
+    senderId: number,
+    senderName: string | undefined,
+  ): Promise<void> {
+    const store = this.inboundMediaStore;
+    const payload: InboundMessage["payload"] = { text: bodyText };
+    if (store !== undefined) {
+      try {
+        const file = await this.bot.api.getFile(media.fileId);
+        const filePath = file.file_path;
+        if (typeof filePath === "string" && filePath.length > 0) {
+          const url = `${TELEGRAM_FILE_API_BASE}${this.botToken}/${filePath}`;
+          const buffer = await this.fileDownloader(url);
+          const ref = await this.saveByKind(store, media, msgId, buffer);
+          applyRefToPayload(payload, ref);
+        } else {
+          this.operatorLogger?.error("telegram_media_save_error", {
+            reason: "missing_file_path",
+            message_type: originalKind,
+          });
+        }
+      } catch (error) {
+        // Best-effort: log and proceed with placeholder-only.  The v1
+        // contract is "agent always gets some text"; refs are upgrades.
+        this.operatorLogger?.error("telegram_media_save_error", {
+          error_class: error instanceof Error ? error.name : "unknown",
+          message: error instanceof Error ? error.message : String(error),
+          message_type: originalKind,
+        });
+      }
+    }
+
+    const msg: InboundMessage = {
+      type: originalKind === "document" ? "image" : originalKind,
+      channel: "telegram",
+      sender: { id: String(senderId), name: senderName },
+      payload,
+      ts: Date.now(),
+    };
+    try {
+      await this.inboundProcessor.processInbound(msg);
+    } catch (error) {
+      this.operatorLogger?.error("telegram_inbound_processor_error", {
+        error_class: error instanceof Error ? error.name : "unknown",
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  private saveByKind(
+    store: InboundMediaStore,
+    media: TelegramMediaSpec,
+    msgId: string,
+    buffer: Buffer,
+  ): Promise<InboundMediaSavedRef> {
+    const opts = {
+      msgId,
+      ext: media.ext,
+      buffer,
+      ...(media.mimeType !== undefined ? { mimeType: media.mimeType } : {}),
+    };
+    if (media.kind === "audio") return store.saveAudio(opts);
+    if (media.kind === "image") return store.saveImage(opts);
+    return store.saveDocument(opts);
+  }
+
+  /**
+   * Test seam: await every in-flight async media-download/save handler.
+   * Mirrors `WhatsappChannel.flushPending` — production callers don't need
+   * this because they don't observe the in-flight promises, but tests
+   * need a deterministic point at which all `processInbound` calls have
+   * settled before asserting on their results.
+   */
+  async flushPending(): Promise<void> {
+    while (this.pendingHandlers.size > 0) {
+      const snapshot = Array.from(this.pendingHandlers);
+      await Promise.allSettled(snapshot);
+    }
+  }
+
+  private track(p: Promise<unknown>): void {
+    this.pendingHandlers.add(p);
+    void p.finally(() => {
+      this.pendingHandlers.delete(p);
     });
   }
 
@@ -572,4 +825,79 @@ function hashSenderId(id: number | string): string {
     h = (h * 31 + s.charCodeAt(i)) | 0;
   }
   return `tg-${(h >>> 0).toString(16).padStart(8, "0")}`;
+}
+
+// ---------------------------------------------------------------------------
+// Internal — media-spec descriptor + payload-ref helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-message media descriptor passed from `installHandlers` down into
+ * `handleInbound`.  Captures everything `dispatchInboundWithMedia` needs
+ * to download + persist the file:
+ *   - `kind`     decides which `InboundMediaStore.save*` method to call
+ *   - `fileId`   feeds `bot.api.getFile` to get the api.telegram.org path
+ *   - `ext`      becomes the on-disk suffix (`.ogg`, `.jpg`, ...).  The
+ *                store sanitizes this so callers can pass raw filenames.
+ *   - `mimeType` informational; threaded into the saved-ref for v2 hints
+ */
+interface TelegramMediaSpec {
+  kind: "audio" | "image" | "document";
+  fileId: string;
+  ext: string;
+  mimeType?: string;
+}
+
+/**
+ * Stamp the saved-ref's path into the appropriate `payload.*Ref` field.
+ * Centralized so both `handleInbound` and any future fan-out path (album
+ * groupings, multi-attachment messages) share one source of truth for
+ * the field-name convention defined in `src/channels/base.ts`.
+ */
+function applyRefToPayload(
+  payload: InboundMessage["payload"],
+  ref: InboundMediaSavedRef,
+): void {
+  if (ref.mediaType === "audio") {
+    payload.audioRef = ref.path;
+    return;
+  }
+  if (ref.mediaType === "image") {
+    payload.imageRef = ref.path;
+    return;
+  }
+  if (ref.mediaType === "document") {
+    payload.documentRef = ref.path;
+    return;
+  }
+  // ref.mediaType === 'video'
+  payload.videoRef = ref.path;
+}
+
+/**
+ * Telegram returns multiple `PhotoSize` entries per inbound photo (a
+ * thumbnail tier + the full-resolution variant).  Pick the highest-res
+ * one — preferring `file_size` when present, falling back to the last
+ * entry which Telegram orders by ascending size per their docs.
+ */
+function pickLargestPhoto<
+  T extends { file_id: string; file_size?: number | undefined },
+>(photos: readonly T[]): T {
+  if (photos.length === 0) {
+    // Defensive: grammy's typing guarantees at least one entry, but we
+    // assert here so a future API change can't silently propagate an
+    // out-of-bounds read.
+    throw new Error("telegram_photo_array_empty");
+  }
+  let best = photos[0]!;
+  let bestSize = best.file_size ?? 0;
+  for (let i = 1; i < photos.length; i++) {
+    const candidate = photos[i]!;
+    const size = candidate.file_size ?? 0;
+    if (size >= bestSize) {
+      best = candidate;
+      bestSize = size;
+    }
+  }
+  return best;
 }

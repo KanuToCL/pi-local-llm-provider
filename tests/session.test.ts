@@ -151,6 +151,8 @@ function makeBaseConfig(): AppConfig {
     piCommsSandbox: "on",
     piCommsAuditRetentionDays: 90,
     piCommsDiagnosticMode: false,
+    piCommsInboundRatePerSenderPerMin: 10,
+    piCommsInboundRatePerChannelPerMin: 30,
   };
 }
 
@@ -451,6 +453,227 @@ describe("auto-promote", () => {
     expect(h.sinks.telegram.events).toHaveLength(1);
     const evt = h.sinks.telegram.events[0]!;
     expect(evt.type).toBe("auto_promote_notice");
+    expect(h.taskState.get().kind).toBe("backgrounded");
+
+    session.resolveCurrentPrompt!();
+    await inflight;
+    await mgr.dispose();
+  });
+
+  test("re-arms after first fire — second fire emits firingNumber=2 (FIX-B-1 #1)", async () => {
+    const h = makeHarness();
+    const session = makeFakeSession();
+
+    // Capture every setTimeout invocation so we can fire timers in
+    // sequence and observe the re-arm cadence.
+    const captured: { handler: () => void; delay: number }[] = [];
+    const setTimeoutFn = vi.fn((handler: () => void, ms: number) => {
+      captured.push({ handler, delay: ms });
+      return Symbol(`handle-${captured.length}`);
+    });
+    const clearTimeoutFn = vi.fn();
+
+    let nowMs = 1_000_000;
+    const mgr = new SessionManager({
+      config: h.config,
+      taskState: h.taskState,
+      pendingConfirms: h.pendingConfirms,
+      sandboxPolicy: h.sandboxPolicy,
+      auditLog: h.auditLog,
+      sinks: h.sinks,
+      basePromptPath: h.basePromptPath,
+      validateModelsJsonOverride: noopValidate,
+      loadSdkOverride: makeFakeSdkLoader(session),
+      setTimeoutFn,
+      clearTimeoutFn,
+      now: () => nowMs,
+    });
+    await mgr.init();
+
+    const inflight = mgr.handleInbound({ channel: "telegram", text: "long" });
+    await waitFor(() => captured.length >= 1);
+    expect(captured[0]!.delay).toBe(30_000);
+
+    // Fire 1: 30s mark → backgrounded + firingNumber=1.
+    nowMs = 1_000_000 + 30_000;
+    captured[0]!.handler();
+    await waitFor(() => h.sinks.telegram.events.length >= 1);
+
+    expect(h.taskState.get().kind).toBe("backgrounded");
+    const e1 = h.sinks.telegram.events[0]!;
+    expect(e1.type).toBe("auto_promote_notice");
+    if (e1.type === "auto_promote_notice") {
+      expect(e1.firingNumber).toBe(1);
+      expect(e1.taskAgeSeconds).toBe(30);
+    }
+
+    // Fire 1 must have re-armed; capture[1] is the next.
+    await waitFor(() => captured.length >= 2);
+    // Second fire is at 90s after the first (= total 2min from start).
+    expect(captured[1]!.delay).toBe(90_000);
+
+    // Fire 2.
+    nowMs = 1_000_000 + 30_000 + 90_000; // 2min mark
+    captured[1]!.handler();
+    await waitFor(() => h.sinks.telegram.events.length >= 2);
+    const e2 = h.sinks.telegram.events[1]!;
+    expect(e2.type).toBe("auto_promote_notice");
+    if (e2.type === "auto_promote_notice") {
+      expect(e2.firingNumber).toBe(2);
+      expect(e2.taskAgeSeconds).toBe(120);
+    }
+    // State should still be backgrounded (re-fires don't re-transition).
+    expect(h.taskState.get().kind).toBe("backgrounded");
+
+    // Fire 2 re-armed at +5min.
+    await waitFor(() => captured.length >= 3);
+    expect(captured[2]!.delay).toBe(300_000);
+
+    // Fire 3: 7min mark.
+    nowMs = 1_000_000 + 30_000 + 90_000 + 300_000;
+    captured[2]!.handler();
+    await waitFor(() => h.sinks.telegram.events.length >= 3);
+    const e3 = h.sinks.telegram.events[2]!;
+    if (e3.type === "auto_promote_notice") {
+      expect(e3.firingNumber).toBe(3);
+      expect(e3.taskAgeSeconds).toBe(420);
+    }
+
+    // Fire 3 re-arms at +5min cap.
+    await waitFor(() => captured.length >= 4);
+    expect(captured[3]!.delay).toBe(300_000);
+
+    // Cancel the task to clean up.
+    const cur = h.taskState.get();
+    if (cur.kind === "backgrounded") {
+      h.taskState.tryTransition({
+        kind: "cancelled",
+        taskId: cur.taskId,
+        startedAt: cur.startedAt,
+        cancelledAt: nowMs,
+        reason: "user",
+      });
+    }
+    session.resolveCurrentPrompt!();
+    await inflight;
+    await mgr.dispose();
+  });
+
+  test("re-arm timer is cleared on task completion (FIX-B-1 #1)", async () => {
+    const h = makeHarness();
+    const session = makeFakeSession();
+
+    const captured: { handler: () => void; delay: number }[] = [];
+    const setTimeoutFn = vi.fn((handler: () => void, ms: number) => {
+      captured.push({ handler, delay: ms });
+      return Symbol(`handle-${captured.length}`);
+    });
+    const clearTimeoutFn = vi.fn();
+
+    const mgr = new SessionManager({
+      config: h.config,
+      taskState: h.taskState,
+      pendingConfirms: h.pendingConfirms,
+      sandboxPolicy: h.sandboxPolicy,
+      auditLog: h.auditLog,
+      sinks: h.sinks,
+      basePromptPath: h.basePromptPath,
+      validateModelsJsonOverride: noopValidate,
+      loadSdkOverride: makeFakeSdkLoader(session),
+      setTimeoutFn,
+      clearTimeoutFn,
+    });
+    await mgr.init();
+
+    const inflight = mgr.handleInbound({ channel: "telegram", text: "x" });
+    await waitFor(() => captured.length >= 1);
+
+    // Resolve the prompt + complete the task BEFORE firing the timer.
+    session.resolveCurrentPrompt!();
+    await inflight;
+
+    // Subsequent fires should NOT emit (taskState is no longer running).
+    captured[0]!.handler();
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+    expect(h.sinks.telegram.events).toHaveLength(0);
+
+    await mgr.dispose();
+  });
+
+  test("cold-start: model not loaded → emits 'warming up' notice and reschedules (FIX-B-1 #4)", async () => {
+    const h = makeHarness();
+    const session = makeFakeSession();
+
+    const captured: { handler: () => void; delay: number }[] = [];
+    const setTimeoutFn = vi.fn((handler: () => void, ms: number) => {
+      captured.push({ handler, delay: ms });
+      return Symbol(`handle-${captured.length}`);
+    });
+    const clearTimeoutFn = vi.fn();
+
+    let modelReadyAttempts = 0;
+    const isStudioModelLoaded = vi.fn(async () => {
+      modelReadyAttempts += 1;
+      return modelReadyAttempts >= 3; // false twice, then true
+    });
+
+    const mgr = new SessionManager({
+      config: h.config,
+      taskState: h.taskState,
+      pendingConfirms: h.pendingConfirms,
+      sandboxPolicy: h.sandboxPolicy,
+      auditLog: h.auditLog,
+      sinks: h.sinks,
+      basePromptPath: h.basePromptPath,
+      validateModelsJsonOverride: noopValidate,
+      loadSdkOverride: makeFakeSdkLoader(session),
+      setTimeoutFn,
+      clearTimeoutFn,
+      isStudioModelLoaded,
+      coldStartMaxRetries: 5,
+      coldStartRetryMs: 30_000,
+    });
+    await mgr.init();
+
+    const inflight = mgr.handleInbound({ channel: "telegram", text: "x" });
+    await waitFor(() => captured.length >= 1);
+
+    // Fire 1 — model not ready (attempt 1) — emits warming notice + reschedules.
+    captured[0]!.handler();
+    await waitFor(() => h.sinks.telegram.events.length >= 1);
+    const e1 = h.sinks.telegram.events[0]!;
+    expect(e1.type).toBe("system_notice");
+    if (e1.type === "system_notice") {
+      expect(e1.text).toMatch(/warming up/i);
+    }
+    // No backgrounded transition yet.
+    expect(h.taskState.get().kind).toBe("running");
+    // Reschedule at +30s.
+    await waitFor(() => captured.length >= 2);
+    expect(captured[1]!.delay).toBe(30_000);
+
+    // Fire 2 — model not ready (attempt 2) — another warming notice.
+    captured[1]!.handler();
+    await waitFor(() => h.sinks.telegram.events.length >= 2);
+    const e2 = h.sinks.telegram.events[1]!;
+    expect(e2.type).toBe("system_notice");
+    expect(h.taskState.get().kind).toBe("running");
+
+    // Fire 3 — model ready — fires the real auto_promote_notice.
+    await waitFor(() => captured.length >= 3);
+    captured[2]!.handler();
+    await waitFor(
+      () =>
+        h.sinks.telegram.events.length >= 3 &&
+        h.sinks.telegram.events.some(
+          (e) => e.type === "auto_promote_notice",
+        ),
+    );
+    const promoted = h.sinks.telegram.events.find(
+      (e) => e.type === "auto_promote_notice",
+    );
+    expect(promoted).toBeDefined();
     expect(h.taskState.get().kind).toBe("backgrounded");
 
     session.resolveCurrentPrompt!();

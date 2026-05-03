@@ -137,6 +137,23 @@ const envSchema = z.object({
   WHATSAPP_IDENTITY_MODEL: z.enum(["self-chat", "second-number"]).optional(),
   WHATSAPP_OWNER_JID: z.string().trim().optional(),
   WHATSAPP_BOT_JID: z.string().trim().optional(),
+
+  // Inbound rate limiting (FIX-B-3 Wave 8). Per-sender and per-channel
+  // token-bucket caps applied BEFORE the allowlist check at the channel
+  // adapter ingress; silent reject + audit on rate-limit so a flooding
+  // sender cannot exhaust downstream queue budget. Defaults are tuned for
+  // single-user pi-comms: per-sender 10/min handles legitimate burst typing,
+  // per-channel 30/min is "any 1-3 senders flooding".
+  PI_COMMS_INBOUND_RATE_PER_SENDER_PER_MIN: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(10),
+  PI_COMMS_INBOUND_RATE_PER_CHANNEL_PER_MIN: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(30),
 });
 
 // -- Output types -----------------------------------------------------------
@@ -184,6 +201,10 @@ export interface AppConfig {
   piCommsSandbox: SandboxPosture;
   piCommsAuditRetentionDays: number;
   piCommsDiagnosticMode: boolean;
+
+  // Inbound rate-limit caps (per minute).
+  piCommsInboundRatePerSenderPerMin: number;
+  piCommsInboundRatePerChannelPerMin: number;
 
   // WhatsApp (optional; present only when WHATSAPP_IDENTITY_MODEL is set)
   whatsapp?: WhatsAppConfig;
@@ -248,6 +269,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       data.PI_COMMS_DIAGNOSTIC_MODE,
       "PI_COMMS_DIAGNOSTIC_MODE"
     ),
+
+    piCommsInboundRatePerSenderPerMin:
+      data.PI_COMMS_INBOUND_RATE_PER_SENDER_PER_MIN,
+    piCommsInboundRatePerChannelPerMin:
+      data.PI_COMMS_INBOUND_RATE_PER_CHANNEL_PER_MIN,
 
     whatsapp,
   };

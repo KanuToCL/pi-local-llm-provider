@@ -482,3 +482,312 @@ describe("formatChannelEvent — coverage of all event types", () => {
 // (compile-time check; no runtime assertions needed)
 const _typeSmoke: ChannelEvent = { type: "reply", text: "x", ts: 0 };
 void _typeSmoke;
+
+// ---------------------------------------------------------------------------
+// FIX-B-3 Wave 8 — per-sender / per-channel inbound rate limiter wiring
+// ---------------------------------------------------------------------------
+
+import { InboundRateLimiter } from "../src/lib/inbound-rate-limit.js";
+import { AuditLog } from "../src/audit/log.js";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+describe("TelegramChannel — inbound rate limiter wiring (FIX-B-3 Wave 8)", () => {
+  let auditDir: string;
+  beforeEach(() => {
+    auditDir = mkdtempSync(join(tmpdir(), "tg-rl-audit-"));
+  });
+  afterEach(() => {
+    rmSync(auditDir, { recursive: true, force: true });
+  });
+
+  function readAuditLines(): Array<Record<string, unknown>> {
+    const all: Array<Record<string, unknown>> = [];
+    for (const name of readdirSync(auditDir)) {
+      if (!name.startsWith("audit.")) continue;
+      const raw = readFileSync(join(auditDir, name), "utf8");
+      for (const line of raw.split("\n")) {
+        if (line.length === 0) continue;
+        all.push(JSON.parse(line) as Record<string, unknown>);
+      }
+    }
+    return all;
+  }
+
+  test("11th rapid message from same allowed sender is silently rate-limited + audited", async () => {
+    let t = 1_700_000_000_000;
+    const limiter = new InboundRateLimiter({
+      perSender: { capacity: 10, refillRatePerMs: 0 },
+      perChannel: { capacity: 100, refillRatePerMs: 0 },
+      now: () => t,
+    });
+    const audit = new AuditLog({ dir: auditDir, daemonStartTs: t - 1000 });
+    const proc = new CapturingProcessor();
+    const factory = makeBotFactory();
+    let bot: Bot | undefined;
+    const channel = new TelegramChannel({
+      botToken: "fake-token",
+      allowedUserIds: ALLOWED,
+      inboundProcessor: proc,
+      inboundRateLimiter: limiter,
+      auditLog: audit,
+      botFactory: (tk) => {
+        bot = factory(tk);
+        return bot;
+      },
+    });
+    void channel;
+    if (!bot) throw new Error("bot not constructed");
+
+    for (let i = 0; i < 10; i++) {
+      await bot.handleUpdate(
+        mkUpdate({ fromId: 12345, text: `msg ${i}` }),
+      );
+    }
+    expect(proc.received).toHaveLength(10);
+
+    // 11th — rate limited (silent: no reply, processor not called).
+    await bot.handleUpdate(mkUpdate({ fromId: 12345, text: "msg 11" }));
+    expect(proc.received).toHaveLength(10);
+
+    // Audit emitted with reason=per_sender.
+    // Allow audit-log async write to flush.
+    await audit.append({
+      event: "daemon_boot",
+      task_id: null,
+      channel: "system",
+      sender_id_hash: null,
+    });
+    const lines = readAuditLines();
+    const rl = lines.filter((e) => e.event === "inbound_rate_limited");
+    expect(rl.length).toBeGreaterThanOrEqual(1);
+    const extra = rl[0]!.extra as { reason?: string } | undefined;
+    expect(extra?.reason).toBe("per_sender");
+  });
+
+  test("31st rapid message across the channel is silently rate-limited (per_channel)", async () => {
+    let t = 1_700_000_000_000;
+    const limiter = new InboundRateLimiter({
+      perSender: { capacity: 100, refillRatePerMs: 0 },
+      perChannel: { capacity: 30, refillRatePerMs: 0 },
+      now: () => t,
+    });
+    const audit = new AuditLog({ dir: auditDir, daemonStartTs: t - 1000 });
+    const proc = new CapturingProcessor();
+    const factory = makeBotFactory();
+    // Allowlist 30 distinct senders + a 31st as the tripper.
+    const allowed = new Set<string>();
+    for (let i = 0; i < 31; i++) allowed.add(String(20000 + i));
+    let bot: Bot | undefined;
+    const channel = new TelegramChannel({
+      botToken: "fake-token",
+      allowedUserIds: allowed,
+      inboundProcessor: proc,
+      inboundRateLimiter: limiter,
+      auditLog: audit,
+      botFactory: (tk) => {
+        bot = factory(tk);
+        return bot;
+      },
+    });
+    void channel;
+    if (!bot) throw new Error("bot not constructed");
+
+    for (let i = 0; i < 30; i++) {
+      await bot.handleUpdate(
+        mkUpdate({ fromId: 20000 + i, text: `m${i}` }),
+      );
+    }
+    expect(proc.received).toHaveLength(30);
+
+    // 31st — channel saturated.
+    await bot.handleUpdate(
+      mkUpdate({ fromId: 20030, text: "tripping channel cap" }),
+    );
+    expect(proc.received).toHaveLength(30);
+
+    await audit.append({
+      event: "daemon_boot",
+      task_id: null,
+      channel: "system",
+      sender_id_hash: null,
+    });
+    const lines = readAuditLines();
+    const rl = lines.filter((e) => e.event === "inbound_rate_limited");
+    expect(rl.length).toBeGreaterThanOrEqual(1);
+    const reasons = rl.map((r) => (r.extra as { reason?: string } | undefined)?.reason);
+    expect(reasons).toContain("per_channel");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FIX-B-4 Wave 8 — audioRef / imageRef / documentRef populated for non-text
+// inbound (closes BLESS Accessibility — v4 changelog audioRef seam)
+// ---------------------------------------------------------------------------
+
+import { InboundMediaStore } from "../src/lib/inbound-media.js";
+import { readFileSync as readFileSyncMedia, statSync } from "node:fs";
+
+describe("TelegramChannel — non-text inbound populates the right *Ref field", () => {
+  let mediaDir: string;
+
+  beforeEach(() => {
+    mediaDir = mkdtempSync(join(tmpdir(), "tg-media-"));
+  });
+
+  afterEach(() => {
+    rmSync(mediaDir, { recursive: true, force: true });
+  });
+
+  function mediaChannel(opts?: {
+    fileBuffer?: Buffer;
+    failDownload?: boolean;
+    filePathOverride?: string;
+  }): {
+    channel: TelegramChannel;
+    proc: CapturingProcessor;
+    bot: Bot;
+    store: InboundMediaStore;
+    downloader: ReturnType<typeof vi.fn>;
+  } {
+    const buffer = opts?.fileBuffer ?? Buffer.from([0xff, 0xfb, 0x90, 0x44]);
+    const downloader = opts?.failDownload
+      ? vi.fn().mockRejectedValue(new Error("HTTP 502"))
+      : vi.fn().mockResolvedValue(buffer);
+    const store = new InboundMediaStore({ dir: mediaDir });
+    const proc = new CapturingProcessor();
+    const factory = makeBotFactory();
+    let bot: Bot | undefined;
+    const channel = new TelegramChannel({
+      botToken: "fake-token",
+      allowedUserIds: ALLOWED,
+      inboundProcessor: proc,
+      inboundMediaStore: store,
+      fileDownloader: downloader as unknown as (url: string) => Promise<Buffer>,
+      botFactory: (t) => {
+        const b = factory(t);
+        b.api.getFile = vi.fn().mockResolvedValue({
+          file_id: "media-1",
+          file_unique_id: "mu1",
+          file_path: opts?.filePathOverride ?? "voice/file_1.oga",
+          file_size: buffer.byteLength,
+        });
+        bot = b;
+        return b;
+      },
+    });
+    if (!bot) throw new Error("bot factory not invoked");
+    return { channel, proc, bot, store, downloader };
+  }
+
+  test("voice inbound: audioRef populated, file persisted, content matches buffer", async () => {
+    const buffer = Buffer.from("OggS\x00\x02ABCDE", "binary");
+    const { channel, proc, bot, downloader } = mediaChannel({ fileBuffer: buffer });
+
+    await bot.handleUpdate(mkUpdate({ voice: true, fromId: 12345 }));
+    await channel.flushPending();
+
+    expect(proc.received).toHaveLength(1);
+    const got = proc.received[0]!;
+    expect(got.type).toBe("voice");
+    expect(got.payload.text).toContain("voice");
+    expect(got.payload.audioRef).toBeDefined();
+    expect(typeof got.payload.audioRef).toBe("string");
+    expect(got.payload.audioRef!.endsWith(".ogg")).toBe(true);
+    const onDisk = readFileSyncMedia(got.payload.audioRef!);
+    expect(onDisk.equals(buffer)).toBe(true);
+    if (process.platform !== "win32") {
+      const st = statSync(got.payload.audioRef!);
+      expect(st.mode & 0o777).toBe(0o600);
+    }
+    expect(downloader).toHaveBeenCalledTimes(1);
+    const url = downloader.mock.calls[0]![0] as string;
+    expect(url).toContain("api.telegram.org/file/bot");
+    expect(url).toContain("voice/file_1.oga");
+  });
+
+  test("photo inbound: imageRef populated, file persisted", async () => {
+    const buffer = Buffer.from([0xff, 0xd8, 0xff, 0xe0]);
+    const { channel, proc, bot } = mediaChannel({
+      fileBuffer: buffer,
+      filePathOverride: "photo/file_2.jpg",
+    });
+
+    await bot.handleUpdate(mkUpdate({ photo: true, fromId: 12345 }));
+    await channel.flushPending();
+
+    expect(proc.received).toHaveLength(1);
+    const got = proc.received[0]!;
+    expect(got.type).toBe("image");
+    expect(got.payload.imageRef).toBeDefined();
+    expect(got.payload.imageRef!.endsWith(".jpg")).toBe(true);
+    const onDisk = readFileSyncMedia(got.payload.imageRef!);
+    expect(onDisk.equals(buffer)).toBe(true);
+  });
+
+  test("document inbound: documentRef populated; payload.text still has placeholder", async () => {
+    const buffer = Buffer.from("%PDF-1.4 fake content");
+    const { channel, proc, bot } = mediaChannel({
+      fileBuffer: buffer,
+      filePathOverride: "documents/file_3.pdf",
+    });
+
+    await bot.handleUpdate(mkUpdate({ document: true, fromId: 12345 }));
+    await channel.flushPending();
+
+    expect(proc.received).toHaveLength(1);
+    const got = proc.received[0]!;
+    expect(got.type).toBe("image"); // legacy enum collapse
+    expect(got.payload.documentRef).toBeDefined();
+    expect(got.payload.text).toContain("document");
+    // imageRef is reserved for true images; document goes to documentRef.
+    expect(got.payload.imageRef).toBeUndefined();
+  });
+
+  test("download failure does NOT block placeholder delivery — agent still gets text", async () => {
+    const { channel, proc, bot } = mediaChannel({ failDownload: true });
+
+    await bot.handleUpdate(mkUpdate({ voice: true, fromId: 12345 }));
+    await channel.flushPending();
+
+    expect(proc.received).toHaveLength(1);
+    const got = proc.received[0]!;
+    expect(got.type).toBe("voice");
+    expect(got.payload.text).toContain("voice");
+    expect(got.payload.audioRef).toBeUndefined();
+  });
+
+  test("text inbound: no media-store interaction, payload contains only text", async () => {
+    const { channel, proc, bot, downloader } = mediaChannel();
+    await bot.handleUpdate(mkUpdate({ fromId: 12345, text: "no media here" }));
+    await channel.flushPending();
+    expect(proc.received).toHaveLength(1);
+    expect(proc.received[0]!.payload.audioRef).toBeUndefined();
+    expect(proc.received[0]!.payload.imageRef).toBeUndefined();
+    expect(downloader).not.toHaveBeenCalled();
+  });
+
+  test("no inboundMediaStore configured: voice inbound delivers placeholder (back-compat)", async () => {
+    const proc = new CapturingProcessor();
+    const factory = makeBotFactory();
+    let bot: Bot | undefined;
+    const channel = new TelegramChannel({
+      botToken: "fake-token",
+      allowedUserIds: ALLOWED,
+      inboundProcessor: proc,
+      botFactory: (t) => {
+        const b = factory(t);
+        bot = b;
+        return b;
+      },
+    });
+    void channel;
+    if (!bot) throw new Error("bot factory not invoked");
+
+    await bot.handleUpdate(mkUpdate({ voice: true, fromId: 12345 }));
+    expect(proc.received).toHaveLength(1);
+    expect(proc.received[0]!.type).toBe("voice");
+    expect(proc.received[0]!.payload.audioRef).toBeUndefined();
+  });
+});

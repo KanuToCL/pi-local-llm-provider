@@ -736,3 +736,151 @@ describe("formatChannelEvent — coverage of all event types", () => {
 // (compile-time check; no runtime assertions needed)
 const _typeSmoke: ChannelEvent = { type: "reply", text: "x", ts: 0 };
 void _typeSmoke;
+
+// ---------------------------------------------------------------------------
+// FIX-B-3 Wave 8 — per-sender / per-channel inbound rate limiter wiring
+// ---------------------------------------------------------------------------
+
+import { InboundRateLimiter } from "../src/lib/inbound-rate-limit.js";
+
+describe("WhatsappChannel — inbound rate limiter wiring (FIX-B-3 Wave 8)", () => {
+  test("11th rapid message from same allowed sender is silently rate-limited + audited", async () => {
+    let t = 1_700_000_000_000;
+    const limiter = new InboundRateLimiter({
+      perSender: { capacity: 10, refillRatePerMs: 0 },
+      perChannel: { capacity: 100, refillRatePerMs: 0 },
+      now: () => t,
+    });
+    const proc = new CapturingProcessor();
+    const auditDir = join(workDir, "audit");
+    const audit = new AuditLog({ dir: auditDir, daemonStartTs: t - 1000 });
+    const socket = makeMockSocket();
+    const channel = new WhatsappChannel({
+      identityModel: "self-chat",
+      ownerJid: OWNER_JID,
+      authStateDir: join(workDir, "wa-auth-rl"),
+      inboundProcessor: proc,
+      auditLog: audit,
+      socketFactory: makeFactory(socket),
+      inboundRateLimiter: limiter,
+    });
+    await channel.start();
+    socket.ev.emit("connection.update", { connection: "open" });
+    await channel.flushPending();
+
+    for (let i = 0; i < 10; i++) {
+      socket.ev.emit("messages.upsert", {
+        messages: [
+          mkMessage({
+            remoteJid: OWNER_JID,
+            fromMe: true,
+            text: `msg ${i}`,
+          }),
+        ],
+        type: "notify",
+      });
+    }
+    await channel.flushPending();
+    expect(proc.received).toHaveLength(10);
+
+    // 11th — rate limited.
+    socket.ev.emit("messages.upsert", {
+      messages: [
+        mkMessage({
+          remoteJid: OWNER_JID,
+          fromMe: true,
+          text: "msg 11",
+        }),
+      ],
+      type: "notify",
+    });
+    await channel.flushPending();
+    expect(proc.received).toHaveLength(10);
+
+    // Force-flush audit.
+    await audit.append({
+      event: "daemon_boot",
+      task_id: null,
+      channel: "system",
+      sender_id_hash: null,
+    });
+    const lines = await readAuditLines(auditDir);
+    const rl = (lines as AuditEntryShape[]).filter(
+      (e) => e.event === "inbound_rate_limited",
+    );
+    expect(rl.length).toBeGreaterThanOrEqual(1);
+    expect(rl[0]!.extra?.reason).toBe("per_sender");
+    expect(rl[0]!.channel).toBe("whatsapp");
+
+    await channel.stop();
+  });
+
+  test("31st rapid message across the channel is silently rate-limited (per_channel)", async () => {
+    let t = 1_700_000_000_000;
+    const limiter = new InboundRateLimiter({
+      perSender: { capacity: 100, refillRatePerMs: 0 },
+      perChannel: { capacity: 30, refillRatePerMs: 0 },
+      now: () => t,
+    });
+    const proc = new CapturingProcessor();
+    const auditDir = join(workDir, "audit-wa-channel");
+    const audit = new AuditLog({ dir: auditDir, daemonStartTs: t - 1000 });
+    const socket = makeMockSocket();
+    const channel = new WhatsappChannel({
+      identityModel: "self-chat",
+      ownerJid: OWNER_JID,
+      authStateDir: join(workDir, "wa-auth-rl-ch"),
+      inboundProcessor: proc,
+      auditLog: audit,
+      socketFactory: makeFactory(socket),
+      inboundRateLimiter: limiter,
+    });
+    await channel.start();
+    socket.ev.emit("connection.update", { connection: "open" });
+    await channel.flushPending();
+
+    // Burn 30 channel tokens via owner messages.
+    for (let i = 0; i < 30; i++) {
+      socket.ev.emit("messages.upsert", {
+        messages: [
+          mkMessage({
+            remoteJid: OWNER_JID,
+            fromMe: true,
+            text: `m${i}`,
+          }),
+        ],
+        type: "notify",
+      });
+    }
+    await channel.flushPending();
+    expect(proc.received).toHaveLength(30);
+
+    // 31st - channel saturated.
+    socket.ev.emit("messages.upsert", {
+      messages: [
+        mkMessage({
+          remoteJid: OWNER_JID,
+          fromMe: true,
+          text: "tripping channel cap",
+        }),
+      ],
+      type: "notify",
+    });
+    await channel.flushPending();
+    expect(proc.received).toHaveLength(30);
+
+    await audit.append({
+      event: "daemon_boot",
+      task_id: null,
+      channel: "system",
+      sender_id_hash: null,
+    });
+    const lines = (await readAuditLines(auditDir)) as AuditEntryShape[];
+    const rl = lines.filter((e) => e.event === "inbound_rate_limited");
+    expect(rl.length).toBeGreaterThanOrEqual(1);
+    const reasons = rl.map((r) => r.extra?.reason);
+    expect(reasons).toContain("per_channel");
+
+    await channel.stop();
+  });
+});

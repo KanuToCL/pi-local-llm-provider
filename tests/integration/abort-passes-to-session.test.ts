@@ -50,6 +50,8 @@ function makeAppConfig(): AppConfig {
     piCommsSandbox: "on",
     piCommsAuditRetentionDays: 90,
     piCommsDiagnosticMode: false,
+    piCommsInboundRatePerSenderPerMin: 10,
+    piCommsInboundRatePerChannelPerMin: 30,
   };
 }
 

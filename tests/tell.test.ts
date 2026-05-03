@@ -1,5 +1,10 @@
 import { describe, expect, test } from "vitest";
-import { defineTellTool, normalizeForDedupHash } from "../src/tools/tell.js";
+import {
+  COOLDOWN_MAP_HARD_CAP,
+  defineTellTool,
+  normalizeForDedupHash,
+  pruneCooldownMap,
+} from "../src/tools/tell.js";
 import type { ChannelEvent, Sink, ToolUrgency } from "../src/tools/types.js";
 
 // ---------------------------------------------------------------------------
@@ -254,5 +259,121 @@ describe("normalizeForDedupHash", () => {
     expect(normalizeForDedupHash("a-b-c")).toBe("abc");
     // numbers preserved
     expect(normalizeForDedupHash("v1.2.3 release")).toBe("v123 release");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FIX-B-3 Wave 8 — bounded eviction (TTL + LRU) on cooldownMap
+// ---------------------------------------------------------------------------
+
+describe("cooldownMap bounded eviction (FIX-B-3 Wave 8)", () => {
+  test("10K unique tells cap the map at COOLDOWN_MAP_HARD_CAP", async () => {
+    const term = new CapturingSink();
+    const cooldownMap = new Map<string, number>();
+    const clock = makeClock();
+    const tool = defineTellTool({
+      sinks: { terminal: term },
+      cooldownMap,
+      now: clock.now,
+      // Use blocked urgency so per-urgency rate cap is Infinity (no throttle).
+    });
+
+    for (let i = 0; i < 10_000; i++) {
+      // Use a unique text each time (so cooldown won't suppress).
+      await callTell(tool, { text: `unique #${i}`, urgency: "blocked" });
+      // Tiny clock advance so each entry has a distinct timestamp; keep
+      // them all within 2*cooldownMs so TTL prune doesn't take them.
+      clock.advance(1);
+    }
+    // After 10K inserts the map must be capped at COOLDOWN_MAP_HARD_CAP.
+    expect(cooldownMap.size).toBeLessThanOrEqual(COOLDOWN_MAP_HARD_CAP);
+    expect(cooldownMap.size).toBe(COOLDOWN_MAP_HARD_CAP);
+  });
+
+  test("entries past 2*cooldownMs are pruned (TTL eviction)", async () => {
+    const term = new CapturingSink();
+    const cooldownMap = new Map<string, number>();
+    const clock = makeClock();
+    const tool = defineTellTool({
+      sinks: { terminal: term },
+      cooldownMap,
+      cooldownMs: 30_000,
+      now: clock.now,
+    });
+
+    // Plant 5 distinct stale entries.
+    for (let i = 0; i < 5; i++) {
+      await callTell(tool, { text: `stale #${i}`, urgency: "blocked" });
+      clock.advance(1);
+    }
+    expect(cooldownMap.size).toBe(5);
+
+    // Jump well past 2 * cooldownMs (60s).
+    clock.advance(120_000);
+
+    // A fresh tell triggers prune at the top of execute().
+    await callTell(tool, { text: "fresh entry", urgency: "blocked" });
+
+    // All 5 stale entries should be gone; only the fresh one remains.
+    expect(cooldownMap.size).toBe(1);
+    expect(cooldownMap.has(normalizeForDedupHash("fresh entry"))).toBe(true);
+  });
+
+  test("recent entries are retained (TTL prune does not take them)", async () => {
+    const term = new CapturingSink();
+    const cooldownMap = new Map<string, number>();
+    const clock = makeClock();
+    const tool = defineTellTool({
+      sinks: { terminal: term },
+      cooldownMap,
+      cooldownMs: 30_000,
+      now: clock.now,
+    });
+
+    // Plant 3 entries.
+    await callTell(tool, { text: "alpha", urgency: "blocked" });
+    clock.advance(1_000);
+    await callTell(tool, { text: "bravo", urgency: "blocked" });
+    clock.advance(1_000);
+    await callTell(tool, { text: "charlie", urgency: "blocked" });
+
+    expect(cooldownMap.size).toBe(3);
+
+    // Advance just under 2*cooldownMs (=60s); entries are still in the
+    // 'recent' window.
+    clock.advance(50_000);
+    await callTell(tool, { text: "delta", urgency: "blocked" });
+    // All 4 should be retained — none is past 2*cooldownMs.
+    expect(cooldownMap.size).toBe(4);
+  });
+});
+
+describe("pruneCooldownMap (unit)", () => {
+  test("TTL pass drops entries older than 2*cooldownMs", () => {
+    const map = new Map<string, number>();
+    map.set("old", 1_000);
+    map.set("borderline", 50_000); // older than cooldownMs but within 2x
+    map.set("fresh", 95_000);
+    pruneCooldownMap(map, 100_000, 30_000);
+    // ttlCutoff = 100_000 - 60_000 = 40_000
+    expect(map.has("old")).toBe(false); // 1_000 < 40_000
+    expect(map.has("borderline")).toBe(true); // 50_000 >= 40_000
+    expect(map.has("fresh")).toBe(true);
+  });
+
+  test("LRU pass enforces the hard cap by dropping oldest", () => {
+    const map = new Map<string, number>();
+    // Fill 5 entries at the same recent timestamp so TTL doesn't catch them.
+    for (let i = 0; i < 5; i++) {
+      map.set(`k${i}`, 1_000);
+    }
+    pruneCooldownMap(map, 1_010, 30_000, 3); // hardCap = 3
+    expect(map.size).toBe(3);
+    // Oldest two (k0, k1) should be gone; k2/k3/k4 remain.
+    expect(map.has("k0")).toBe(false);
+    expect(map.has("k1")).toBe(false);
+    expect(map.has("k2")).toBe(true);
+    expect(map.has("k3")).toBe(true);
+    expect(map.has("k4")).toBe(true);
   });
 });

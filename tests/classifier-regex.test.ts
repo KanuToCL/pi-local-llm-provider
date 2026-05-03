@@ -235,6 +235,27 @@ describe("CRITICAL shell-like-tool (v4.2)", () => {
   });
 });
 
+// ----- CRITICAL: npx arbitrary-package (FIX-B-3 Wave 8) -------------------
+
+describe("CRITICAL npx arbitrary-package (FIX-B-3 Wave 8)", () => {
+  test.each([
+    "npx some-package",
+    "npx create-react-app my-app",
+    "npx cowsay hello",
+    "npx -y typo-squat-attack",
+    "npx tsx scripts/foo.ts",
+  ])("triggers on %s — npx <package> fetches+runs arbitrary remote code", (cmd) => {
+    expectConfirm(cmd, "critical-npx-arbitrary-package");
+  });
+
+  test.each([
+    "npx --help",
+    "npx --version",
+  ])("allows npx %s (informational only, no remote fetch)", (cmd) => {
+    expectAllow(cmd);
+  });
+});
+
 // ----- CRITICAL: path-relative --------------------------------------------
 
 describe("CRITICAL path-relative (v4.2)", () => {

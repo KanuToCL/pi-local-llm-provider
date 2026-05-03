@@ -49,6 +49,10 @@
 import { chmod, mkdir, writeFile } from "node:fs/promises";
 
 import { chunkOutbound } from "../lib/chunk-outbound.js";
+import {
+  InboundMediaStore,
+  type InboundMediaSavedRef,
+} from "../lib/inbound-media.js";
 import type {
   ChannelEvent,
   InboundMessage,
@@ -57,6 +61,7 @@ import type {
 } from "./base.js";
 import type { AuditLog } from "../audit/log.js";
 import type { AuditEntry } from "../audit/schema.js";
+import type { InboundRateLimiter } from "../lib/inbound-rate-limit.js";
 import type { OperatorLogger } from "../utils/operator-logger.js";
 
 // ---------------------------------------------------------------------------
@@ -73,6 +78,52 @@ export class BaileysNotInstalledError extends Error {
     super(message);
     this.name = "BaileysNotInstalledError";
   }
+}
+
+// ---------------------------------------------------------------------------
+// Pluggable Baileys media downloader (test seam)
+// ---------------------------------------------------------------------------
+
+/**
+ * Pluggable downloader called once per non-text inbound to materialize a
+ * Baileys WAMessage as a Buffer.  Production wiring binds this to
+ * `@whiskeysockets/baileys`'s `downloadMediaMessage(msg, "buffer", {})`;
+ * tests inject a synthetic Buffer so they never need to load the optional
+ * Baileys dep just to assert that the channel populates `audioRef` etc.
+ *
+ * Keeping the callback opaque to this module mirrors how Baileys itself
+ * is dynamic-imported (`loadBaileys` below) — `@whiskeysockets/baileys` is
+ * an `optionalDependencies` entry, so a direct `import` would break tsc
+ * on dev machines without the package installed.
+ */
+export type WhatsappMediaDownloader = (msg: unknown) => Promise<Buffer>;
+
+/**
+ * Default media downloader: lazy-loads Baileys and calls
+ * `downloadMediaMessage(msg, "buffer", {})`.  Throws `BaileysNotInstalledError`
+ * (same as the connect path) when the optional dep is missing.  Unit tests
+ * inject a stub and never reach this code; the production daemon wiring
+ * (FIX-B-1/B-2 own daemon.ts) constructs the channel with this default.
+ */
+async function defaultBaileysDownload(msg: unknown): Promise<Buffer> {
+  let mod: Record<string, unknown>;
+  try {
+    mod = (await import("@whiskeysockets/baileys")) as Record<string, unknown>;
+  } catch (err) {
+    const cause = err instanceof Error ? err.message : String(err);
+    throw new BaileysNotInstalledError(
+      `@whiskeysockets/baileys is not installed (${cause}); cannot download inbound media.`,
+    );
+  }
+  const fn = mod.downloadMediaMessage as
+    | ((m: unknown, type: "buffer", opts: Record<string, unknown>) => Promise<Buffer>)
+    | undefined;
+  if (typeof fn !== "function") {
+    throw new BaileysNotInstalledError(
+      "@whiskeysockets/baileys loaded but `downloadMediaMessage` is not a function.",
+    );
+  }
+  return fn(msg, "buffer", {});
 }
 
 // ---------------------------------------------------------------------------
@@ -151,6 +202,34 @@ export interface WhatsappChannelOpts {
    * DM-only / allowlist filters (the WS read itself succeeded).
    */
   onPoll?: () => void;
+  /**
+   * Optional per-sender / per-channel inbound rate limiter (FIX-B-3 Wave 8).
+   * When provided, each message in the upsert batch is checked AGAINST
+   * the limiter BEFORE the DM-only / allowlist gates so a flooding sender
+   * cannot exhaust downstream queue budget regardless of allowlist status.
+   * Silent reject + audit (`inbound_rate_limited`) on rate-limit; the
+   * channel keeps reading the WS. Omit in tests that don't exercise
+   * rate-limit semantics.
+   */
+  inboundRateLimiter?: InboundRateLimiter;
+  /**
+   * Persistence backend for non-text inbound media (voice notes, images,
+   * documents, video, stickers).  When provided, the channel calls the
+   * configured `mediaDownloader` to materialize the buffer, hands it to
+   * `inboundMediaStore.save*`, and stamps the resulting absolute path into
+   * `payload.audioRef` / `imageRef` / `documentRef` / `videoRef` so v2
+   * STT/vision can pick it up (per BLESS Accessibility — closes the v4
+   * changelog audioRef seam).  Omit in tests that don't exercise media
+   * persistence; the channel falls back to the v1 placeholder-only path.
+   */
+  inboundMediaStore?: InboundMediaStore;
+  /**
+   * Test-injectable media downloader.  Defaults to
+   * `@whiskeysockets/baileys`'s `downloadMediaMessage(msg, "buffer", {})`
+   * (lazy-loaded from the optional dep).  Tests stub this to return a
+   * synthetic Buffer so they never need Baileys installed.
+   */
+  mediaDownloader?: WhatsappMediaDownloader;
 }
 
 // ---------------------------------------------------------------------------
@@ -364,6 +443,9 @@ export class WhatsappChannel implements Sink {
   private readonly clearTimeoutFn: typeof clearTimeout;
   private readonly jitterFn: () => number;
   private readonly onPoll: (() => void) | undefined;
+  private readonly inboundRateLimiter: InboundRateLimiter | undefined;
+  private readonly inboundMediaStore: InboundMediaStore | undefined;
+  private readonly mediaDownloader: WhatsappMediaDownloader;
 
   private sock: WhatsappSocket | null = null;
   private connected = false;
@@ -408,6 +490,9 @@ export class WhatsappChannel implements Sink {
     this.clearTimeoutFn = opts.clearTimeoutFn ?? clearTimeout;
     this.jitterFn = opts.jitterFn ?? defaultJitter;
     this.onPoll = opts.onPoll;
+    this.inboundRateLimiter = opts.inboundRateLimiter;
+    this.inboundMediaStore = opts.inboundMediaStore;
+    this.mediaDownloader = opts.mediaDownloader ?? defaultBaileysDownload;
   }
 
   // -------------------------------------------------------------------------
@@ -820,6 +905,34 @@ export class WhatsappChannel implements Sink {
       const remoteJid = key.remoteJid;
       if (typeof remoteJid !== "string" || remoteJid.length === 0) continue;
 
+      // The "sender" in WhatsApp's model:
+      //   - In a 1:1 DM, the sender is `remoteJid` (or `key.participant`
+      //     in some message variants; we prefer participant when present).
+      //   - In Model A self-chat, the sender == ownerJid AND fromMe is
+      //     true (you ARE both sides of the conversation).
+      const senderJid =
+        (key.participant && key.participant.length > 0
+          ? key.participant
+          : remoteJid) ?? remoteJid;
+
+      // Per-sender / per-channel rate-limit gate (FIX-B-3 Wave 8).  Runs
+      // BEFORE the DM-only / allowlist gates so a flooding sender cannot
+      // exhaust downstream queue budget regardless of allowlist status.
+      // Silent reject + audit; the channel keeps reading the WS.
+      if (this.inboundRateLimiter) {
+        const verdict = this.inboundRateLimiter.allow("whatsapp", senderJid);
+        if (!verdict.ok) {
+          await this.audit({
+            event: "inbound_rate_limited",
+            task_id: null,
+            channel: "whatsapp",
+            sender_id_hash: hashJid(senderJid),
+            extra: { reason: verdict.reason },
+          });
+          continue;
+        }
+      }
+
       // DM-only filter: WhatsApp groups have JIDs ending in `@g.us`.
       if (remoteJid.endsWith("@g.us")) {
         await this.audit({
@@ -832,16 +945,6 @@ export class WhatsappChannel implements Sink {
         continue;
       }
 
-      // The "sender" in WhatsApp's model:
-      //   - In a 1:1 DM, the sender is `remoteJid` (or `key.participant`
-      //     in some message variants; we prefer participant when present).
-      //   - In Model A self-chat, the sender == ownerJid AND fromMe is
-      //     true (you ARE both sides of the conversation).
-      const senderJid =
-        (key.participant && key.participant.length > 0
-          ? key.participant
-          : remoteJid) ?? remoteJid;
-
       if (!this.isAllowedSender(senderJid, key.fromMe === true)) {
         await this.audit({
           event: "allowlist_reject",
@@ -853,16 +956,61 @@ export class WhatsappChannel implements Sink {
         continue;
       }
 
-      const inbound = this.normalizeInbound(msg, senderJid);
-      if (!inbound) continue;
+      const normalized = this.normalizeInbound(msg, senderJid);
+      if (!normalized) continue;
+      const { inbound, media } = normalized;
 
       this.operatorLogger?.debug("whatsapp_inbound", {
         message_type: inbound.type,
         sender_id_hash: hashJid(senderJid),
       });
 
-      // Fire-and-forget.  Errors surface via the daemon's audit pipeline,
-      // not here.
+      const msgId = extractMessageId(msg);
+
+      // When media is present AND we have a configured store AND a usable
+      // msgId, route through the async media-save path.  Otherwise dispatch
+      // the placeholder-only inbound directly.
+      if (
+        media !== null &&
+        this.inboundMediaStore !== undefined &&
+        msgId !== null
+      ) {
+        const mediaStore = this.inboundMediaStore;
+        const handler = (async () => {
+          const payload = inbound.payload;
+          try {
+            const buffer = await this.mediaDownloader(msg);
+            const ref = await this.saveByKind(
+              mediaStore,
+              media,
+              msgId,
+              buffer,
+            );
+            applyRefToPayload(payload, ref);
+          } catch (error) {
+            // Best-effort: log + proceed with placeholder-only.  v1
+            // contract: agent always gets some text; refs are upgrades.
+            this.operatorLogger?.error("whatsapp_media_save_error", {
+              error_class: error instanceof Error ? error.name : "unknown",
+              message: error instanceof Error ? error.message : String(error),
+              message_type: inbound.type,
+            });
+          }
+          try {
+            await this.inboundProcessor.processInbound(inbound);
+          } catch (error) {
+            this.operatorLogger?.error("whatsapp_inbound_processor_error", {
+              error_class: error instanceof Error ? error.name : "unknown",
+              message: error instanceof Error ? error.message : String(error),
+            });
+          }
+        })();
+        this.track(handler);
+        continue;
+      }
+
+      // Fast path: text or no-store fallback.  Fire-and-forget.  Errors
+      // surface via the daemon's audit pipeline, not here.
       void this.inboundProcessor.processInbound(inbound).catch((error) => {
         this.operatorLogger?.error("whatsapp_inbound_processor_error", {
           error_class: error instanceof Error ? error.name : "unknown",
@@ -914,17 +1062,23 @@ export class WhatsappChannel implements Sink {
   // -------------------------------------------------------------------------
 
   /**
-   * Normalize a Baileys WAMessage into our InboundMessage shape.
+   * Normalize a Baileys WAMessage into our InboundMessage shape, plus an
+   * optional `WhatsappMediaSpec` describing how to persist the underlying
+   * file when an `inboundMediaStore` is configured.
    *
-   * Per Pitfall #21 (line 1261): voice / image / document / video collapse
-   * to a synthesized text placeholder for v1.  The audioRef/imageRef
-   * filesystem seam is reserved for v2 (whisper.cpp / vision); v1 channels
-   * do NOT download media — that would explode the security surface.
+   * Per Pitfall #21: voice / image / document / video / sticker still
+   * collapse to a synthesized text placeholder for v1 (so the agent
+   * surface stays uniform).  The BLESS Accessibility ask added a second
+   * leg: when a media store is wired, the channel ALSO downloads the
+   * buffer and stamps the saved-file path into the appropriate
+   * `payload.*Ref` field, so v2 (whisper.cpp / vision) can pick it up
+   * without re-plumbing the inbound path.  This method returns the
+   * media-spec; the caller (onMessagesUpsert) owns the download/save.
    */
   private normalizeInbound(
     msg: Record<string, unknown>,
     senderJid: string,
-  ): InboundMessage | null {
+  ): { inbound: InboundMessage; media: WhatsappMediaSpec | null } | null {
     const message = msg.message as Record<string, unknown> | null | undefined;
     if (!message || typeof message !== "object") return null;
 
@@ -932,45 +1086,96 @@ export class WhatsappChannel implements Sink {
     // `conversation` (simple text) or `extendedTextMessage` (text with
     // a quote / link preview / mention).
     if (typeof message.conversation === "string") {
-      return this.buildInbound(senderJid, "text", message.conversation);
+      return {
+        inbound: this.buildInbound(senderJid, "text", message.conversation),
+        media: null,
+      };
     }
     const extended = message.extendedTextMessage as
       | { text?: string }
       | undefined;
     if (extended && typeof extended.text === "string") {
-      return this.buildInbound(senderJid, "text", extended.text);
+      return {
+        inbound: this.buildInbound(senderJid, "text", extended.text),
+        media: null,
+      };
     }
 
     // Voice note (PTT).  Baileys exposes `audioMessage.ptt = true` for
     // voice notes; non-PTT audioMessage is regular audio attachment.
     const audioMessage = message.audioMessage as
-      | { ptt?: boolean }
+      | { ptt?: boolean; mimetype?: string }
       | undefined;
     if (audioMessage) {
       const synthetic =
         "[user sent a voice — voice support is deferred to v2; please type]";
-      return this.buildInbound(senderJid, "voice", synthetic);
+      const mimeType = audioMessage.mimetype;
+      return {
+        inbound: this.buildInbound(senderJid, "voice", synthetic),
+        media: {
+          kind: "audio",
+          ext: extFromMime(mimeType, "ogg"),
+          ...(mimeType !== undefined ? { mimeType } : {}),
+        },
+      };
     }
 
-    if (message.imageMessage) {
+    const imageMessage = message.imageMessage as
+      | { mimetype?: string }
+      | undefined;
+    if (imageMessage) {
       const synthetic =
         "[user sent an image — image support is deferred to v2; please type]";
-      return this.buildInbound(senderJid, "image", synthetic);
+      const mimeType = imageMessage.mimetype;
+      return {
+        inbound: this.buildInbound(senderJid, "image", synthetic),
+        media: {
+          kind: "image",
+          ext: extFromMime(mimeType, "jpg"),
+          ...(mimeType !== undefined ? { mimeType } : {}),
+        },
+      };
     }
 
-    if (message.documentMessage) {
+    const documentMessage = message.documentMessage as
+      | { mimetype?: string; fileName?: string }
+      | undefined;
+    if (documentMessage) {
       const synthetic =
         "[user sent a document — document support is deferred to v2; please type]";
-      // Documents collapse to "image" in the v1 InboundMessage type
-      // enum (only text / voice / image are defined — see
-      // src/channels/base.ts:60).
-      return this.buildInbound(senderJid, "image", synthetic);
+      const mimeType = documentMessage.mimetype;
+      // Documents collapse to "image" in the v1 InboundMessage type enum
+      // (only text / voice / image are defined — see src/channels/base.ts).
+      // The dedicated `documentRef` field carries the v2 hint.
+      return {
+        inbound: this.buildInbound(senderJid, "image", synthetic),
+        media: {
+          kind: "document",
+          ext: documentMessage.fileName ?? extFromMime(mimeType, "bin"),
+          ...(mimeType !== undefined ? { mimeType } : {}),
+        },
+      };
     }
 
-    if (message.videoMessage || message.stickerMessage) {
-      const kind = message.videoMessage ? "video" : "sticker";
+    const videoMessage = message.videoMessage as
+      | { mimetype?: string }
+      | undefined;
+    const stickerMessage = message.stickerMessage as
+      | { mimetype?: string }
+      | undefined;
+    if (videoMessage || stickerMessage) {
+      const isVideo = videoMessage !== undefined;
+      const kind = isVideo ? "video" : "sticker";
       const synthetic = `[user sent a ${kind} — non-text inbound is deferred; please type]`;
-      return this.buildInbound(senderJid, "image", synthetic);
+      const mimeType = (videoMessage ?? stickerMessage)?.mimetype;
+      return {
+        inbound: this.buildInbound(senderJid, "image", synthetic),
+        media: {
+          kind: "video",
+          ext: extFromMime(mimeType, isVideo ? "mp4" : "webp"),
+          ...(mimeType !== undefined ? { mimeType } : {}),
+        },
+      };
     }
 
     // Unknown WhatsApp message kind (poll, contact, location, ...).  Drop
@@ -990,6 +1195,28 @@ export class WhatsappChannel implements Sink {
       payload: { text },
       ts: Date.now(),
     };
+  }
+
+  /**
+   * Hand the buffer to the configured media store using the per-kind save
+   * method.  Mirrors `TelegramChannel.saveByKind`.
+   */
+  private saveByKind(
+    store: InboundMediaStore,
+    media: WhatsappMediaSpec,
+    msgId: string,
+    buffer: Buffer,
+  ): Promise<InboundMediaSavedRef> {
+    const opts = {
+      msgId,
+      ext: media.ext,
+      buffer,
+      ...(media.mimeType !== undefined ? { mimeType: media.mimeType } : {}),
+    };
+    if (media.kind === "audio") return store.saveAudio(opts);
+    if (media.kind === "image") return store.saveImage(opts);
+    if (media.kind === "document") return store.saveDocument(opts);
+    return store.saveVideo(opts);
   }
 
   // -------------------------------------------------------------------------
@@ -1119,4 +1346,92 @@ export async function writePairRecord(
   } catch {
     // non-Unix; ignore
   }
+}
+
+// ---------------------------------------------------------------------------
+// Internal — media-spec descriptor + payload-ref helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-message media descriptor returned alongside an InboundMessage from
+ * `normalizeInbound` when the message has a non-text body.  Captures
+ * everything the upsert handler needs to download + persist the file:
+ *   - `kind`     decides which `InboundMediaStore.save*` method to call
+ *                AND which `payload.*Ref` field to populate.
+ *   - `ext`      becomes the on-disk suffix.  The store sanitizes this.
+ *   - `mimeType` informational; threaded into the saved-ref for v2 hints.
+ *
+ * Note that `kind` differs from the corresponding `payload.type`:
+ *   - `kind: 'document'` → `payload.type` is "image" (legacy enum) but
+ *     `payload.documentRef` is set.
+ *   - `kind: 'video'`    → `payload.type` is "image" (legacy enum) but
+ *     `payload.videoRef` is set.
+ */
+interface WhatsappMediaSpec {
+  kind: "audio" | "image" | "document" | "video";
+  ext: string;
+  mimeType?: string;
+}
+
+/**
+ * Stamp the saved-ref's path into the appropriate `payload.*Ref` field.
+ * Centralized so both `onMessagesUpsert` and any future fan-out path
+ * share one source of truth for the field-name convention defined in
+ * `src/channels/base.ts`.
+ */
+function applyRefToPayload(
+  payload: InboundMessage["payload"],
+  ref: InboundMediaSavedRef,
+): void {
+  if (ref.mediaType === "audio") {
+    payload.audioRef = ref.path;
+    return;
+  }
+  if (ref.mediaType === "image") {
+    payload.imageRef = ref.path;
+    return;
+  }
+  if (ref.mediaType === "document") {
+    payload.documentRef = ref.path;
+    return;
+  }
+  // ref.mediaType === 'video'
+  payload.videoRef = ref.path;
+}
+
+/**
+ * Pull a stable per-message id off a Baileys WAMessage envelope.  Returns
+ * `null` if the id isn't present (defensive: real Baileys messages always
+ * have `key.id`, but we don't want to throw if a future SDK change drops
+ * the field — the channel can still deliver the placeholder text).
+ */
+function extractMessageId(msg: Record<string, unknown>): string | null {
+  const key = msg.key as { id?: unknown } | undefined;
+  if (!key) return null;
+  if (typeof key.id !== "string" || key.id.length === 0) return null;
+  return key.id;
+}
+
+/**
+ * Map a MIME-type hint to a sensible file extension.  Used so we don't have
+ * to hard-code `.ogg` for all audio when WhatsApp delivers `.opus` /
+ * `.aac` etc.  Falls back to `defaultExt` when no mime is supplied or the
+ * mapping is unknown.  The store sanitizes the result so downstream callers
+ * can pass arbitrary mime strings without worrying about filesystem safety.
+ */
+function extFromMime(mime: string | undefined, defaultExt: string): string {
+  if (!mime) return defaultExt;
+  // Drop parameters: "audio/ogg; codecs=opus" → "audio/ogg"
+  const base = mime.split(";")[0]!.trim().toLowerCase();
+  const slash = base.indexOf("/");
+  if (slash < 0) return defaultExt;
+  const subtype = base.slice(slash + 1);
+  // Common normalizations.
+  if (subtype === "jpeg") return "jpg";
+  if (subtype === "ogg") return "ogg";
+  if (subtype === "mpeg") return "mp3";
+  if (subtype === "x-m4a") return "m4a";
+  // Generic case: alnum-only.  inbound-media's sanitizeExt will trim
+  // anything weird, but trimming here keeps the on-disk filename tidy.
+  return subtype.replace(/[^a-z0-9]/g, "") || defaultExt;
 }

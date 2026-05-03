@@ -448,6 +448,21 @@ const CRITICAL_SHELL_LIKE_TOOL: Rule[] = [
     decision: "confirm",
     category: "shell-like-tool",
   },
+  {
+    id: "critical-npx-arbitrary-package",
+    severity: "critical",
+    // npx <anything> EXCEPT --help / --version. npx fetches and executes
+    // arbitrary remote packages — strictly higher risk than `npm run`
+    // (which is bounded by package.json) because the package itself is
+    // chosen at the command line, can be anything on the npm registry
+    // (including typo-squatted malicious packages), and immediately runs
+    // its install + bin scripts.  Per FIX-B-3 Wave 8 (BLESS round).
+    pattern: /^\s*npx\s+(?!--help|--version)/,
+    description:
+      "npx <package> — fetches + runs arbitrary remote package (typo-squatting / supply-chain risk)",
+    decision: "confirm",
+    category: "shell-like-tool",
+  },
 ];
 
 const CRITICAL_PATH_RELATIVE: Rule[] = [
