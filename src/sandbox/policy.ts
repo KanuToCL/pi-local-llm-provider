@@ -109,6 +109,25 @@ export interface DisableOptions {
    * after a fresh session boundary. Captured on the grant for forensics.
    */
   firstPerSession?: boolean;
+  /**
+   * AUDIT-B #16: forensic context.  When the request was triggered as a
+   * follow-up to a tool result, the upstream handler should pass the
+   * task id whose tool output prompted the user.  Recorded on
+   * `unsand_enabled` audit so post-incident review can correlate.
+   */
+  triggeringTaskId?: string;
+  /**
+   * AUDIT-B #16: hash of the user-message text that triggered the
+   * request (NOT the raw text — privacy).  Recorded on `unsand_enabled`
+   * audit.  Empty string when not provided.
+   */
+  triggeringUserMessageHash?: string;
+  /**
+   * AUDIT-B #16: free-form rationale the AGENT supplied (when the
+   * grant was tool-derived).  Recorded verbatim on `unsand_enabled`
+   * audit (truncated to 500 chars).  Empty string when not provided.
+   */
+  agentRationaleText?: string;
   /** Optional clock injection for tests. */
   now?: number;
 }
@@ -231,18 +250,25 @@ export class SandboxPolicy {
     this.state = next;
     this.persist();
     if (this.auditLog) {
+      // AUDIT-B #16: enrich `unsand_enabled` with caller-supplied
+      // forensic fields.  All optional; empty-string fallback so
+      // post-mortem queries always see the keys even when unset.
+      const extra: Record<string, string | number | boolean> = {
+        scope: next.scope,
+        expires_at: next.expiresAt ?? 0,
+        tool_derived: next.toolDerivedFlag,
+        first_per_session: next.firstPerSession,
+        triggering_task_id: opts.triggeringTaskId ?? "",
+        triggering_user_message_hash: opts.triggeringUserMessageHash ?? "",
+        agent_rationale_text: (opts.agentRationaleText ?? "").slice(0, 500),
+      };
       void this.auditLog
         .append({
           event: "unsand_enabled",
-          task_id: null,
+          task_id: opts.triggeringTaskId ?? null,
           channel: "system",
           sender_id_hash: null,
-          extra: {
-            scope: next.scope,
-            expires_at: next.expiresAt ?? 0,
-            tool_derived: next.toolDerivedFlag,
-            first_per_session: next.firstPerSession,
-          },
+          extra,
         })
         .catch(() => undefined);
     }

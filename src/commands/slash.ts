@@ -456,7 +456,15 @@ export class SlashCommandRouter {
       : false;
     const needsAck = firstPerSession || toolDerived;
     if (needsAck && !ctx.isTerminal) {
-      await this.auditAllowlistReject("unsand", ctx, needsAck && firstPerSession ? "first_per_session_no_terminal_ack" : "tool_derived_no_terminal_ack");
+      // Use the unsand-specific audit event: this is NOT an allowlist
+      // violation (the user IS allowed; the surface is wrong).  Lower-
+      // priority finding from AUDIT-A: /unsand needs `unsand_disabled`
+      // with the specific terminal-ack reason rather than the generic
+      // `allowlist_reject`.
+      const reason = firstPerSession
+        ? "first_per_session_no_terminal_ack"
+        : "tool_derived_no_terminal_ack";
+      await this.auditUnsandDisabled(ctx, reason);
       return {
         handled: true,
         reply: "first-session /unsand requires terminal ack — please run from your desk first.",
@@ -588,6 +596,33 @@ export class SlashCommandRouter {
         sender_id_hash: ctx.senderId,
         extra: {
           command,
+          reason,
+          terminal: ctx.isTerminal,
+        },
+      });
+    } catch {
+      // best-effort
+    }
+  }
+
+  /**
+   * Emit an `unsand_disabled` audit event with the specific reason when
+   * /unsand is refused for first-per-session or tool-derived reasons
+   * without terminal-side ack.  Per AUDIT-A lower-priority fix: this is
+   * NOT an allowlist violation; the operator is allowed but the surface
+   * is wrong.
+   */
+  private async auditUnsandDisabled(
+    ctx: SlashCommandContext,
+    reason: string,
+  ): Promise<void> {
+    try {
+      await this.deps.auditLog.append({
+        event: "unsand_disabled",
+        task_id: null,
+        channel: ctx.senderChannel,
+        sender_id_hash: ctx.senderId,
+        extra: {
           reason,
           terminal: ctx.isTerminal,
         },
