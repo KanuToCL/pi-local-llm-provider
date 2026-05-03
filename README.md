@@ -2,15 +2,21 @@
 
 > Use [pi-mono](https://github.com/badlogic/pi-mono) (Mario Zechner's terminal coding agent) backed by a **local LLM** instead of paying for cloud subscriptions. Today supports [Unsloth Studio](https://unsloth.ai/), [Ollama](https://ollama.com/), [LM Studio](https://lmstudio.ai/), and [vLLM](https://vllm.ai/) — anything that speaks the OpenAI `/v1/chat/completions` shape.
 
-Status: **probe-gated**. The integration ships as a single `~/.pi/agent/models.json` config entry per backend (Tier 0). The 30-LOC probe in [`scripts/probe-toolcalls.js`](./scripts/probe-toolcalls.js) decides whether a given backend is viable for pi-mono's tool-calling agent before you commit.
+Status: **probe-gated**. The integration ships as a single `~/.pi/agent/models.json` config entry per backend (Tier 0). The 30-LOC probe in [`scripts/probe-toolcalls.js`](./scripts/probe-toolcalls.js) decides whether a given backend is viable for pi-mono's tool-calling agent before you commit. Verified end-to-end on RTX 5070 (12 GB) with `unsloth/Qwen3.6-27B-GGUF` (UD-Q4_K_XL) → Unsloth Studio → pi-mono 0.70.6 — see [Probe results](#probe-results) and the generated artifact in [`examples/blog-artifacts/`](./examples/blog-artifacts/).
 
 - [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) — four-layer architecture (Studio → this repo → pi-mono → OpenClaw), data flow, recommended wiring path, failure-mode reference
 - [`docs/DESIGN.md`](./docs/DESIGN.md) — Tier-0 design and decision tree
+- [`SECURITY.md`](./SECURITY.md) — threat model, risk register, operator discipline
+- [`CONTRIBUTING.md`](./CONTRIBUTING.md) — submit a probe verdict for your hardware
 - [`RFC.md`](./RFC.md) — upstream pi-mono PR draft
 
 ## Why this exists
 
 pi-mono advertises "BYO model." That works trivially for cloud APIs, but local LLM servers have undocumented quirks (Studio silently drops `chat_template_kwargs`; Ollama needed v0.3+ for OpenAI-shaped tool calls; LM Studio's chat-template handling for Qwen3 is version-dependent). This repo collects the empirical findings — what config works, what breaks, what to test before committing.
+
+## Safety, in one paragraph
+
+A local-LLM coding agent is a powerful primitive: pi-mono can read your filesystem, write files, and run `bash`. Combined with a model that may follow attacker-controlled instructions in a poisoned context, that's a prompt-injection RCE surface. Read [`SECURITY.md`](./SECURITY.md) before running pi from a directory that contains anything you'd rather not see in a public gist. The tl;dr: launch via [`scripts/pi-launch.sh`](./scripts/pi-launch.sh) (validates env-var `apiKey` references before pi runs — closes R2), launch Studio with `-H 127.0.0.1` (don't expose the daemon to your LAN — R9), and don't `/share` any session that touched secrets (R5).
 
 ## Three-step install
 
@@ -50,6 +56,26 @@ pi --provider unsloth-studio --model "unsloth/Qwen3.6-27B-GGUF" "list files in t
 ```
 
 If `~/.pi/agent/models.json` already exists, merge by hand — pi-mono accepts multiple providers in one file.
+
+### Recommended: launch via `pi-launch.sh`
+
+Use the wrapper at [`scripts/pi-launch.sh`](./scripts/pi-launch.sh) (or the PowerShell counterpart [`scripts/pi-launch.ps1`](./scripts/pi-launch.ps1)) instead of calling `pi` directly. It runs [`scripts/check-env.js`](./scripts/check-env.js) first to confirm every env-var-named `apiKey` in your `models.json` resolves to a non-empty value — without that gate, an unset env var can cause pi-mono to ship the literal env-var name as the bearer token (R2 in [`SECURITY.md`](./SECURITY.md)). The wrapper also warns if `~/.pi/agent/models.json` is group/other-readable on Unix.
+
+```bash
+# Put pi-launch on PATH (one-time)
+ln -s "$(pwd)/scripts/pi-launch.sh" /usr/local/bin/pi-launch
+
+# Use it instead of `pi`
+pi-launch --provider unsloth-studio --model "unsloth/Qwen3.6-27B-GGUF" "list files"
+```
+
+Windows / PowerShell:
+
+```powershell
+.\scripts\pi-launch.ps1 --provider unsloth-studio --model "unsloth/Qwen3.6-27B-GGUF" "list files"
+```
+
+If the wrapper exits before pi runs, the diagnostic on stderr lists which env vars are missing and why letting pi run anyway is the wrong call.
 
 ## Switching and checking models
 
@@ -128,14 +154,22 @@ The `models.json` schema pi-mono actually reads (per `<pi-coding-agent>/docs/mod
 | `cost` | Required (use all zeros for local) or pi reports fake dollars per turn. |
 | `tools` | Not a field — tool-calling capability is decided by the backend at runtime. The probe is what verifies it. |
 
-## Supported backends
+## Probe results
 
-| Backend | Tested model | Status | Example config |
-|---------|--------------|--------|----------------|
-| Unsloth Studio | `unsloth/Qwen3.6-27B-GGUF` | probe-gated | [`examples/models.unsloth-studio.json`](./examples/models.unsloth-studio.json) |
-| Ollama | `qwen2.5:14b-instruct-q4_K_M` | mature | [`examples/models.ollama.json`](./examples/models.ollama.json) |
-| LM Studio | TBD | future | TBD |
-| vLLM | TBD | future | TBD |
+| Backend | Model | Quant / variant | Hardware | OS | pi-mono | Date | Verdict | Contributor | Example config |
+|---|---|---|---|---|---|---|---|---|---|
+| Unsloth Studio | `unsloth/Qwen3.6-27B-GGUF` | UD-Q4_K_XL | RTX 5070 (12 GB) | Windows 11 | 0.70.6 | 2026-04-29 | **PASS** | [@KanuToCL](https://github.com/KanuToCL) | [`examples/models.unsloth-studio.json`](./examples/models.unsloth-studio.json) |
+| Ollama | `qwen2.5:14b-instruct-q4_K_M` | Q4_K_M | — | — | — | — | known-good (mature, no formal probe verdict on file) | — | [`examples/models.ollama.json`](./examples/models.ollama.json) |
+| LM Studio | TBD | TBD | — | — | — | — | untested skeleton | — | [`examples/models.lm-studio.json`](./examples/models.lm-studio.json) |
+| vLLM | TBD | TBD | — | — | — | — | untested skeleton | — | [`examples/models.vllm.json`](./examples/models.vllm.json) |
+
+| Verdict | Meaning |
+|---|---|
+| **PASS** | `node scripts/probe-toolcalls.js` exits 0 — backend emits structured `tool_calls[]` and pi-mono can drive it |
+| known-good | Backend works in practice; no probe verdict on file with hardware attribution |
+| untested skeleton | A `models.json` example exists but no PASS verdict has been submitted — see [`CONTRIBUTING.md`](./CONTRIBUTING.md) |
+
+Submit a row for your hardware/model via the verdict template in [`CONTRIBUTING.md`](./CONTRIBUTING.md).
 
 ## Why the probe
 
@@ -149,6 +183,12 @@ The probe sends one tool-augmented request and asserts `tool_calls[]` is populat
 - **Single-user-of-public-record** (the author). Use at your own risk; please open issues if you hit a backend quirk this repo doesn't document.
 - **Not a Claude replacement.** Local Qwen3.6-27B is a junior pair programmer for grunt work, not a Claude Sonnet substitute. See [`docs/DESIGN.md`](./docs/DESIGN.md) §1 for honest framing.
 - **Not coupled to any specific RAG project.** This is pure infrastructure — pi sends OpenAI-compat HTTP requests, your local server answers.
+
+## Contributing
+
+Probe verdicts for new hardware/model combinations are the highest-leverage contribution. See [`CONTRIBUTING.md`](./CONTRIBUTING.md) for the verdict template, code style (zero runtime deps, shellcheck-clean bash, ESM-only Node), and what's out of scope.
+
+Security findings: see [`SECURITY.md`](./SECURITY.md). Open a [GitHub security advisory](https://github.com/KanuToCL/pi-local-llm-provider/security/advisories/new) for credential exposure or RCE; open a regular issue with the `security` label for hardening suggestions.
 
 ## License
 

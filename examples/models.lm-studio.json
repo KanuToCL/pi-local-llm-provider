@@ -1,0 +1,35 @@
+{
+  "_comment": "UNTESTED skeleton for LM Studio. The schema follows pi-mono ≥0.70 (see README 'Schema notes'). LM Studio's OpenAI-compat server is enabled in the 'Server' tab of the LM Studio app and defaults to http://localhost:1234. Auth is typically not enforced for local LM Studio installs; the apiKey field is set to a literal placeholder so pi-mono's resolver doesn't try to look up an env var. Pre-req: launch LM Studio's local server, load a tool-capable model (e.g. Qwen3 or qwen2.5 family), then run `node scripts/probe-toolcalls.js` with PROBE_ENDPOINT=http://localhost:1234/v1 PROBE_MODEL=<your-model-id> PROBE_API_KEY=lmstudio. Submit your probe verdict per CONTRIBUTING.md to upgrade this entry from 'untested' to a passing matrix row.",
+
+  "providers": {
+    "lm-studio": {
+      "baseUrl": "http://localhost:1234/v1",
+      "api": "openai-completions",
+      "apiKey": "lmstudio",
+
+      "models": [
+        {
+          "id": "REPLACE_WITH_YOUR_MODEL_ID",
+          "name": "REPLACE — LM Studio loaded model (untested)",
+          "reasoning": false,
+          "input": ["text"],
+          "contextWindow": 32768,
+          "maxTokens": 8192,
+
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          },
+
+          "compat": {
+            "supportsDeveloperRole": false,
+            "supportsReasoningEffort": false,
+            "maxTokensField": "max_tokens"
+          }
+        }
+      ]
+    }
+  }
+}
