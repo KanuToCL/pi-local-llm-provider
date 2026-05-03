@@ -70,8 +70,10 @@ describe("AUDIT-C #9: AbortController.signal flows from TaskState into pi-mono",
 
     // Capture the prompt options on each call.
     const capturedOptions: unknown[] = [];
-    let promptResolve: (() => void) | null = null;
-    const promptPromise = new Promise<void>((r) => (promptResolve = r));
+    let promptResolve: (() => void) = () => undefined;
+    const promptPromise = new Promise<void>((r) => {
+      promptResolve = r;
+    });
 
     const fakeSession = {
       subscribe: () => () => undefined,
@@ -126,7 +128,7 @@ describe("AUDIT-C #9: AbortController.signal flows from TaskState into pi-mono",
     expect(opts.signal!.aborted).toBe(true);
 
     // Release the prompt so the inbound handler can finish cleanly.
-    promptResolve?.();
+    promptResolve();
     await inboundPromise;
     await sm.dispose();
   });
