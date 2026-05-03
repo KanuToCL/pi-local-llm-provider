@@ -107,6 +107,11 @@ export const AuditEventType = z.enum([
   "sandbox_force_engaged_on_boot",
   // Prompt versioning
   "prompt_version_changed",
+  // Lock / panic gate (RS-2)
+  "lock_engaged_reject",
+  // IPC lifecycle (separate from daemon-wide events)
+  "ipc_attach",
+  "ipc_detach",
 ]);
 
 export type AuditEventType = z.infer<typeof AuditEventType>;

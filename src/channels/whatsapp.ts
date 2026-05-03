@@ -144,6 +144,13 @@ export interface WhatsappChannelOpts {
    * uniformly distributed on [0.8, 1.2]).
    */
   jitterFn?: () => number;
+  /**
+   * Optional callback invoked on every inbound `messages.upsert` event —
+   * used by the daemon's Heartbeat to record a `baileys-poll` liveness
+   * touch.  Fires regardless of whether the messages survive the
+   * DM-only / allowlist filters (the WS read itself succeeded).
+   */
+  onPoll?: () => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -356,6 +363,7 @@ export class WhatsappChannel implements Sink {
   private readonly setTimeoutFn: typeof setTimeout;
   private readonly clearTimeoutFn: typeof clearTimeout;
   private readonly jitterFn: () => number;
+  private readonly onPoll: (() => void) | undefined;
 
   private sock: WhatsappSocket | null = null;
   private connected = false;
@@ -399,6 +407,7 @@ export class WhatsappChannel implements Sink {
     this.setTimeoutFn = opts.setTimeoutFn ?? setTimeout;
     this.clearTimeoutFn = opts.clearTimeoutFn ?? clearTimeout;
     this.jitterFn = opts.jitterFn ?? defaultJitter;
+    this.onPoll = opts.onPoll;
   }
 
   // -------------------------------------------------------------------------
@@ -781,6 +790,15 @@ export class WhatsappChannel implements Sink {
   // -------------------------------------------------------------------------
 
   private async onMessagesUpsert(event: unknown): Promise<void> {
+    // Heartbeat-touch on EVERY upsert event — the WS read succeeded so the
+    // baileys-poll source is fresh, regardless of whether the messages
+    // survive the DM-only / allowlist filters below.
+    try {
+      this.onPoll?.();
+    } catch {
+      /* heartbeat is best-effort; never break the upsert handler */
+    }
+
     if (!event || typeof event !== "object") return;
     const e = event as { messages?: unknown; type?: string };
     if (!Array.isArray(e.messages)) return;

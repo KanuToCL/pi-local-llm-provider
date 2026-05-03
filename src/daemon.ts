@@ -33,8 +33,7 @@
  *     all encapsulated by their respective W1+W2+W3 modules.
  */
 
-import { mkdir, chmod, writeFile, readFile, utimes } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { mkdir, chmod, writeFile, readFile } from "node:fs/promises";
 import { homedir, platform } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
@@ -68,6 +67,11 @@ import {
 } from "./ipc/server.js";
 import { ensureTokenFile } from "./ipc/protocol.js";
 import { TelegramChannel, TelegramAuthError } from "./channels/telegram.js";
+import {
+  WhatsappChannel,
+  BaileysNotInstalledError,
+} from "./channels/whatsapp.js";
+import { Heartbeat, type HeartbeatSource } from "./lib/heartbeat.js";
 import type {
   ChannelEvent,
   ChannelId,
@@ -93,9 +97,18 @@ import {
  *  smoke test boot the daemon hermetically without external services). */
 const TEST_SKIP_STUDIO_PREFIX = "__test_skip_studio__";
 
-/** How often the heartbeat file mtime gets touched (ms). PE Skeptic R2 #2:
- *  v1 stub; IMPL-19 swaps for "touched only after a successful poll + ping". */
-const HEARTBEAT_INTERVAL_MS = 30_000;
+/** How often the periodic drivers fire (ms): pendingConfirms.expire and
+ *  sandboxPolicy.tickExpiration both ride the same interval to keep wake-ups
+ *  cheap.  60s is generous: confirm TTLs are 30 minutes by default and
+ *  sandbox windows are 1-120 minutes; sub-minute precision is unnecessary. */
+const PERIODIC_TICK_INTERVAL_MS = 60_000;
+
+/** How often heartbeat snapshots are read for state-transition emission.
+ *  Per plan §"Heartbeat liveness from message-loop", touchAlive() fires
+ *  on every successful channel poll / pi-ping; this interval just runs
+ *  `getState()` so a stale source still emits `pi_stuck_suspected`
+ *  even if no fresh polls arrive.  30s is a good balance. */
+const HEARTBEAT_OBSERVE_INTERVAL_MS = 30_000;
 
 /** Wait up to 5 minutes for the model to load before giving up at boot. */
 const STUDIO_MODEL_WAIT_MS = 5 * 60 * 1000;
@@ -163,6 +176,25 @@ export async function start(opts: DaemonOpts = {}): Promise<RunningDaemon> {
   // 1. Load config (lifts env via dotenv side-effect on import).
   const config = opts.config ?? loadConfig();
 
+  // 1b. AUDIT-D #4: Windows-without-explicit-opt-in gate.  The Windows
+  //     sandbox (Job Objects) is not implemented in v1; running unsandboxed
+  //     on Windows is a security regression that must be acknowledged
+  //     explicitly.  Test mode bypasses this gate so the integration
+  //     smoke can run on any host.
+  const testMode = config.piCommsDefaultModel.startsWith(TEST_SKIP_STUDIO_PREFIX);
+  if (
+    !testMode &&
+    platform() === "win32" &&
+    process.env.PI_COMMS_ALLOW_UNSANDBOXED_WINDOWS !== "true"
+  ) {
+    throw new DaemonBootError(
+      "pi-comms refuses to start on Windows without explicit opt-in. " +
+        "v1 lacks a Windows-native sandbox (Job Objects); the bash tool " +
+        "would run unsandboxed.  Set PI_COMMS_ALLOW_UNSANDBOXED_WINDOWS=true " +
+        "to acknowledge this risk.  See docs/INSTALL.md for details."
+    );
+  }
+
   // 2. Materialize ~/.pi-comms tree (mode 0700) so audit/store/socket calls
   //    don't race the parent dir into existence.
   const home = config.piCommsHome;
@@ -193,9 +225,14 @@ export async function start(opts: DaemonOpts = {}): Promise<RunningDaemon> {
       style: config.operatorLogStyle,
       includeContent: config.operatorLogContent,
       previewChars: config.operatorLogPreviewChars,
+      // AUDIT-A #18: tee operator-log lines to ~/.pi-comms/operator.log
+      // with daily rotation so post-incident review has more than the
+      // 60-second console scrollback to work with.  Tests opt-out by
+      // injecting their own logger via opts.operatorLogger.
+      filePath: join(home, "operator.log"),
     });
 
-  const testMode = config.piCommsDefaultModel.startsWith(TEST_SKIP_STUDIO_PREFIX);
+  // (testMode evaluated at boot-gate; see step 1b.)
 
   operatorLogger.banner({
     bot: config.telegramBotToken ? "telegram" : "(disabled)",
@@ -278,11 +315,38 @@ export async function start(opts: DaemonOpts = {}): Promise<RunningDaemon> {
     operatorLogger,
   });
 
-  // 12. SessionManager: shared AgentSession + custom tools. The sinks include
+  // 12. Heartbeat: required sources derived from configured channels.
+  //     `pi-ping` is always required; `telegram-poll` if telegramBotToken
+  //     set; `baileys-poll` if config.whatsapp set.  In test mode we still
+  //     construct the heartbeat (it's needed by `/alive`) but only require
+  //     pi-ping (which the SDK isn't actually started, so we touch it
+  //     manually below to keep the gauge healthy for tests).
+  const heartbeatPath = join(home, "daemon.heartbeat");
+  const requiredHeartbeatSources: HeartbeatSource[] = ["pi-ping"];
+  if (!testMode && config.telegramBotToken) {
+    requiredHeartbeatSources.push("telegram-poll");
+  }
+  if (!testMode && config.whatsapp) {
+    requiredHeartbeatSources.push("baileys-poll");
+  }
+  const heartbeat = new Heartbeat({
+    heartbeatPath,
+    healthyMaxAgeMs: 90_000,
+    degradedMaxAgeMs: 180_000,
+    requiredSources: requiredHeartbeatSources,
+    auditLog,
+    operatorLogger,
+  });
+
+  // lockState materialized early so SessionManager observers can plumb
+  // lastTellAt updates through the same shared object.
+  const lockState = { locked: false, lastTellAt: null as number | null };
+
+  // 13. SessionManager: shared AgentSession + custom tools. The sinks include
   //     the IPC server (terminal-style fan-out) plus telegram (set up below);
   //     the manager holds a reference to `sinks` and re-fan-outs as events
-  //     arrive. We pre-create the bag here and mutate it after telegram
-  //     init succeeds — Sink fan-out tolerates a missing key.
+  //     arrive. We pre-create the bag here and mutate it after telegram /
+  //     whatsapp init succeeds — Sink fan-out tolerates a missing key.
   const sessionSinks: { terminal: Sink; whatsapp?: Sink; telegram?: Sink } = {
     terminal: ipcServer,
   };
@@ -295,6 +359,14 @@ export async function start(opts: DaemonOpts = {}): Promise<RunningDaemon> {
     auditLog,
     operatorLogger,
     sinks: sessionSinks,
+    onPiActivity: () => {
+      // pi-ping heartbeat.  Best-effort — never let a touchAlive failure
+      // crash the agent stream.
+      void heartbeat.touchAlive({ source: "pi-ping" }).catch(() => undefined);
+    },
+    onTellEmit: (ts) => {
+      lockState.lastTellAt = ts;
+    },
   });
 
   if (!testMode) {
@@ -304,11 +376,15 @@ export async function start(opts: DaemonOpts = {}): Promise<RunningDaemon> {
       test_mode: true,
       reason: "PI_COMMS_DEFAULT_MODEL starts with __test_skip_studio__; skipping SDK init",
     });
+    // In test mode, prime the pi-ping source so /status doesn't pin at
+    // 'dead' for the integration smoke.  This mirrors what the first SDK
+    // event would do in production.
+    void heartbeat.touchAlive({ source: "pi-ping" }).catch(() => undefined);
   }
 
-  // 13. Telegram channel — only when a bot token is configured. Bare-config
-  //     daemons run terminal-only.
+  // 14. Telegram + WhatsApp channels.  Bare-config daemons run terminal-only.
   let telegramChannel: TelegramChannel | null = null;
+  let whatsappChannel: WhatsappChannel | null = null;
   const inboundProcessor: InboundProcessor = {
     async processInbound(msg: ChannelInboundMessage): Promise<void> {
       await handleChannelInbound(msg, {
@@ -319,6 +395,8 @@ export async function start(opts: DaemonOpts = {}): Promise<RunningDaemon> {
         operatorLogger,
         telegramChannel: () => telegramChannel,
         installSalt,
+        lockState,
+        auditLog,
       });
     },
   };
@@ -331,6 +409,11 @@ export async function start(opts: DaemonOpts = {}): Promise<RunningDaemon> {
         inboundProcessor,
         auditLog,
         operatorLogger,
+        onPoll: () => {
+          void heartbeat
+            .touchAlive({ source: "telegram-poll" })
+            .catch(() => undefined);
+        },
       });
       await telegramChannel.start();
       sessionSinks.telegram = telegramChannel;
@@ -348,6 +431,15 @@ export async function start(opts: DaemonOpts = {}): Promise<RunningDaemon> {
           reason: "auth_failure_continuing_terminal_only",
         });
       }
+      void auditLog
+        .append({
+          event: "telegram_disconnect",
+          task_id: null,
+          channel: "telegram",
+          sender_id_hash: null,
+          extra: { reason: "boot_start_failed", error: message.slice(0, 200) },
+        })
+        .catch(() => undefined);
     }
   } else if (!config.telegramBotToken) {
     operatorLogger.info("telegram_disconnect", {
@@ -355,10 +447,51 @@ export async function start(opts: DaemonOpts = {}): Promise<RunningDaemon> {
     });
   }
 
-  // 14. Slash-command router. Wires deps for /unsand, /lock, /alive, etc.
-  const lockState = { locked: false, lastTellAt: null as number | null };
+  if (!testMode && config.whatsapp) {
+    try {
+      const wa = config.whatsapp;
+      whatsappChannel = new WhatsappChannel({
+        identityModel: wa.identityModel,
+        ownerJid: wa.ownerJid,
+        botJid: wa.botJid,
+        authStateDir: join(home, "wa-auth"),
+        inboundProcessor,
+        auditLog,
+        operatorLogger,
+        onPoll: () => {
+          void heartbeat
+            .touchAlive({ source: "baileys-poll" })
+            .catch(() => undefined);
+        },
+      });
+      await whatsappChannel.start();
+      sessionSinks.whatsapp = whatsappChannel;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      operatorLogger.error("whatsapp_disconnect", {
+        reason: "boot_start_failed",
+        error: message,
+      });
+      void auditLog
+        .append({
+          event: "whatsapp_disconnect",
+          task_id: null,
+          channel: "whatsapp",
+          sender_id_hash: null,
+          extra: { reason: "boot_start_failed", error: message.slice(0, 200) },
+        })
+        .catch(() => undefined);
+      if (err instanceof BaileysNotInstalledError) {
+        operatorLogger.error("whatsapp_disconnect", {
+          reason: "baileys_not_installed_continuing_without_whatsapp",
+        });
+      }
+      whatsappChannel = null;
+    }
+  }
+
+  // 15. Slash-command router. Wires deps for /unsand, /lock, /alive, etc.
   let shutdownInFlight: Promise<void> | null = null;
-  const heartbeatPath = join(home, "daemon.heartbeat");
   const slashRouter = new SlashCommandRouter({
     taskState,
     pendingConfirms,
@@ -376,8 +509,11 @@ export async function start(opts: DaemonOpts = {}): Promise<RunningDaemon> {
     },
     onAlive: () => {
       // RS-1 dead-man heartbeat bump. Touch the file mtime so the dead-man
-      // switch (Phase 4.0 / IMPL-19) sees the user is alive.
-      void touchHeartbeat(heartbeatPath).catch(() => undefined);
+      // switch (Phase 4.0 / IMPL-19) sees the user is alive.  Using
+      // touchAlive on the pi-ping source is a pragmatic shortcut — the
+      // user told us they're alive, which logically implies the comms
+      // path between user and daemon is fine.
+      void heartbeat.touchAlive({ source: "pi-ping" }).catch(() => undefined);
     },
     onCancelTask: async () => {
       const cur = taskState.get();
@@ -389,13 +525,26 @@ export async function start(opts: DaemonOpts = {}): Promise<RunningDaemon> {
       } catch {
         /* abort signals are best-effort */
       }
+      const cancelledAt = Date.now();
       taskState.tryTransition({
         kind: "cancelled",
         taskId: cur.taskId,
         startedAt: cur.startedAt,
-        cancelledAt: Date.now(),
+        cancelledAt,
         reason: "user",
       });
+      // Audit task_cancelled with duration_ms so post-incident review can
+      // correlate cancel latency with downstream events.
+      void auditLog
+        .append({
+          event: "task_cancelled",
+          task_id: cur.taskId,
+          channel: cur.channel,
+          sender_id_hash: null,
+          duration_ms: Math.max(0, cancelledAt - cur.startedAt),
+          extra: { reason: "user" },
+        })
+        .catch(() => undefined);
       return { cancelled: true, taskId: cur.taskId };
     },
     onResetSession: async () => {
@@ -438,19 +587,82 @@ export async function start(opts: DaemonOpts = {}): Promise<RunningDaemon> {
     lockState,
   });
 
-  // 16. Bind the socket. After this, attached clients can connect.
+  // 17. Bind the socket. After this, attached clients can connect.
   await ipcServer.start();
 
-  // 17. Heartbeat stub — touch the file every 30s. PE Skeptic R2 #2:
-  //     this is a TODO; IMPL-19 will make it conditional on (channel-poll-ok
-  //     AND pi-mono-ping-ok). For v1 we just keep the file alive so the
-  //     dead-man switch wiring + tests can be exercised end-to-end.
-  await touchHeartbeat(heartbeatPath).catch(() => undefined);
-  const heartbeatTimer = setInterval(() => {
-    // TODO(IMPL-19): replace with conditional-on-poll-ok touch (Phase 4.0).
-    void touchHeartbeat(heartbeatPath).catch(() => undefined);
-  }, HEARTBEAT_INTERVAL_MS);
-  heartbeatTimer.unref?.();
+  // 18. Periodic drivers.  Three independent timers:
+  //
+  //     a) Heartbeat observation — runs `getState()` so a stale source
+  //        still emits `pi_stuck_suspected` even when no fresh polls
+  //        arrive.  touchAlive() handles the touched-file write itself.
+  //     b) Periodic tick — calls `pendingConfirms.expire(now)` (AUDIT-C
+  //        #6) and `sandboxPolicy.tickExpiration(now)` (AUDIT-B #14).
+  //        Both are cheap when nothing is open; combined to share the
+  //        same wake-up.
+  const heartbeatObserveTimer = setInterval(() => {
+    void heartbeat.getState().catch(() => undefined);
+  }, HEARTBEAT_OBSERVE_INTERVAL_MS);
+  heartbeatObserveTimer.unref?.();
+
+  const periodicTickTimer = setInterval(() => {
+    const now = Date.now();
+    // AUDIT-C #6: expire pending confirms; emit confirm_timed_out per entry.
+    try {
+      const expired = pendingConfirms.expire(now);
+      for (const e of expired) {
+        void auditLog
+          .append({
+            event: "confirm_timed_out",
+            task_id: e.taskId,
+            channel: e.channel,
+            sender_id_hash: null,
+            extra: { short_id: e.shortId },
+          })
+          .catch(() => undefined);
+      }
+    } catch (err) {
+      operatorLogger.error("chat_error", {
+        context: "pending_confirms_expire",
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+    // AUDIT-B #14: re-engage sandbox if a window-scoped grant has expired.
+    // The policy itself emits the `unsand_disabled` audit row; we just
+    // surface a `system_notice` to the originating channel so Sergio
+    // sees "sandbox re-engaged" without needing to refresh /status.
+    try {
+      const result = sandboxPolicy.tickExpiration(now);
+      if (result.stateChanged && result.newState.kind === "engaged") {
+        // We don't track the originating channel on the policy itself —
+        // broadcast to all configured sinks.  The channel layer will
+        // silently drop on transports that have no active session.
+        const event: ChannelEvent = {
+          type: "system_notice",
+          text: "pi: sandbox re-engaged (window expired).",
+          level: "info",
+          ts: now,
+        };
+        const broadcast = async () => {
+          for (const sink of [
+            sessionSinks.terminal,
+            sessionSinks.telegram,
+            sessionSinks.whatsapp,
+          ]) {
+            if (sink) {
+              await sink.send(event).catch(() => undefined);
+            }
+          }
+        };
+        void broadcast();
+      }
+    } catch (err) {
+      operatorLogger.error("chat_error", {
+        context: "sandbox_tick_expiration",
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }, PERIODIC_TICK_INTERVAL_MS);
+  periodicTickTimer.unref?.();
 
   // 18. Signal handlers.
   const handle: RunningDaemon = {
@@ -463,7 +675,8 @@ export async function start(opts: DaemonOpts = {}): Promise<RunningDaemon> {
       }
       shutdownInFlight = (async () => {
         operatorLogger.info("daemon_shutdown", { reason });
-        clearInterval(heartbeatTimer);
+        clearInterval(heartbeatObserveTimer);
+        clearInterval(periodicTickTimer);
 
         // Cancel any in-flight task gracefully.
         const cur = taskState.get();
@@ -492,6 +705,15 @@ export async function start(opts: DaemonOpts = {}): Promise<RunningDaemon> {
           } catch (err) {
             errors.push(
               `telegram_stop:${err instanceof Error ? err.message : String(err)}`
+            );
+          }
+        }
+        if (whatsappChannel) {
+          try {
+            await whatsappChannel.stop();
+          } catch (err) {
+            errors.push(
+              `whatsapp_stop:${err instanceof Error ? err.message : String(err)}`
             );
           }
         }
@@ -545,6 +767,8 @@ interface InboundContext {
   telegramChannel: () => TelegramChannel | null;
   operatorLogger: OperatorLogger;
   installSalt: string;
+  lockState: { locked: boolean; lastTellAt: number | null };
+  auditLog: AuditLog;
 }
 
 /**
@@ -559,6 +783,44 @@ async function handleChannelInbound(
 ): Promise<void> {
   const text = msg.payload.text ?? "";
   const senderHash = AuditLog.senderIdHash(msg.sender.id, ctx.installSalt);
+
+  // AUDIT-D #3: lockState gate.  When `/lock` has been engaged, refuse
+  // every non-`/unlock` slash command AND every non-slash inbound.  The
+  // dispatcher itself enforces "unlock is terminal-only" so a phone-side
+  // `/unlock` will never bypass this gate even if the gate weren't here.
+  if (ctx.lockState.locked) {
+    const trimmed = text.trimStart().toLowerCase();
+    const isUnlock =
+      trimmed.startsWith("/unlock") &&
+      (trimmed.length === "/unlock".length ||
+        /[\s@]/.test(trimmed[7] ?? ""));
+    if (!isUnlock) {
+      // Surface a system_notice to the originating channel so the user
+      // understands why their input was dropped.
+      const sink = sinkFor(msg.channel, ctx.sinks);
+      if (sink) {
+        const event: ChannelEvent = {
+          type: "system_notice",
+          text: "pi: locked. /unlock from terminal to resume.",
+          level: "warn",
+          ts: Date.now(),
+        };
+        await sink.send(event).catch(() => undefined);
+      }
+      void ctx.auditLog
+        .append({
+          event: "lock_engaged_reject",
+          task_id: null,
+          channel: msg.channel,
+          sender_id_hash: senderHash,
+          extra: {
+            input_starts_with_slash: text.trimStart().startsWith("/"),
+          },
+        })
+        .catch(() => undefined);
+      return;
+    }
+  }
 
   // Slash routing: only line-leading `/`. The router itself checks the same;
   // we delegate the parse and act on the result.
@@ -662,6 +924,40 @@ function makeProductionHandlers(deps: ProductionHandlersDeps): IpcServerHandlers
       // The IPC server already gates by attach-token; this is the real entry
       // for terminal-originated inbound. Tee through the slash router first.
       const senderHash = `ipc-${attached.id}`;
+
+      // AUDIT-D #3: lockState gate (terminal entry path).  Same semantics
+      // as handleChannelInbound: refuse every non-`/unlock` input.  The
+      // terminal IS the only place /unlock works, so this is the surface
+      // where the operator unsticks the daemon.
+      if (deps.lockState.locked) {
+        const trimmed = text.trimStart().toLowerCase();
+        const isUnlock =
+          trimmed.startsWith("/unlock") &&
+          (trimmed.length === "/unlock".length ||
+            /[\s@]/.test(trimmed[7] ?? ""));
+        if (!isUnlock) {
+          const event: ChannelEvent = {
+            type: "system_notice",
+            text: "pi: locked. /unlock from terminal to resume.",
+            level: "warn",
+            ts: Date.now(),
+          };
+          await deps.ipcServer.send(event).catch(() => undefined);
+          void deps.auditLog
+            .append({
+              event: "lock_engaged_reject",
+              task_id: null,
+              channel: "terminal",
+              sender_id_hash: senderHash,
+              extra: {
+                input_starts_with_slash: text.trimStart().startsWith("/"),
+              },
+            })
+            .catch(() => undefined);
+          return;
+        }
+      }
+
       const slashCtx: SlashCommandContext = {
         raw: text,
         senderChannel: "terminal",
@@ -921,19 +1217,8 @@ function sleep(ms: number): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Heartbeat + signals
+// Signals
 // ---------------------------------------------------------------------------
-
-async function touchHeartbeat(path: string): Promise<void> {
-  if (!existsSync(path)) {
-    await writeFile(path, "", { mode: 0o600 }).catch(() => undefined);
-  }
-  const now = new Date();
-  await utimes(path, now, now).catch(async () => {
-    // Some filesystems require an existing fd; fall back to a write.
-    await writeFile(path, "", { mode: 0o600 }).catch(() => undefined);
-  });
-}
 
 function installSignalHandlers(
   handle: RunningDaemon,

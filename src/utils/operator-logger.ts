@@ -5,6 +5,15 @@
 // `includeContent: false` is the default — keep operator output screen-recording
 // safe. Set `OPERATOR_LOG_CONTENT=true` only on machines where full prompt and
 // response text is safe to display.
+//
+// AUDIT-A #18: when `filePath` is set the logger ALSO appends each line to
+// disk, with daily rotation (`<filePath>.YYYY-MM-DD`).  This mirrors gemini-
+// claw's pattern (one file per UTC day, suffix appended to the base path).
+// Console output continues unchanged so operators tailing stdout still see
+// the live stream.
+
+import { appendFileSync, mkdirSync } from "node:fs";
+import { dirname } from "node:path";
 
 export type OperatorLogLevel = "silent" | "info" | "debug";
 export type OperatorLogStyle = "pretty" | "plain" | "json";
@@ -14,7 +23,21 @@ export interface OperatorLoggerOptions {
   style: OperatorLogStyle;
   includeContent: boolean;
   previewChars: number;
+  /**
+   * Console writer.  Defaults to `console.log`.  Tests inject a buffer.
+   * When `filePath` is set, lines are tee'd to the file regardless of
+   * whether `write` was overridden.
+   */
   write?: (line: string) => void;
+  /**
+   * Optional base file path for daily-rotated persistence.  When set,
+   * every line is also appended to `<filePath>.YYYY-MM-DD` (mode 0600
+   * on POSIX; Windows ACLs apply).  The parent directory is created if
+   * absent.  File-write failures are silently dropped — the audit log
+   * remains the source of truth for forensic events; this file is for
+   * human-friendly tailing only.
+   */
+  filePath?: string;
 }
 
 export interface OperatorLogger {
@@ -97,10 +120,45 @@ const icons: Record<string, string> = {
   unsand_enabled: "🔓",
   unsand_disabled: "🔒",
   sandbox_force_engaged_on_boot: "🔒",
+
+  // additional event-vocabulary alignments (audit schema parity)
+  confirm_rejected: "⛔",
+  prompt_version_changed: "📝",
+  serial_queue_blocked: "⏸️",
+  task_abandoned_on_restart: "🔁",
+  lock_engaged_reject: "🛡️",
+  ipc_attach: "🔌",
+  ipc_detach: "🔌",
 };
 
 export function createOperatorLogger(options: OperatorLoggerOptions): OperatorLogger {
-  const write = options.write ?? ((line: string) => console.log(line));
+  const consoleWrite = options.write ?? ((line: string) => console.log(line));
+  // AUDIT-A #18: if filePath set, ensure parent dir exists once at
+  // construction.  We use sync mkdir/append because the operator logger
+  // is on every event path and async fs would burn an extra microtask
+  // per call; failures are swallowed because this file is convenience,
+  // not the audit log.
+  if (options.filePath) {
+    try {
+      mkdirSync(dirname(options.filePath), { recursive: true, mode: 0o700 });
+    } catch {
+      /* best-effort */
+    }
+  }
+  const teeFile = (line: string) => {
+    if (!options.filePath) return;
+    const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+    const target = `${options.filePath}.${today}`;
+    try {
+      appendFileSync(target, line + "\n", { mode: 0o600 });
+    } catch {
+      /* best-effort — operator log is convenience, not source-of-truth */
+    }
+  };
+  const write = (line: string) => {
+    consoleWrite(line);
+    teeFile(line);
+  };
 
   const logger: OperatorLogger = {
     includeContent: options.includeContent,

@@ -89,6 +89,14 @@ export interface TelegramChannelOpts {
    * `new Bot(opts.botToken)`.
    */
   botFactory?: (token: string) => Bot;
+  /**
+   * Optional callback invoked from the bot's first middleware on every
+   * inbound update — used by the daemon's Heartbeat to record a
+   * `telegram-poll` liveness touch.  Fires even when the inbound update is
+   * about to be silent-rejected (DM-only / allowlist), because the poll
+   * itself succeeded.
+   */
+  onPoll?: () => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -140,6 +148,7 @@ export class TelegramChannel implements Sink {
   private readonly typingIntervalMs: number;
   private readonly auditLog?: AuditLog;
   private readonly operatorLogger?: OperatorLogger;
+  private readonly onPoll: (() => void) | undefined;
 
   /**
    * The chat id the most-recent inbound message came from.  Outbound
@@ -170,6 +179,7 @@ export class TelegramChannel implements Sink {
     this.typingIntervalMs = opts.typingIntervalMs ?? DEFAULT_TYPING_INTERVAL_MS;
     this.auditLog = opts.auditLog;
     this.operatorLogger = opts.operatorLogger;
+    this.onPoll = opts.onPoll;
 
     this.installMiddleware();
     this.installHandlers();
@@ -329,6 +339,19 @@ export class TelegramChannel implements Sink {
    * always records the rejection reason.
    */
   private installMiddleware(): void {
+    // First middleware: heartbeat-touch on EVERY inbound update.  Per
+    // Heartbeat invariant, this fires regardless of whether the update is
+    // ultimately admitted (DM-only / allowlist filters happen later).  The
+    // poll itself succeeded so the long-poll liveness is real.
+    this.bot.use(async (_ctx, next) => {
+      try {
+        this.onPoll?.();
+      } catch {
+        /* heartbeat is best-effort; never break the bot loop */
+      }
+      await next();
+    });
+
     this.bot.use(async (ctx, next) => {
       const chatType = ctx.chat?.type;
       const senderId = ctx.from?.id;
