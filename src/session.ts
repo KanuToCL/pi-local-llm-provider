@@ -76,6 +76,7 @@ import {
 } from "./tools/confirm.js";
 import { defineGoBackgroundTool } from "./tools/go-background.js";
 import { PendingConfirmsRegistry } from "./tools/pending-confirms.js";
+import { redactCredentialShapes } from "./lib/sanitize.js";
 
 // ---------------------------------------------------------------------------
 // Public — inbound message + sink bag
@@ -120,6 +121,21 @@ export interface SessionManagerOpts {
   globalQueue?: GlobalQueue;
   /** Path to the SHA-pinned base prompt. Defaults to `prompts/coding-agent.v1.txt`. */
   basePromptPath?: string;
+  /**
+   * Optional callback fired whenever pi-mono shows life — at message_start /
+   * message_end / tool_execution_start events.  The daemon (IMPL-19) wires
+   * this into the Heartbeat as the `pi-ping` source so a deadlocked
+   * daemon's Node event loop cannot fool the dead-man switch.  Best-effort;
+   * failures in the callback are swallowed so a heartbeat hiccup never
+   * breaks the agent stream.
+   */
+  onPiActivity?: () => void;
+  /**
+   * Optional callback fired by the tell-tool every time it successfully
+   * fans out to at least one sink.  The daemon uses this to refresh the
+   * `lockState.lastTellAt` field surfaced by `/status`.
+   */
+  onTellEmit?: (ts: number) => void;
   /** Optional path to the status pointer file (composed into system prompt). */
   pointerPath?: string;
   /** Pointer body cap in graphemes. Defaults to 2000 per Data Guardian. */
@@ -250,6 +266,20 @@ export class SessionManager {
       customTools,
     });
     this.session = result.session;
+
+    // AUDIT-C #8: pi-mono customTools[name='bash'] override assumption.
+    // The plan assumes `customTools` with a tool named `bash` REPLACES
+    // pi-mono's default bash entirely.  This cannot be verified without
+    // an installed pi-mono on a Windows production box (the spike rig
+    // covers Probe 5 — `tool_call_interception`).  Until that integration
+    // test exists, surface a one-line WARN at boot so post-incident
+    // review sees the assumption in context.
+    this.opts.operatorLogger?.error("classifier_block", {
+      reason:
+        "ASSUMPTION: pi-mono customTools[name='bash'] overrides default; " +
+        "verify by spike on Windows production box (scripts/sdk-spike.ts probe 5).",
+    });
+
     this.subscribeToEvents();
   }
 
@@ -357,11 +387,25 @@ export class SessionManager {
       this.scheduleAutoPromote(taskId);
 
       try {
-        // Hand the message to pi-mono. Errors are caught and logged but do
-        // NOT bubble out — the daemon would otherwise crash on a single
-        // bad turn. The TaskState machine drives recovery instead.
+        // Hand the message to pi-mono.  We pass the running TaskState's
+        // AbortController.signal so /cancel can actually stop the GPU —
+        // pi-mono ≥0.72 honors `options.signal` to cancel the inference
+        // loop and tool execution.  Without this, the SDK's own
+        // AbortController is internal and unreachable from /cancel.
+        // Errors are caught and logged but do NOT bubble out — the daemon
+        // would otherwise crash on a single bad turn.  The TaskState
+        // machine drives recovery instead.
         if (this.session) {
-          await this.session.prompt(msg.text);
+          // Re-read the current TaskState — by this point we have just
+          // CAS'd to running so the abort controller is the one we just
+          // installed; this also defends against tests that manipulate
+          // state out-of-band.
+          const live = this.opts.taskState.get();
+          const signal =
+            (live.kind === "running" || live.kind === "backgrounded")
+              ? live.abort.signal
+              : undefined;
+          await this.session.prompt(msg.text, { signal });
         }
       } catch (err) {
         const error = err instanceof Error ? err.message : String(err);
@@ -371,16 +415,37 @@ export class SessionManager {
         });
         const cur = this.opts.taskState.get();
         if (cur.kind === "running" || cur.kind === "backgrounded") {
+          const finishedAt = this.now();
           this.opts.taskState.tryTransition({
             kind: "failed",
             taskId,
             startedAt,
-            finishedAt: this.now(),
+            finishedAt,
             error,
           });
+          // Audit the failure with duration_ms so post-incident review can
+          // correlate task latency with the failure surface.
+          void this.opts.auditLog
+            .append({
+              event: "task_failed",
+              task_id: taskId,
+              channel: msg.channel,
+              sender_id_hash: null,
+              duration_ms: Math.max(0, finishedAt - startedAt),
+              error_class: error.slice(0, 200),
+            })
+            .catch(() => undefined);
         }
       } finally {
         this.clearAutoPromote();
+        // SandboxPolicy lifecycle: if a `next-task` un-sand grant was open,
+        // re-engage now (per plan §"v4.1 /unsand escape hatch" line 1387).
+        // Window-scoped grants outlive task boundaries by design.
+        try {
+          this.opts.sandboxPolicy.onTaskCompleted();
+        } catch {
+          /* sandbox bookkeeping is best-effort */
+        }
       }
     });
   }
@@ -443,7 +508,12 @@ export class SessionManager {
         task_id: taskId,
         channel: state.channel,
         sender_id_hash: null,
-        extra: { promoted_by: "auto" },
+        extra: {
+          promoted_by: "auto",
+          // task_age_ms is exposed as scalar `extra` (not the top-level
+          // duration_ms field, which is reserved for terminal-state spans).
+          task_age_ms: Math.max(0, promotedAt - state.startedAt),
+        },
       })
       .catch(() => undefined);
     this.opts.operatorLogger?.info("auto_promote_fired", {
@@ -485,13 +555,32 @@ export class SessionManager {
     this.unsubscribe = this.session.subscribe((rawEvent) => {
       // Operator log: every event kind is debug-logged so operators can see
       // the full firehose during diagnostic sessions.
+      const evt = rawEvent as Record<string, unknown> | null;
+      const kind =
+        evt && typeof evt === "object" && typeof evt.type === "string"
+          ? (evt.type as string)
+          : "<unknown>";
+
       if (this.opts.operatorLogger?.includeContent) {
-        const evt = rawEvent as Record<string, unknown> | null;
-        const kind =
-          evt && typeof evt === "object" && typeof evt.type === "string"
-            ? (evt.type as string)
-            : "<unknown>";
         this.opts.operatorLogger.debug("pi_event", { kind });
+      }
+
+      // Heartbeat-touch: pi-mono is alive if it just emitted any of the
+      // turn-driving events.  This is the `pi-ping` source for the dead-man
+      // switch (PE Skeptic R2 #2 + plan §"Heartbeat liveness from
+      // message-loop").  Best-effort — never let a heartbeat hiccup break
+      // the event stream.
+      if (
+        kind === "message_start" ||
+        kind === "message_end" ||
+        kind === "tool_execution_start" ||
+        kind === "agent_start"
+      ) {
+        try {
+          this.opts.onPiActivity?.();
+        } catch {
+          /* heartbeat is best-effort */
+        }
       }
 
       // Cross-cutting safety gate: post-abort silence.
@@ -541,24 +630,34 @@ export class SessionManager {
     if (state.kind !== "running" && state.kind !== "backgrounded") {
       return;
     }
+    const finishedAt = this.now();
     this.opts.taskState.tryTransition({
       kind: "completed",
       taskId: state.taskId,
       startedAt: state.startedAt,
-      finishedAt: this.now(),
+      finishedAt,
     });
     this.clearAutoPromote();
+    // Emit task_completed with duration_ms so post-incident review can
+    // correlate task latency with downstream events.
     void this.opts.auditLog
       .append({
         event: "task_completed",
         task_id: state.taskId,
         channel: state.channel,
         sender_id_hash: null,
+        duration_ms: Math.max(0, finishedAt - state.startedAt),
       })
       .catch(() => undefined);
     this.opts.operatorLogger?.info("task_completed", {
       task_id: state.taskId,
     });
+    // SandboxPolicy lifecycle hook: re-engage on next-task scope.
+    try {
+      this.opts.sandboxPolicy.onTaskCompleted();
+    } catch {
+      /* sandbox bookkeeping is best-effort */
+    }
   }
 
   // ---------------------------------------------------------------------
@@ -614,11 +713,17 @@ export class SessionManager {
           .list()
           .find((e) => e.shortId === id);
         const expiresAt = entry?.expiresAt ?? this.now() + 30 * 60 * 1000;
-        const resolutionPromise = promise.then((approved) => ({
-          // false ≡ no-or-timeout; we collapse to 'no' because the agent's
-          // safe default is "treat unanswered as declined" (plan default-deny).
-          decision: approved ? ("yes" as const) : ("no" as const),
-        }));
+        // AUDIT-C #10: distinguish timeout-via-expire() from user-no.  The
+        // registry tags expired ids in `recentlyTimedOut`; we read+consume
+        // the tag on the resolution side so the agent sees a real
+        // `decision: 'timeout'` instead of always collapsing to `'no'`.
+        const resolutionPromise = promise.then((approved) => {
+          if (approved) return { decision: "yes" as const };
+          if (realRegistry.consumeTimedOut(id)) {
+            return { decision: "timeout" as const };
+          }
+          return { decision: "no" as const };
+        });
         return { shortId: id, expiresAt, promise: resolutionPromise };
       },
     };
@@ -692,11 +797,20 @@ export class SessionManager {
     const tellDef = defineTellTool({
       sinks,
       cooldownMap: this.tellCooldownMap,
+      sanitizeOutbound: redactCredentialShapes,
+      onEmit: (ts) => {
+        try {
+          this.opts.onTellEmit?.(ts);
+        } catch {
+          /* observer is best-effort */
+        }
+      },
     });
     const confirmDef = defineConfirmTool({
       pendingConfirms: this.confirmRegistryAdapter,
       sinks,
       getCurrentTaskId: () => this.currentTaskId(),
+      sanitizeOutbound: redactCredentialShapes,
     });
     // IMPL-8's defineGoBackgroundTool declares its own structural-stub
     // TaskState type that mirrors task-state.ts's union shape. The two are
