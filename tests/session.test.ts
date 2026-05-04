@@ -116,9 +116,11 @@ function makeFakeSdkLoader(session: FakeSession) {
 
 let workDir: string;
 let activeTaskState: TaskStateManager | null = null;
+let activeAuditLog: AuditLog | null = null;
 beforeEach(() => {
   workDir = mkdtempSync(join(tmpdir(), "pi-comms-session-"));
   activeTaskState = null;
+  activeAuditLog = null;
 });
 afterEach(async () => {
   // Flush any in-flight TaskStateManager writes BEFORE we rm the tempdir,
@@ -131,7 +133,32 @@ afterEach(async () => {
       /* ignore */
     }
   }
-  rmSync(workDir, { recursive: true, force: true });
+  // Drain audit-log writeQueue too — IMPL-D added several fire-and-forget
+  // audit appends (watchdog, prompt_version_changed, studio_model_swap) that
+  // can land AFTER the test body finishes; rmSync racing them produces
+  // ENOTEMPTY on macOS.
+  if (activeAuditLog) {
+    try {
+      // The writeQueue is private; the cheapest drain is a no-op append +
+      // wait. Cap at a few attempts so a wedged queue doesn't hang afterEach.
+      for (let i = 0; i < 4; i++) {
+        await new Promise((r) => setImmediate(r));
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  // rmSync with force: true is supposed to ignore ENOENT but NOT ENOTEMPTY;
+  // retry briefly to absorb any final straggler write that lands during the
+  // initial rm sweep.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      rmSync(workDir, { recursive: true, force: true });
+      break;
+    } catch {
+      await new Promise((r) => setImmediate(r));
+    }
+  }
 });
 
 function makeBaseConfig(): AppConfig {
@@ -179,6 +206,11 @@ function makeHarness(): Harness {
   });
   activeTaskState = taskState;
 
+  const auditLog = new AuditLog({
+    dir: join(workDir, "audit"),
+    daemonStartTs: Date.now(),
+  });
+  activeAuditLog = auditLog;
   return {
     config: makeBaseConfig(),
     taskState,
@@ -186,10 +218,7 @@ function makeHarness(): Harness {
     sandboxPolicy: new SandboxPolicy({
       jsonStore: new JsonStore<SandboxState>(join(workDir, "sandbox.json")),
     }),
-    auditLog: new AuditLog({
-      dir: join(workDir, "audit"),
-      daemonStartTs: Date.now(),
-    }),
+    auditLog,
     sinks: {
       terminal: new CapturingSink(),
       whatsapp: new CapturingSink(),
@@ -1046,24 +1075,22 @@ describe("TaskState watchdog (plan v2 IMPL-D)", () => {
     }
 
     // Audit entry recorded with reason "watchdog_no_terminal_event".
-    await waitFor(
-      () =>
-        readAuditLines(join(workDir, "audit")).some((e) =>
-          (e.event === "task_failed" &&
-            typeof e.extra === "object" &&
-            e.extra !== null &&
-            (e.extra as Record<string, unknown>).reason ===
-              "watchdog_no_terminal_event"),
-        ),
-    );
-    const found = readAuditLines(join(workDir, "audit")).find(
-      (e) =>
-        e.event === "task_failed" &&
-        typeof e.extra === "object" &&
-        e.extra !== null &&
-        (e.extra as Record<string, unknown>).reason ===
-          "watchdog_no_terminal_event",
-    );
+    // Use a generous maxAttempts because the audit-log write is queued
+    // through a Promise chain + mkdir + appendFile, and under parallel
+    // test-suite load the syscall latency adds up.
+    let found: Record<string, unknown> | undefined;
+    await waitFor(() => {
+      const lines = readAuditLines(join(workDir, "audit"));
+      found = lines.find(
+        (e) =>
+          e.event === "task_failed" &&
+          typeof e.extra === "object" &&
+          e.extra !== null &&
+          (e.extra as Record<string, unknown>).reason ===
+            "watchdog_no_terminal_event",
+      );
+      return found !== undefined;
+    }, 1000);
     expect(found).toBeDefined();
 
     session.resolveCurrentPrompt!();
@@ -1191,14 +1218,12 @@ describe("serial_queue_blocked user notice (plan v2 IMPL-D)", () => {
     }
 
     // Audit entry recorded.
-    await waitFor(
-      () =>
-        readAuditLines(join(workDir, "audit")).some(
-          (e) => e.event === "serial_queue_blocked",
-        ),
-    );
-    const auditLines = readAuditLines(join(workDir, "audit"));
-    const blocked = auditLines.find((e) => e.event === "serial_queue_blocked");
+    let blocked: Record<string, unknown> | undefined;
+    await waitFor(() => {
+      const lines = readAuditLines(join(workDir, "audit"));
+      blocked = lines.find((e) => e.event === "serial_queue_blocked");
+      return blocked !== undefined;
+    }, 1000);
     expect(blocked).toBeDefined();
     expect(blocked!.channel).toBe("telegram");
 
@@ -1237,13 +1262,12 @@ describe("prompt_version_changed audit (plan v2 IMPL-D)", () => {
     });
     await mgr.init();
 
-    await waitFor(() =>
-      readAuditLines(join(workDir, "audit")).some(
-        (e) => e.event === "prompt_version_changed",
-      ),
-    );
-    const lines = readAuditLines(join(workDir, "audit"));
-    const entry = lines.find((e) => e.event === "prompt_version_changed");
+    let entry: Record<string, unknown> | undefined;
+    await waitFor(() => {
+      const lines = readAuditLines(join(workDir, "audit"));
+      entry = lines.find((e) => e.event === "prompt_version_changed");
+      return entry !== undefined;
+    }, 1000);
     expect(entry).toBeDefined();
     expect(entry!.task_id).toBeNull();
     expect(entry!.channel).toBe("system");
@@ -1252,6 +1276,569 @@ describe("prompt_version_changed audit (plan v2 IMPL-D)", () => {
     expect(typeof extra.sha256_first8).toBe("string");
     expect((extra.sha256_first8 as string).length).toBe(8);
 
+    await mgr.dispose();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Soft Studio model-swap detector (plan v2 IMPL-D Step D.7).
+// ---------------------------------------------------------------------------
+
+describe("checkForStudioModelSwap (plan v2 IMPL-D)", () => {
+  /**
+   * Helper: build a SessionManager wired with the soft-swap probe + fake
+   * `now()` so per-channel cooldown can be tested without real wall-clock
+   * waits.  Returns the manager + control surfaces.
+   */
+  async function buildSwapHarness(opts: {
+    h: Harness;
+    coldStartModelId: string | null;
+    probeReturns: ReadonlyArray<readonly string[] | null>;
+    probeError?: Error;
+  }): Promise<{
+    mgr: SessionManager;
+    session: FakeSession;
+    nowMs: { value: number };
+    probeCalls: number;
+  }> {
+    const session = makeFakeSession();
+    const nowMs = { value: 1_000_000 };
+    let probeCalls = 0;
+    const probe = vi.fn(async (): Promise<readonly string[] | null> => {
+      const idx = Math.min(probeCalls, opts.probeReturns.length - 1);
+      probeCalls += 1;
+      if (opts.probeError && idx === 0) throw opts.probeError;
+      return opts.probeReturns[idx] ?? null;
+    });
+    const mgr = new SessionManager({
+      config: opts.h.config,
+      taskState: opts.h.taskState,
+      pendingConfirms: opts.h.pendingConfirms,
+      sandboxPolicy: opts.h.sandboxPolicy,
+      auditLog: opts.h.auditLog,
+      sinks: opts.h.sinks,
+      basePromptPath: opts.h.basePromptPath,
+      validateModelsJsonOverride: noopValidate,
+      loadSdkOverride: makeFakeSdkLoader(session),
+      coldStartModelId: opts.coldStartModelId,
+      getStudioLoadedModelIds: probe,
+      now: () => nowMs.value,
+    });
+    await mgr.init();
+    return {
+      mgr,
+      session,
+      nowMs,
+      get probeCalls() {
+        return probeCalls;
+      },
+    } as {
+      mgr: SessionManager;
+      session: FakeSession;
+      nowMs: { value: number };
+      probeCalls: number;
+    };
+  }
+
+  test("same model loaded as boot → no notice emitted", async () => {
+    const h = makeHarness();
+    const { mgr, session } = await buildSwapHarness({
+      h,
+      coldStartModelId: "modelA",
+      probeReturns: [["modelA"]],
+    });
+    h.sinks.telegram.events = [];
+
+    const inflight = mgr.handleInbound({ channel: "telegram", text: "hi" });
+    await waitFor(() => session.promptCalls.length > 0);
+    // Yield so the fire-and-forget probe + post-probe emission settles.
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+
+    const swapNotices = h.sinks.telegram.events.filter(
+      (e) =>
+        e.type === "system_notice" &&
+        /loaded model changed|Studio has no model/i.test(e.text),
+    );
+    expect(swapNotices).toHaveLength(0);
+
+    session.resolveCurrentPrompt!();
+    await inflight;
+    await mgr.dispose();
+  });
+
+  test("swap to new model → emits notice + audit entry + operator log", async () => {
+    const h = makeHarness();
+    const operatorEntries: { event: string; fields: Record<string, unknown> }[] =
+      [];
+    const operatorLogger = {
+      includeContent: false,
+      preview: (s: string | undefined) => s,
+      banner: () => {},
+      info: (event: string, fields?: Record<string, unknown>) => {
+        operatorEntries.push({ event, fields: (fields ?? {}) as Record<string, unknown> });
+      },
+      debug: () => {},
+      error: () => {},
+    };
+    const session = makeFakeSession();
+    const probe = vi.fn(async (): Promise<readonly string[] | null> => ["modelB"]);
+    const nowMs = 1_000_000;
+    const mgr = new SessionManager({
+      config: h.config,
+      taskState: h.taskState,
+      pendingConfirms: h.pendingConfirms,
+      sandboxPolicy: h.sandboxPolicy,
+      auditLog: h.auditLog,
+      sinks: h.sinks,
+      operatorLogger,
+      basePromptPath: h.basePromptPath,
+      validateModelsJsonOverride: noopValidate,
+      loadSdkOverride: makeFakeSdkLoader(session),
+      coldStartModelId: "modelA",
+      getStudioLoadedModelIds: probe,
+      now: () => nowMs,
+    });
+    await mgr.init();
+    h.sinks.telegram.events = [];
+
+    const inflight = mgr.handleInbound({ channel: "telegram", text: "hi" });
+    await waitFor(() => session.promptCalls.length > 0);
+    await waitFor(
+      () =>
+        h.sinks.telegram.events.some(
+          (e) =>
+            e.type === "system_notice" && /loaded model changed/i.test(e.text),
+        ),
+      400,
+    );
+
+    const notice = h.sinks.telegram.events.find(
+      (e) => e.type === "system_notice" && /loaded model changed/i.test(e.text),
+    );
+    expect(notice).toBeDefined();
+    if (notice && notice.type === "system_notice") {
+      expect(notice.text).toContain("modelA");
+      expect(notice.text).toContain("modelB");
+      expect(notice.level).toBe("warn");
+    }
+
+    // Audit entry recorded.
+    let swap: Record<string, unknown> | undefined;
+    await waitFor(() => {
+      const lines = readAuditLines(join(workDir, "audit"));
+      swap = lines.find((e) => e.event === "studio_model_swap_detected");
+      return swap !== undefined;
+    }, 1000);
+    expect(swap).toBeDefined();
+    expect(swap!.channel).toBe("telegram");
+    const extra = swap!.extra as Record<string, unknown>;
+    expect(extra.cold_start_model_id).toBe("modelA");
+    expect(extra.current_model_id).toBe("modelB");
+
+    // Operator log entry recorded.
+    const opEntry = operatorEntries.find(
+      (e) => e.event === "studio_model_swap_detected",
+    );
+    expect(opEntry).toBeDefined();
+    expect(opEntry!.fields.cold_start_model_id).toBe("modelA");
+    expect(opEntry!.fields.current_model_id).toBe("modelB");
+
+    session.resolveCurrentPrompt!();
+    await inflight;
+    await mgr.dispose();
+  });
+
+  test("one-shot suppression: same swap-target on next inbound → no second notice", async () => {
+    const h = makeHarness();
+    const session = makeFakeSession();
+    const probe = vi.fn(async (): Promise<readonly string[] | null> => ["modelB"]);
+    const nowMs = { value: 1_000_000 };
+    const mgr = new SessionManager({
+      config: h.config,
+      taskState: h.taskState,
+      pendingConfirms: h.pendingConfirms,
+      sandboxPolicy: h.sandboxPolicy,
+      auditLog: h.auditLog,
+      sinks: h.sinks,
+      basePromptPath: h.basePromptPath,
+      validateModelsJsonOverride: noopValidate,
+      loadSdkOverride: makeFakeSdkLoader(session),
+      coldStartModelId: "modelA",
+      getStudioLoadedModelIds: probe,
+      now: () => nowMs.value,
+    });
+    await mgr.init();
+    h.sinks.telegram.events = [];
+
+    // First inbound → notice fires.
+    const a = mgr.handleInbound({ channel: "telegram", text: "first" });
+    await waitFor(() => session.promptCalls.length > 0);
+    await waitFor(
+      () =>
+        h.sinks.telegram.events.some(
+          (e) =>
+            e.type === "system_notice" && /loaded model changed/i.test(e.text),
+        ),
+      400,
+    );
+    expect(
+      h.sinks.telegram.events.filter(
+        (e) => e.type === "system_notice" && /loaded model changed/i.test(e.text),
+      ),
+    ).toHaveLength(1);
+
+    // Drain to idle so a second inbound can run.
+    const cur = h.taskState.get();
+    if (cur.kind === "running" || cur.kind === "backgrounded") {
+      h.taskState.tryTransition({
+        kind: "completed",
+        taskId: cur.taskId,
+        startedAt: cur.startedAt,
+        finishedAt: nowMs.value,
+      });
+      h.taskState.tryTransition({ kind: "idle" });
+    }
+    session.resolveCurrentPrompt!();
+    await a;
+
+    // Advance time PAST the cooldown so we're testing one-shot, not cooldown.
+    nowMs.value += 120_000;
+
+    // Second inbound — same swap target (modelB).  Should NOT re-emit.
+    const beforeCount = h.sinks.telegram.events.filter(
+      (e) => e.type === "system_notice" && /loaded model changed/i.test(e.text),
+    ).length;
+    const b = mgr.handleInbound({ channel: "telegram", text: "second" });
+    await waitFor(() => session.promptCalls.length > 1);
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+
+    const afterCount = h.sinks.telegram.events.filter(
+      (e) => e.type === "system_notice" && /loaded model changed/i.test(e.text),
+    ).length;
+    expect(afterCount).toBe(beforeCount);
+
+    session.resolveCurrentPrompt!();
+    await b;
+    await mgr.dispose();
+  });
+
+  test("multi-load: original still in loaded[] → no notice", async () => {
+    const h = makeHarness();
+    // Studio reports BOTH the original modelA and the new modelB loaded.
+    // Since modelA is still there, the daemon's session is fine — no notice.
+    const { mgr, session } = await buildSwapHarness({
+      h,
+      coldStartModelId: "modelA",
+      probeReturns: [["modelA", "modelB"]],
+    });
+    h.sinks.telegram.events = [];
+
+    const inflight = mgr.handleInbound({ channel: "telegram", text: "hi" });
+    await waitFor(() => session.promptCalls.length > 0);
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+
+    const swapNotices = h.sinks.telegram.events.filter(
+      (e) =>
+        e.type === "system_notice" && /loaded model changed/i.test(e.text),
+    );
+    expect(swapNotices).toHaveLength(0);
+
+    session.resolveCurrentPrompt!();
+    await inflight;
+    await mgr.dispose();
+  });
+
+  test("studio-empty: loaded.length === 0 → distinct 'has no model' notice", async () => {
+    const h = makeHarness();
+    const { mgr, session } = await buildSwapHarness({
+      h,
+      coldStartModelId: "modelA",
+      probeReturns: [[]],
+    });
+    h.sinks.telegram.events = [];
+
+    const inflight = mgr.handleInbound({ channel: "telegram", text: "hi" });
+    await waitFor(() => session.promptCalls.length > 0);
+    await waitFor(
+      () =>
+        h.sinks.telegram.events.some(
+          (e) =>
+            e.type === "system_notice" && /Studio has no model/i.test(e.text),
+        ),
+      400,
+    );
+
+    const empty = h.sinks.telegram.events.find(
+      (e) => e.type === "system_notice" && /Studio has no model/i.test(e.text),
+    );
+    expect(empty).toBeDefined();
+    if (empty && empty.type === "system_notice") {
+      expect(empty.level).toBe("warn");
+    }
+
+    session.resolveCurrentPrompt!();
+    await inflight;
+    await mgr.dispose();
+  });
+
+  test("per-channel cooldown: second notice within 60s suppressed (different model)", async () => {
+    const h = makeHarness();
+    const session = makeFakeSession();
+    let callIdx = 0;
+    const probe = vi.fn(async (): Promise<readonly string[] | null> => {
+      const seq: ReadonlyArray<readonly string[]> = [["modelB"], ["modelC"]];
+      const out = seq[Math.min(callIdx, seq.length - 1)];
+      callIdx += 1;
+      return out;
+    });
+    const nowMs = { value: 1_000_000 };
+    const mgr = new SessionManager({
+      config: h.config,
+      taskState: h.taskState,
+      pendingConfirms: h.pendingConfirms,
+      sandboxPolicy: h.sandboxPolicy,
+      auditLog: h.auditLog,
+      sinks: h.sinks,
+      basePromptPath: h.basePromptPath,
+      validateModelsJsonOverride: noopValidate,
+      loadSdkOverride: makeFakeSdkLoader(session),
+      coldStartModelId: "modelA",
+      getStudioLoadedModelIds: probe,
+      now: () => nowMs.value,
+    });
+    await mgr.init();
+    h.sinks.telegram.events = [];
+
+    // First inbound → notice for modelB.
+    const a = mgr.handleInbound({ channel: "telegram", text: "first" });
+    await waitFor(() => session.promptCalls.length > 0);
+    await waitFor(
+      () =>
+        h.sinks.telegram.events.some(
+          (e) =>
+            e.type === "system_notice" && /loaded model changed/i.test(e.text),
+        ),
+      400,
+    );
+    expect(
+      h.sinks.telegram.events.filter(
+        (e) => e.type === "system_notice" && /loaded model changed/i.test(e.text),
+      ),
+    ).toHaveLength(1);
+
+    // Drain to idle.
+    const cur = h.taskState.get();
+    if (cur.kind === "running" || cur.kind === "backgrounded") {
+      h.taskState.tryTransition({
+        kind: "completed",
+        taskId: cur.taskId,
+        startedAt: cur.startedAt,
+        finishedAt: nowMs.value,
+      });
+      h.taskState.tryTransition({ kind: "idle" });
+    }
+    session.resolveCurrentPrompt!();
+    await a;
+
+    // Stay WITHIN cooldown (advance only 30s, not 60s).
+    nowMs.value += 30_000;
+
+    // Second inbound → probe returns modelC (different from modelB) — but
+    // cooldown should suppress.
+    const beforeCount = h.sinks.telegram.events.filter(
+      (e) => e.type === "system_notice" && /loaded model changed/i.test(e.text),
+    ).length;
+    const b = mgr.handleInbound({ channel: "telegram", text: "second" });
+    await waitFor(() => session.promptCalls.length > 1);
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+
+    const afterCount = h.sinks.telegram.events.filter(
+      (e) => e.type === "system_notice" && /loaded model changed/i.test(e.text),
+    ).length;
+    expect(afterCount).toBe(beforeCount);
+
+    session.resolveCurrentPrompt!();
+    await b;
+    await mgr.dispose();
+  });
+
+  test("post-abort gate: cancelled state when probe resolves → no notice", async () => {
+    const h = makeHarness();
+    const session = makeFakeSession();
+    let resolveProbe: ((v: readonly string[] | null) => void) | null = null;
+    const probe = vi.fn(async (): Promise<readonly string[] | null> => {
+      return new Promise<readonly string[] | null>((r) => {
+        resolveProbe = r;
+      });
+    });
+    const mgr = new SessionManager({
+      config: h.config,
+      taskState: h.taskState,
+      pendingConfirms: h.pendingConfirms,
+      sandboxPolicy: h.sandboxPolicy,
+      auditLog: h.auditLog,
+      sinks: h.sinks,
+      basePromptPath: h.basePromptPath,
+      validateModelsJsonOverride: noopValidate,
+      loadSdkOverride: makeFakeSdkLoader(session),
+      coldStartModelId: "modelA",
+      getStudioLoadedModelIds: probe,
+    });
+    await mgr.init();
+    h.sinks.telegram.events = [];
+
+    const inflight = mgr.handleInbound({ channel: "telegram", text: "hi" });
+    await waitFor(() => session.promptCalls.length > 0);
+    await waitFor(() => resolveProbe !== null);
+
+    // Cancel the task BEFORE the probe resolves.
+    const cur = h.taskState.get();
+    if (cur.kind === "running") {
+      h.taskState.tryTransition({
+        kind: "cancelled",
+        taskId: cur.taskId,
+        startedAt: cur.startedAt,
+        cancelledAt: Date.now(),
+        reason: "user",
+      });
+    }
+
+    // NOW resolve the probe with a swap-detected payload.
+    resolveProbe!(["modelB"]);
+    // Yield so the post-abort-gated emission would run if it weren't suppressed.
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+
+    const swapNotices = h.sinks.telegram.events.filter(
+      (e) =>
+        e.type === "system_notice" && /loaded model changed/i.test(e.text),
+    );
+    expect(swapNotices).toHaveLength(0);
+
+    session.resolveCurrentPrompt!();
+    await inflight;
+    await mgr.dispose();
+  });
+
+  test("probe error → swallowed, no notice, no crash", async () => {
+    const h = makeHarness();
+    const session = makeFakeSession();
+    const probe = vi.fn(async (): Promise<readonly string[] | null> => {
+      throw new Error("network down");
+    });
+    const mgr = new SessionManager({
+      config: h.config,
+      taskState: h.taskState,
+      pendingConfirms: h.pendingConfirms,
+      sandboxPolicy: h.sandboxPolicy,
+      auditLog: h.auditLog,
+      sinks: h.sinks,
+      basePromptPath: h.basePromptPath,
+      validateModelsJsonOverride: noopValidate,
+      loadSdkOverride: makeFakeSdkLoader(session),
+      coldStartModelId: "modelA",
+      getStudioLoadedModelIds: probe,
+    });
+    await mgr.init();
+    h.sinks.telegram.events = [];
+
+    const inflight = mgr.handleInbound({ channel: "telegram", text: "hi" });
+    await waitFor(() => session.promptCalls.length > 0);
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+
+    const swapNotices = h.sinks.telegram.events.filter(
+      (e) =>
+        e.type === "system_notice" && /loaded model changed/i.test(e.text),
+    );
+    expect(swapNotices).toHaveLength(0);
+
+    session.resolveCurrentPrompt!();
+    await inflight;
+    await mgr.dispose();
+  });
+
+  test("no coldStartModelId / no probe → fire-and-forget no-op", async () => {
+    const h = makeHarness();
+    const session = makeFakeSession();
+    // No getStudioLoadedModelIds, no coldStartModelId.
+    const mgr = new SessionManager({
+      config: h.config,
+      taskState: h.taskState,
+      pendingConfirms: h.pendingConfirms,
+      sandboxPolicy: h.sandboxPolicy,
+      auditLog: h.auditLog,
+      sinks: h.sinks,
+      basePromptPath: h.basePromptPath,
+      validateModelsJsonOverride: noopValidate,
+      loadSdkOverride: makeFakeSdkLoader(session),
+    });
+    await mgr.init();
+    h.sinks.telegram.events = [];
+
+    const inflight = mgr.handleInbound({ channel: "telegram", text: "hi" });
+    await waitFor(() => session.promptCalls.length > 0);
+    await new Promise((r) => setImmediate(r));
+
+    const swapNotices = h.sinks.telegram.events.filter(
+      (e) =>
+        e.type === "system_notice" && /loaded model changed/i.test(e.text),
+    );
+    expect(swapNotices).toHaveLength(0);
+
+    session.resolveCurrentPrompt!();
+    await inflight;
+    await mgr.dispose();
+  });
+
+  test("swap notice mirrors to terminal sink when origin is non-terminal", async () => {
+    const h = makeHarness();
+    const session = makeFakeSession();
+    const probe = vi.fn(async (): Promise<readonly string[] | null> => ["modelB"]);
+    const mgr = new SessionManager({
+      config: h.config,
+      taskState: h.taskState,
+      pendingConfirms: h.pendingConfirms,
+      sandboxPolicy: h.sandboxPolicy,
+      auditLog: h.auditLog,
+      sinks: h.sinks,
+      basePromptPath: h.basePromptPath,
+      validateModelsJsonOverride: noopValidate,
+      loadSdkOverride: makeFakeSdkLoader(session),
+      coldStartModelId: "modelA",
+      getStudioLoadedModelIds: probe,
+    });
+    await mgr.init();
+    h.sinks.telegram.events = [];
+    h.sinks.terminal.events = [];
+
+    const inflight = mgr.handleInbound({ channel: "telegram", text: "hi" });
+    await waitFor(() => session.promptCalls.length > 0);
+    await waitFor(
+      () =>
+        h.sinks.telegram.events.some(
+          (e) =>
+            e.type === "system_notice" && /loaded model changed/i.test(e.text),
+        ),
+      400,
+    );
+
+    // Notice should land on BOTH telegram (origin) AND terminal (mirror).
+    const onTel = h.sinks.telegram.events.find(
+      (e) => e.type === "system_notice" && /loaded model changed/i.test(e.text),
+    );
+    const onTerm = h.sinks.terminal.events.find(
+      (e) => e.type === "system_notice" && /loaded model changed/i.test(e.text),
+    );
+    expect(onTel).toBeDefined();
+    expect(onTerm).toBeDefined();
+
+    session.resolveCurrentPrompt!();
+    await inflight;
     await mgr.dispose();
   });
 });

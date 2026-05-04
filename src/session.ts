@@ -180,6 +180,27 @@ export interface SessionManagerOpts {
    *  `system_notice` is fanned out to the originating channel, and an audit
    *  entry is appended.  Tests use a shorter value (e.g. 100ms). */
   taskWatchdogMs?: number;
+  /**
+   * Soft Studio model-swap detection (plan v2 IMPL-D Step D.7).
+   *
+   * Optional callback that re-probes Studio for its currently-loaded model
+   * IDs.  Returns the loaded[] array (typically length 1, but Studio
+   * supports multi-load) or null on failure.  When provided AND
+   * `coldStartModelId` is also provided, SessionManager fires the probe
+   * (fire-and-forget) on every inbound and emits a one-shot
+   * `system_notice` if the cold-start model is no longer in the loaded
+   * set.  Hardening: multi-load semantics, per-channel cooldown,
+   * post-abort gate, audit-log entry, studio-empty distinct alarm.
+   *
+   * Wired by daemon.ts to `getStudioLoadedModelIds` (IMPL-E Wave 3).
+   */
+  getStudioLoadedModelIds?: () => Promise<readonly string[] | null>;
+  /**
+   * Studio's loaded model id captured at boot.  Used as the comparison
+   * point for the soft-swap detector.  When null/undefined, the detector
+   * is dormant.
+   */
+  coldStartModelId?: string | null;
   /** Time source (ms). Defaults to Date.now. */
   now?: () => number;
   /** setTimeout function (for fake-timer tests). Defaults to global setTimeout. */
@@ -237,6 +258,12 @@ export class SessionManager {
   private watchdogHandle: unknown = null;
   /** Task id the watchdog is bound to — CAS guard for late firings. */
   private watchdogTaskId: string | null = null;
+  /** Soft-swap detector state (plan v2 IMPL-D Step D.7).
+   *  `lastSwapNoticeModelId` — last model ID we surfaced via swap notice
+   *  (one-shot suppression).  `lastSwapNoticeAt` — per-channel timestamp of
+   *  last swap notice, used for the 60s cooldown. */
+  private lastSwapNoticeModelId: string | null = null;
+  private lastSwapNoticeAt: Map<ChannelId, number> = new Map();
   /** Adapter wrapping pending-confirms.ts to satisfy confirm.ts's interface. */
   private confirmRegistryAdapter: ConfirmToolRegistryContract | null = null;
 
@@ -501,6 +528,15 @@ export class SessionManager {
       this.scheduleAutoPromote(taskId);
       this.scheduleWatchdog(taskId);
 
+      // Plan v2 IMPL-D Step D.7 (Round 1+2 elder convergence): fire-and-
+      // forget soft Studio model-swap probe.  No await — the probe runs
+      // in parallel with the prompt and emits a one-shot system_notice if
+      // Studio's loaded model has drifted from the boot-captured one.
+      // Hardening (multi-load semantics, post-abort gate, per-channel
+      // cooldown, audit-log entry, studio-empty distinct alarm) lives in
+      // checkForStudioModelSwap.
+      void this.checkForStudioModelSwap(msg.channel);
+
       try {
         // Hand the message to pi-mono.  We pass the running TaskState's
         // AbortController.signal so /cancel can actually stop the GPU —
@@ -753,6 +789,143 @@ export class SessionManager {
     } catch {
       /* sandbox bookkeeping is best-effort */
     }
+  }
+
+  // ---------------------------------------------------------------------
+  // Private — soft Studio model-swap detector (plan v2 IMPL-D Step D.7)
+  // ---------------------------------------------------------------------
+
+  /**
+   * Soft model-swap detection: re-probe Studio's loaded model and, if it
+   * differs from the boot-captured `coldStartModelId` AND we haven't already
+   * told the user about THIS swap AND the channel isn't in cooldown, emit a
+   * one-shot `system_notice`.
+   *
+   * Hardening (Round 1+2 Elder findings):
+   *   - Multi-load semantics: use `loaded.includes(expected)`, not
+   *     `loaded[0] === expected` (Architect B1 + Adversarial B3.2 + PE W8 +
+   *     Integration W5).  Studio supports multiple loaded models; as long
+   *     as the boot model is still in the loaded set, the daemon's session
+   *     is fine — no notice.
+   *   - Studio-empty distinct alarm (PE W1): if `loaded.length === 0`, emit
+   *     a different "Studio has no model loaded" notice — semantically
+   *     distinct from a swap.
+   *   - Per-channel cooldown (Observability W5): 60s minimum between
+   *     notices per channel, regardless of model-id; prevents spam under
+   *     A→B→C→B oscillation.
+   *   - Post-abort gate (PE Skeptic W3): re-check `taskState.kind !==
+   *     "cancelled"` before fanOut; respects the existing post-abort
+   *     silence contract (the probe is fire-and-forget and may resolve
+   *     after a /cancel).
+   *   - Audit log entry (PE W4 + Security W4 + Obs W1): emit
+   *     `studio_model_swap_detected` to the audit log alongside the
+   *     operator log so the forensic trail survives operator-log rotation.
+   *   - One-shot suppression via `lastSwapNoticeModelId`: once we've told
+   *     the user about a swap to model B, don't repeat for B until the
+   *     model changes again.
+   *
+   * Best-effort; never throws; fire-and-forget from handleInbound.
+   */
+  private async checkForStudioModelSwap(channel: ChannelId): Promise<void> {
+    const probe = this.opts.getStudioLoadedModelIds;
+    const expected = this.opts.coldStartModelId;
+    if (!probe || !expected) return;
+
+    let loaded: readonly string[] | null;
+    try {
+      loaded = await probe();
+    } catch {
+      // Probe failure — never raise to the caller; the daemon stays up.
+      return;
+    }
+    if (loaded === null) return;
+
+    // Studio reported zero loaded models — distinct alarm.
+    if (loaded.length === 0) {
+      // Post-abort gate also applies to the empty-studio alarm.
+      if (this.opts.taskState.get().kind === "cancelled") return;
+      await this.emitStudioNotice(
+        channel,
+        "warn",
+        "pi: Studio has no model loaded — daemon cannot serve requests until you load one.",
+      );
+      return;
+    }
+
+    // Multi-load semantics: as long as the boot-captured model is among
+    // the loaded set, no swap. Notice fires only when the cold-start model
+    // is GONE.
+    if (loaded.includes(expected)) return;
+
+    const current = loaded[0]!;
+    if (current === this.lastSwapNoticeModelId) return;
+
+    // Per-channel cooldown.
+    const lastAt = this.lastSwapNoticeAt.get(channel) ?? 0;
+    if (this.now() - lastAt < 60_000) {
+      this.opts.operatorLogger?.debug("studio_model_swap_suppressed", {
+        reason: "channel_cooldown",
+        current_model_id: current,
+        channel,
+      });
+      return;
+    }
+
+    // Post-abort gate.
+    if (this.opts.taskState.get().kind === "cancelled") return;
+
+    this.lastSwapNoticeModelId = current;
+    this.lastSwapNoticeAt.set(channel, this.now());
+
+    await this.emitStudioNotice(
+      channel,
+      "warn",
+      `pi: Studio's loaded model changed since boot (was ${expected}, now ${current}). Daemon is still using ${expected} until next restart.`,
+    );
+
+    // Operator log.  OperatorLogger has no .warn — use .info for the
+    // swap-detected event (the warning level is already reflected in the
+    // user-facing system_notice + the audit-log row).
+    this.opts.operatorLogger?.info("studio_model_swap_detected", {
+      cold_start_model_id: expected,
+      current_model_id: current,
+      channel,
+    });
+    void this.opts.auditLog
+      .append({
+        event: "studio_model_swap_detected",
+        task_id: null,
+        channel,
+        sender_id_hash: null,
+        extra: { cold_start_model_id: expected, current_model_id: current },
+      })
+      .catch(() => undefined);
+  }
+
+  /**
+   * Fan-out helper for Studio-related system notices.  Emits to the
+   * originating channel + mirrors to the terminal sink (when origin is
+   * non-terminal) so an operator watching the terminal sees the same
+   * thing the user gets on Telegram/WhatsApp.
+   */
+  private async emitStudioNotice(
+    channel: ChannelId,
+    level: "info" | "warn" | "error",
+    text: string,
+  ): Promise<void> {
+    const notice: ChannelEvent = {
+      type: "system_notice",
+      level,
+      text,
+      ts: this.now(),
+    };
+    const sinkBag: Record<string, Sink | undefined> = {};
+    const target = this.opts.sinks[channel as "telegram" | "whatsapp" | "terminal"];
+    if (target) sinkBag[channel] = target;
+    if (this.opts.sinks.terminal && channel !== "terminal") {
+      sinkBag.terminal = this.opts.sinks.terminal;
+    }
+    await fanOut(sinkBag as SinkBag, notice).catch(() => undefined);
   }
 
   /**
