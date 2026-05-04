@@ -1058,11 +1058,14 @@ describe("TaskState watchdog (plan v2 IMPL-D)", () => {
 
     // Fire the watchdog timer.
     watchdog!.handler();
-    await waitFor(() => h.taskState.get().kind === "failed");
+    // v0.2.2: watchdog now uses markTerminalAndIdle, which drains all the way
+    // through to idle in a single atomic call.  Pre-v0.2.2 the test stopped at
+    // `failed`; post-v0.2.2 the state should END at `idle`.  The audit row +
+    // user-facing notice still fire on the way through (that's what we assert
+    // below).
+    await waitFor(() => h.taskState.get().kind === "idle");
 
-    // State transitioned to failed (not idle, since failed is the rescue
-    // sink for stuck-task watchdogs).
-    expect(h.taskState.get().kind).toBe("failed");
+    expect(h.taskState.get().kind).toBe("idle");
 
     // System notice was emitted to the originating channel.
     await waitFor(() => h.sinks.telegram.events.length > 0);
@@ -1133,62 +1136,52 @@ describe("TaskState watchdog (plan v2 IMPL-D)", () => {
     const watchdogTimer = captured.find((t) => t.delay === 100);
     expect(watchdogTimer).toBeDefined();
 
-    // Simulate a normal completion: emit agent_end via the subscriber.
-    session.emit({ type: "agent_end" });
-    await waitFor(() => h.taskState.get().kind === "completed");
+    // v0.2.2: termination is now owned exclusively by handleInbound's
+    // `await session.prompt()` resolution.  Resolve the prompt to drive a
+    // normal completion (instead of emit({type: "agent_end"}) — that no longer
+    // terminates).
+    session.resolveCurrentPrompt!();
+    await inflight;
+    // After inflight resolves, markTaskCompletedAndIdle has run → state is idle.
+    expect(h.taskState.get().kind).toBe("idle");
 
-    // The watchdog timer ID should have been cleared.
+    // The watchdog timer ID should have been cleared (handleInbound's
+    // try/finally clears the watchdog regardless of throw/no-throw).
     expect(clearedIds).toContain(watchdogTimer!.id);
 
-    // Even if the watchdog handler somehow fired now, the task is in
-    // `completed` state so it should be a no-op (the watchdog checks
-    // running/backgrounded only).
+    // Even if the watchdog handler somehow fired now, the task is in `idle`
+    // state so it should be a no-op (fireWatchdog's CAS guard checks
+    // running/backgrounded).
     watchdogTimer!.handler();
     await new Promise((r) => setImmediate(r));
-    expect(h.taskState.get().kind).toBe("completed");
+    expect(h.taskState.get().kind).toBe("idle");
 
     // AUDIT-D NIT 9: defensive — ensure the watchdog did NOT emit a
-    // user-facing notice when firing against an already-completed task.
+    // user-facing notice when firing against an already-terminated task.
     expect(
       h.sinks.telegram.events.filter((e) => e.type === "system_notice"),
     ).toHaveLength(0);
 
-    session.resolveCurrentPrompt!();
-    await inflight;
     await mgr.dispose();
   });
 });
 
 // ---------------------------------------------------------------------------
-// markTaskCompleted idempotence (BLESS Adversarial NEW-3).
+// v0.2.2 Test 1 (plan §A.6): multi-message_end load-bearing test.
+//
+// REPLACES the v0.2.1 "markTaskCompleted idempotence" test which guarded
+// against double-firing of subscriber-driven termination side effects.  In
+// v0.2.2 the subscriber NO LONGER terminates — termination is owned
+// exclusively by handleInbound's `await session.prompt()` resolution.  The
+// new contract is: intermediate message_end events MUST NOT trigger
+// termination (the v0.2.1 IMPL-D-1 null-mapper-symmetry bug fired EVERY
+// message_end as a terminator, producing the duration_ms=7 smoking gun
+// per MIB-2026-05-03-2336).
 // ---------------------------------------------------------------------------
 
-describe("markTaskCompleted idempotence (BLESS NEW-3)", () => {
-  test("multiple message_end events for same task → side effects fire only once", async () => {
+describe("v0.2.2 termination contract (plan §A.6 Test 1)", () => {
+  test("intermediate message_end events do NOT trigger termination — only prompt() resolution does", async () => {
     const h = makeHarness();
-    // Track sandboxPolicy.onTaskCompleted calls by spying on it.
-    let sandboxCompleteCalls = 0;
-    const realOnComplete = h.sandboxPolicy.onTaskCompleted.bind(h.sandboxPolicy);
-    h.sandboxPolicy.onTaskCompleted = () => {
-      sandboxCompleteCalls += 1;
-      realOnComplete();
-    };
-
-    // Capture operator-log task_completed entries.
-    const opCompletedEntries: Record<string, unknown>[] = [];
-    const operatorLogger = {
-      includeContent: false,
-      preview: (s: string | undefined) => s,
-      banner: () => {},
-      info: (event: string, fields?: Record<string, unknown>) => {
-        if (event === "task_completed") {
-          opCompletedEntries.push((fields ?? {}) as Record<string, unknown>);
-        }
-      },
-      debug: () => {},
-      error: () => {},
-    };
-
     const session = makeFakeSession();
     const mgr = new SessionManager({
       config: h.config,
@@ -1197,53 +1190,66 @@ describe("markTaskCompleted idempotence (BLESS NEW-3)", () => {
       sandboxPolicy: h.sandboxPolicy,
       auditLog: h.auditLog,
       sinks: h.sinks,
-      operatorLogger,
       basePromptPath: h.basePromptPath,
       validateModelsJsonOverride: noopValidate,
       loadSdkOverride: makeFakeSdkLoader(session),
     });
     await mgr.init();
 
-    const inflight = mgr.handleInbound({ channel: "telegram", text: "task" });
+    const inflight = mgr.handleInbound({ channel: "telegram", text: "x" });
     await waitFor(() => session.promptCalls.length > 0);
+    expect(h.taskState.get().kind).toBe("running");
 
-    // pi-mono streaming sometimes emits multiple message_end events for the
-    // same turn (BLESS Adversarial NEW-3). Without the CAS gate, each call
-    // would re-fire audit + operator log + sandboxPolicy.onTaskCompleted.
-    const sandboxBaseline = sandboxCompleteCalls;
-    session.emit({ type: "message_end", message: { role: "assistant", content: [] } });
-    session.emit({ type: "message_end", message: { role: "assistant", content: [] } });
-    session.emit({ type: "message_end", message: { role: "assistant", content: [] } });
-    await waitFor(() => h.taskState.get().kind === "completed");
-    // Yield a couple turns so any (incorrect) double-fire would land.
+    // Fire 5 message_end events matching pi-mono's actual per-turn behavior:
+    // user / assistant-with-tool-call / tool-result / empty-assistant /
+    // final-assistant.  Pre-v0.2.2, EACH of these fired markTaskCompleted →
+    // duration_ms=7 + state stuck in completed.
+    session.emit({
+      type: "message_end",
+      message: { role: "user", content: [{ type: "text", text: "x" }] },
+    });
+    session.emit({
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "tool_call" }] },
+    });
+    session.emit({
+      type: "message_end",
+      message: { role: "tool", content: [{ type: "text", text: "ok" }] },
+    });
+    session.emit({
+      type: "message_end",
+      message: { role: "assistant", content: [] },
+    });
+    session.emit({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "final answer" }],
+      },
+    });
+
+    // CRITICAL: state must STILL be running after 5 message_end events.  Pre-
+    // v0.2.2 it would already be `completed` after the FIRST emit.  Yield a
+    // few microtask turns so any (incorrect) state transition would land.
     await new Promise((r) => setImmediate(r));
     await new Promise((r) => setImmediate(r));
+    expect(h.taskState.get().kind).toBe("running");
 
-    // sandboxPolicy.onTaskCompleted called exactly once via markTaskCompleted
-    // (NOTE: handleInbound's finally-block also calls it, but only AFTER
-    // resolveCurrentPrompt resolves — at this point the prompt is still
-    // pending, so the only path that increments is markTaskCompleted itself).
-    expect(sandboxCompleteCalls - sandboxBaseline).toBe(1);
+    // No task_completed audit row should have been written yet.
+    const linesPre = readAuditLines(join(workDir, "audit"));
+    expect(linesPre.filter((e) => e.event === "task_completed")).toHaveLength(0);
 
-    // Operator log task_completed fired exactly once.
-    expect(opCompletedEntries).toHaveLength(1);
-
-    // Audit log task_completed fired exactly once.
-    let auditCount = 0;
-    await waitFor(() => {
-      const lines = readAuditLines(join(workDir, "audit"));
-      auditCount = lines.filter((e) => e.event === "task_completed").length;
-      return auditCount >= 1;
-    }, 1000);
-    // Keep yielding briefly so any spurious second append would land.
-    await new Promise((r) => setImmediate(r));
-    await new Promise((r) => setImmediate(r));
-    const finalLines = readAuditLines(join(workDir, "audit"));
-    const finalCount = finalLines.filter((e) => e.event === "task_completed").length;
-    expect(finalCount).toBe(1);
-
+    // NOW resolve the prompt — canonical terminal signal in v0.2.2.
     session.resolveCurrentPrompt!();
     await inflight;
+
+    // Exactly ONE task_completed audit row + state is now idle (cyclicity).
+    await waitFor(() => {
+      const lines = readAuditLines(join(workDir, "audit"));
+      return lines.filter((e) => e.event === "task_completed").length === 1;
+    }, 1000);
+    expect(h.taskState.get().kind).toBe("idle");
+
     await mgr.dispose();
   });
 });
@@ -1253,7 +1259,7 @@ describe("markTaskCompleted idempotence (BLESS NEW-3)", () => {
 // ---------------------------------------------------------------------------
 
 describe("serial_queue_blocked user notice (plan v2 IMPL-D)", () => {
-  test("second concurrent inbound emits system_notice to originating channel + audit entry", async () => {
+  test("second inbound while taskState busy emits system_notice to originating channel + audit entry", async () => {
     const h = makeHarness();
     const session = makeFakeSession();
     const mgr = new SessionManager({
@@ -1269,36 +1275,27 @@ describe("serial_queue_blocked user notice (plan v2 IMPL-D)", () => {
     });
     await mgr.init();
 
-    // First inbound — starts running.
-    const a = mgr.handleInbound({ channel: "telegram", text: "long task" });
-    await waitFor(() => session.promptCalls.length >= 1);
-    expect(h.taskState.get().kind).toBe("running");
+    // v0.2.2: termination is now atomic (markTerminalAndIdle drains all the
+    // way through to idle).  The pre-v0.2.2 hack of "force-background then
+    // resolve prompt" no longer works — markTaskCompletedAndIdle drains state
+    // to idle inside the queue lock, so a second handleInbound finds idle and
+    // starts a new task instead of blocking.
+    //
+    // To exercise the busy-state path directly, we establish a `running`
+    // state via tryTransition (bypassing handleInbound entirely so we don't
+    // hold the queue lock), then call handleInbound which finds the busy
+    // state and emits the serial_queue_blocked notice + audit row.
+    h.taskState.tryTransition({
+      kind: "running",
+      taskId: "T-FAKE-LONG",
+      startedAt: Date.now(),
+      channel: "telegram",
+      userMessage: "long task",
+      abort: new AbortController(),
+    });
 
-    // Force-complete the queue lock by NOT releasing the prompt yet, then
-    // fire a second inbound.  Because GlobalQueue serializes the run, the
-    // second inbound will run AFTER the first.  We need to test what happens
-    // when the second one acquires the lock and finds running state.
-
-    // Release the first prompt + drain via going to backgrounded so the lock
-    // releases, but state is still busy when the second inbound acquires.
-    const cur = h.taskState.get();
-    if (cur.kind === "running") {
-      h.taskState.tryTransition({
-        kind: "backgrounded",
-        taskId: cur.taskId,
-        startedAt: cur.startedAt,
-        channel: cur.channel,
-        userMessage: cur.userMessage,
-        abort: cur.abort,
-        promotedAt: Date.now(),
-        promotedBy: "auto",
-      });
-    }
-    session.resolveCurrentPrompt!();
-    await a;
-
-    // Now state is `backgrounded`. A second inbound should be rejected
-    // and emit a user-facing notice + audit entry.
+    // Now state is `running`. The next inbound should be rejected with
+    // a user-facing notice + audit entry.
     h.sinks.telegram.events = [];
     await mgr.handleInbound({ channel: "telegram", text: "follow-up" });
 
@@ -1322,10 +1319,10 @@ describe("serial_queue_blocked user notice (plan v2 IMPL-D)", () => {
     expect(blocked).toBeDefined();
     expect(blocked!.channel).toBe("telegram");
 
-    // Cleanup.
+    // Cleanup: drain state to idle so afterEach doesn't deadlock.
     const cur2 = h.taskState.get();
-    if (cur2.kind === "backgrounded") {
-      h.taskState.tryTransition({
+    if (cur2.kind === "running") {
+      await h.taskState.markTerminalAndIdle({
         kind: "completed",
         taskId: cur2.taskId,
         startedAt: cur2.startedAt,
@@ -2005,11 +2002,17 @@ describe("backgrounded → completed task_completed rewrite (BLESS S4)", () => {
       expect(evt.finalMessage).toBe("all done with that task");
     }
 
-    // markTaskCompleted MUST still fire — task should be `completed`.
-    expect(h.taskState.get().kind).toBe("completed");
+    // v0.2.2: state stays `backgrounded` until handleInbound's
+    // `await session.prompt()` resolves and markTaskCompletedAndIdle drains
+    // it.  Pre-v0.2.2 the subscriber's mirror trigger would CAS to
+    // `completed` here; in v0.2.2 the subscriber is fan-out only.
+    expect(h.taskState.get().kind).toBe("backgrounded");
 
+    // Now release the prompt — this drives the actual termination via the
+    // canonical Choice D path (await session.prompt() → markTaskCompletedAndIdle).
     session.resolveCurrentPrompt!();
     await inflight;
+    expect(h.taskState.get().kind).toBe("idle");
     await mgr.dispose();
   });
 
@@ -2081,31 +2084,25 @@ describe("serial_queue_blocked cooldown (BLESS PE Skeptic + UX)", () => {
     });
     await mgr.init();
 
-    // Move to backgrounded so the queue lock releases but state is still busy.
-    const a = mgr.handleInbound({ channel: "telegram", text: "long" });
-    await waitFor(() => session.promptCalls.length > 0);
-    const cur = h.taskState.get();
-    if (cur.kind === "running") {
-      h.taskState.tryTransition({
-        kind: "backgrounded",
-        taskId: cur.taskId,
-        startedAt: cur.startedAt,
-        channel: cur.channel,
-        userMessage: cur.userMessage,
-        abort: cur.abort,
-        promotedAt: nowMs.value,
-        promotedBy: "auto",
-      });
-    }
-    session.resolveCurrentPrompt!();
-    await a;
+    // v0.2.2: same pattern as the test above — establish busy state via
+    // tryTransition (bypassing handleInbound) so the busy-state branch can
+    // be exercised without the markTerminalAndIdle drain re-clearing it.
+    h.taskState.tryTransition({
+      kind: "running",
+      taskId: "T-FAKE-LONG",
+      startedAt: nowMs.value,
+      channel: "telegram",
+      userMessage: "long",
+      abort: new AbortController(),
+    });
 
     h.sinks.telegram.events = [];
 
     // First dropped follow-up — emits notice + audit row.
     await mgr.handleInbound({ channel: "telegram", text: "drop 1" });
     const noticesAfterFirst = h.sinks.telegram.events.filter(
-      (e) => e.type === "system_notice" && /still working|previous request/i.test(e.text),
+      (e) =>
+        e.type === "system_notice" && /still working|previous request/i.test(e.text),
     );
     expect(noticesAfterFirst).toHaveLength(1);
 
@@ -2114,7 +2111,8 @@ describe("serial_queue_blocked cooldown (BLESS PE Skeptic + UX)", () => {
     nowMs.value += 5_000;
     await mgr.handleInbound({ channel: "telegram", text: "drop 2" });
     const noticesAfterSecond = h.sinks.telegram.events.filter(
-      (e) => e.type === "system_notice" && /still working|previous request/i.test(e.text),
+      (e) =>
+        e.type === "system_notice" && /still working|previous request/i.test(e.text),
     );
     expect(noticesAfterSecond).toHaveLength(1); // STILL 1 — suppressed.
 
@@ -2123,7 +2121,8 @@ describe("serial_queue_blocked cooldown (BLESS PE Skeptic + UX)", () => {
     nowMs.value += 30_000; // total +35s from first
     await mgr.handleInbound({ channel: "telegram", text: "drop 3" });
     const noticesAfterThird = h.sinks.telegram.events.filter(
-      (e) => e.type === "system_notice" && /still working|previous request/i.test(e.text),
+      (e) =>
+        e.type === "system_notice" && /still working|previous request/i.test(e.text),
     );
     expect(noticesAfterThird).toHaveLength(2);
 
@@ -2131,15 +2130,17 @@ describe("serial_queue_blocked cooldown (BLESS PE Skeptic + UX)", () => {
     let blockedCount = 0;
     await waitFor(() => {
       const lines = readAuditLines(join(workDir, "audit"));
-      blockedCount = lines.filter((e) => e.event === "serial_queue_blocked").length;
+      blockedCount = lines
+        .filter((e) => e.event === "serial_queue_blocked")
+        .length;
       return blockedCount >= 3;
     }, 1000);
     expect(blockedCount).toBe(3);
 
     // Cleanup.
     const cur2 = h.taskState.get();
-    if (cur2.kind === "backgrounded") {
-      h.taskState.tryTransition({
+    if (cur2.kind === "running") {
+      await h.taskState.markTerminalAndIdle({
         kind: "completed",
         taskId: cur2.taskId,
         startedAt: cur2.startedAt,
