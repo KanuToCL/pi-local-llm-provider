@@ -132,16 +132,24 @@ const MAX_LINE_BYTES = 256 * 1024; // 256 KB hard cap per JSON line
 /**
  * Event kinds the `'tell-only'` filter passes through.  The WhatsApp /
  * Telegram-style sinks should never see infrastructural noise like
- * `reply` deltas or daemon-internal `system_notice` lines — only the
- * agent-driven interrupts, confirms, and task-end transitions the user
- * actually wants to know about.
+ * daemon-internal `system_notice` lines, auto-promote pings, or
+ * go_background notices — only the user-facing turns and agent-driven
+ * interrupts.
  *
  * AUDIT-C lower-priority: `task_completed` is a real user-facing event
  * (the framework's "done" signal) and must pass the filter, otherwise
  * tell-only attached clients miss the task-end notification.
+ *
+ * BUG-2026-05-03 fix (Integration Elder Round-1 B1): `reply` is the
+ * dedicated ChannelEvent for the framework's auto-completion text
+ * (after the mapper switched away from `tell+done`).  It MUST pass the
+ * filter or terminal users in tell-only mode see no agent replies.
  */
 const TELL_ONLY_EVENT_TYPES = new Set<ChannelEvent["type"]>([
   "tell",
+  "reply", // BUG-2026-05-03 fix: framework-completion is now `reply`, not
+  // `tell+done`.  tell-only IPC clients MUST receive it or terminal
+  // users see no agent replies.  See Integration Elder Round-1 B1.
   "confirm_request",
   "task_completed",
 ]);
@@ -225,10 +233,17 @@ class ConnectionState implements AttachedClient {
    * Apply the `stream` filter selected at attach time. Returns true if
    * the event should be delivered to this client.
    *
-   * For `'tell-only'` we accept `tell` and `confirm_request` — the
-   * agent-driven interrupts. Replies, deltas, auto-promote notices, and
-   * system notices are all suppressed (the WhatsApp / Telegram sinks
-   * will apply the same rule downstream).
+   * For `'tell-only'` we accept `tell`, `reply`, `confirm_request`, and
+   * `task_completed` — the user-facing turns and agent-driven interrupts.
+   * Auto-promote notices, go_background notices, and system notices are
+   * suppressed (the WhatsApp / Telegram sinks will apply the same rule
+   * downstream).
+   *
+   * BUG-2026-05-03 fix (Integration Elder Round-1 B1): `reply` was added
+   * to the pass-through set when the mapper switched from `tell+done` to
+   * the dedicated `reply` ChannelEvent type for framework auto-completion.
+   * Without this entry, tell-only attached clients (the terminal CLI in
+   * its default mode) would silently miss every conversational reply.
    */
   acceptsEvent(event: ChannelEvent): boolean {
     if (this.streamMode === "all") return true;

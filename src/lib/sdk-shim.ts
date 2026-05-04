@@ -36,6 +36,7 @@
  */
 
 import type { ChannelEvent } from "../tools/types.js";
+import { redactCredentialShapes } from "./sanitize.js";
 
 // ---------------------------------------------------------------------------
 // Public — error types
@@ -191,7 +192,10 @@ export async function loadSdk(): Promise<SdkLoaded> {
  */
 export function mapAgentEventToChannelEvent(
   piEvent: unknown,
-  options: { now?: () => number } = {}
+  options: {
+    now?: () => number;
+    logger?: { debug: (msg: string, fields?: Record<string, unknown>) => void };
+  } = {}
 ): ChannelEvent | null {
   if (!piEvent || typeof piEvent !== "object") return null;
   const evt = piEvent as Record<string, unknown>;
@@ -201,22 +205,39 @@ export function mapAgentEventToChannelEvent(
   const now = options.now ?? Date.now;
 
   // The framework-auto-completion event: pi-mono fires `message_end` with the
-  // final assistant message. We surface it as a `tell` urgency=done so the
-  // sink fan-out delivers it via channels.
+  // final assistant message. Surface it as a `reply` ChannelEvent so the sink
+  // fan-out delivers it as plain conversational text — NO prefix, NO urgency
+  // tag.  This IS the conversation turn, not a side-channel notification.
   //
-  // NOTE: this is a deliberate UX decision per plan §"Architectural revision
-  // (Option C)" — the AGENT does NOT call tell() for completion; we synthesize
-  // it here at the event-stream boundary. Agent-discretion `tell()` calls
-  // (mid-task interrupts) are emitted directly by the tool, NOT through this
-  // mapper.
+  // BUG-2026-05-03 fix (PRODUCTION-FINDINGS-2026-05-03.md §5; Ring of Elders
+  // converged plan v2):
+  //   - Previously emitted `tell urgency=done`, which Telegram's
+  //     formatChannelEvent prefixed with `📱` on every reply.
+  //   - The dedicated `reply` ChannelEvent type exists in `src/channels/base.ts`
+  //     exactly for this — no prefix because it IS the conversation.
+  //   - Text passes through `redactCredentialShapes` so the new (now-primary)
+  //     conversational path has the same credential-leak defense as `tell()`
+  //     (Security Elder W1: closes pre-existing gap; was a real exfiltration
+  //     vector that v0.2.1 would otherwise expand).
+  //
+  // Observability hooks (Observability Elder W4): emit debug log entries on
+  // both the dropped (empty text) and emitted paths so a future "no reply"
+  // bug has a forensic trail.
   if (kind === "message_end") {
     const message = evt.message as Record<string, unknown> | undefined;
     const text = extractAssistantText(message);
-    if (!text) return null;
+    if (!text) {
+      options.logger?.debug("framework_reply_dropped", { reason: "empty_text" });
+      return null;
+    }
+    const redacted = redactCredentialShapes(text);
+    options.logger?.debug("framework_reply_emitted", {
+      text_length: redacted.length,
+      redaction_applied: redacted !== text,
+    });
     return {
-      type: "tell",
-      urgency: "done",
-      text,
+      type: "reply",
+      text: redacted,
       ts: now(),
     };
   }
