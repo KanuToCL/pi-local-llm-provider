@@ -1160,6 +1160,95 @@ describe("TaskState watchdog (plan v2 IMPL-D)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// markTaskCompleted idempotence (BLESS Adversarial NEW-3).
+// ---------------------------------------------------------------------------
+
+describe("markTaskCompleted idempotence (BLESS NEW-3)", () => {
+  test("multiple message_end events for same task → side effects fire only once", async () => {
+    const h = makeHarness();
+    // Track sandboxPolicy.onTaskCompleted calls by spying on it.
+    let sandboxCompleteCalls = 0;
+    const realOnComplete = h.sandboxPolicy.onTaskCompleted.bind(h.sandboxPolicy);
+    h.sandboxPolicy.onTaskCompleted = () => {
+      sandboxCompleteCalls += 1;
+      realOnComplete();
+    };
+
+    // Capture operator-log task_completed entries.
+    const opCompletedEntries: Record<string, unknown>[] = [];
+    const operatorLogger = {
+      includeContent: false,
+      preview: (s: string | undefined) => s,
+      banner: () => {},
+      info: (event: string, fields?: Record<string, unknown>) => {
+        if (event === "task_completed") {
+          opCompletedEntries.push((fields ?? {}) as Record<string, unknown>);
+        }
+      },
+      debug: () => {},
+      error: () => {},
+    };
+
+    const session = makeFakeSession();
+    const mgr = new SessionManager({
+      config: h.config,
+      taskState: h.taskState,
+      pendingConfirms: h.pendingConfirms,
+      sandboxPolicy: h.sandboxPolicy,
+      auditLog: h.auditLog,
+      sinks: h.sinks,
+      operatorLogger,
+      basePromptPath: h.basePromptPath,
+      validateModelsJsonOverride: noopValidate,
+      loadSdkOverride: makeFakeSdkLoader(session),
+    });
+    await mgr.init();
+
+    const inflight = mgr.handleInbound({ channel: "telegram", text: "task" });
+    await waitFor(() => session.promptCalls.length > 0);
+
+    // pi-mono streaming sometimes emits multiple message_end events for the
+    // same turn (BLESS Adversarial NEW-3). Without the CAS gate, each call
+    // would re-fire audit + operator log + sandboxPolicy.onTaskCompleted.
+    const sandboxBaseline = sandboxCompleteCalls;
+    session.emit({ type: "message_end", message: { role: "assistant", content: [] } });
+    session.emit({ type: "message_end", message: { role: "assistant", content: [] } });
+    session.emit({ type: "message_end", message: { role: "assistant", content: [] } });
+    await waitFor(() => h.taskState.get().kind === "completed");
+    // Yield a couple turns so any (incorrect) double-fire would land.
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+
+    // sandboxPolicy.onTaskCompleted called exactly once via markTaskCompleted
+    // (NOTE: handleInbound's finally-block also calls it, but only AFTER
+    // resolveCurrentPrompt resolves — at this point the prompt is still
+    // pending, so the only path that increments is markTaskCompleted itself).
+    expect(sandboxCompleteCalls - sandboxBaseline).toBe(1);
+
+    // Operator log task_completed fired exactly once.
+    expect(opCompletedEntries).toHaveLength(1);
+
+    // Audit log task_completed fired exactly once.
+    let auditCount = 0;
+    await waitFor(() => {
+      const lines = readAuditLines(join(workDir, "audit"));
+      auditCount = lines.filter((e) => e.event === "task_completed").length;
+      return auditCount >= 1;
+    }, 1000);
+    // Keep yielding briefly so any spurious second append would land.
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+    const finalLines = readAuditLines(join(workDir, "audit"));
+    const finalCount = finalLines.filter((e) => e.event === "task_completed").length;
+    expect(finalCount).toBe(1);
+
+    session.resolveCurrentPrompt!();
+    await inflight;
+    await mgr.dispose();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // serial_queue_blocked user notice (plan v2 IMPL-D Step D.5).
 // ---------------------------------------------------------------------------
 

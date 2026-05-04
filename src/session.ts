@@ -885,20 +885,43 @@ export class SessionManager {
     // Post-abort gate.
     if (this.opts.taskState.get().kind === "cancelled") return;
 
-    // AUDIT-D IMPORTANT 3: emit BEFORE arming the cooldown.  If
-    // emitStudioNotice throws synchronously (low probability — fanOut
-    // already swallows throws — but defense-in-depth), the cooldown stays
-    // un-armed so the next inbound can re-detect and re-attempt the
-    // notice.  Either the emit succeeds (state advances correctly) or it
-    // throws (state stays untouched).
-    await this.emitStudioNotice(
-      channel,
-      "warn",
-      `pi: Studio's loaded model changed since boot (was ${expected}, now ${current}). Daemon is still using ${expected} until next restart.`,
-    );
-
+    // BLESS Adversarial NEW-2 + AUDIT-D IMPORTANT 3 — set state
+    // SYNCHRONOUSLY before the await, with rollback on throw.
+    //
+    // Why before-await beats after-await: two concurrent probes (e.g. from
+    // two parallel inbounds on the same channel) would both pass the
+    // `current === lastSwapNoticeModelId` and `cooldown` checks above,
+    // both reach the await with empty state, and both emit — user sees a
+    // double notice.  Setting state pre-await closes that race because
+    // the second probe sees `current === lastSwapNoticeModelId` on its
+    // own one-shot check and bails.
+    //
+    // Why rollback: AUDIT-D IMPORTANT 3 wanted "don't burn the cooldown
+    // for a notice that never landed".  In the realistic case fanOut
+    // swallows throws (Promise.allSettled), so this catch never runs —
+    // but if a future refactor of emitStudioNotice ever does throw
+    // synchronously, we still want the next inbound to retry the notice.
+    const previousNoticeModel = this.lastSwapNoticeModelId;
+    const previousNoticeAt = this.lastSwapNoticeAt.get(channel);
     this.lastSwapNoticeModelId = current;
     this.lastSwapNoticeAt.set(channel, this.now());
+    try {
+      await this.emitStudioNotice(
+        channel,
+        "warn",
+        `pi: Studio's loaded model changed since boot (was ${expected}, now ${current}). Daemon is still using ${expected} until next restart.`,
+      );
+    } catch {
+      // Roll back so a future inbound retries the notice.  fanOut already
+      // swallows throws via Promise.allSettled so this catch is defensive
+      // — but the rollback preserves the AUDIT-D IMPORTANT 3 contract.
+      this.lastSwapNoticeModelId = previousNoticeModel;
+      if (previousNoticeAt !== undefined) {
+        this.lastSwapNoticeAt.set(channel, previousNoticeAt);
+      } else {
+        this.lastSwapNoticeAt.delete(channel);
+      }
+    }
 
     // Operator log.  OperatorLogger has no .warn — use .info for the
     // swap-detected event (the warning level is already reflected in the
@@ -1211,12 +1234,21 @@ export class SessionManager {
       return;
     }
     const finishedAt = this.now();
-    this.opts.taskState.tryTransition({
+    // BLESS Adversarial NEW-3: gate ALL side effects on tryTransition's
+    // `ok` field.  pi-mono can emit multiple `message_end` events per
+    // turn during streaming (and the subscriber loop also fires this from
+    // the `reply` ChannelEvent mirror); without this gate, audit row +
+    // operator log + sandboxPolicy.onTaskCompleted would double-fire.
+    // Mirrors the pattern fireWatchdog uses correctly at L763-765.
+    const transitionResult = this.opts.taskState.tryTransition({
       kind: "completed",
       taskId: state.taskId,
       startedAt: state.startedAt,
       finishedAt,
     });
+    if (!transitionResult.ok) {
+      return; // Already in terminal state; another path won the race.
+    }
     this.clearAutoPromote();
     this.clearWatchdog();
     // Emit task_completed with duration_ms so post-incident review can
