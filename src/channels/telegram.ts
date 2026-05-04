@@ -145,6 +145,19 @@ export interface TelegramChannelOpts {
    * Buffer so they never reach api.telegram.org.
    */
   fileDownloader?: TelegramFileDownloader;
+  /**
+   * Optional salted sender-id hasher (per Security BLESS-W1, v0.2.2).
+   * When provided, the channel uses this for the `sender_id_hash` field on
+   * audit rows + operator logs instead of the local non-salted
+   * `hashSenderId`. Production daemon wiring (IMPL-V2-C territory) hands
+   * down a closure that calls `AuditLog.senderIdHash(id, installSalt)`.
+   * When omitted (typical: tests + back-compat), the channel falls back to
+   * the local weak hash.  Either way the load-bearing privacy invariant
+   * ("raw jid never written to disk") is satisfied — only a hash is ever
+   * written.  TODO(v0.3): remove the fallback once the daemon always wires
+   * the salted hasher.
+   */
+  senderIdHash?: (id: string) => string;
 }
 
 // ---------------------------------------------------------------------------
@@ -203,6 +216,14 @@ export class TelegramChannel implements Sink {
   private readonly fileDownloader: TelegramFileDownloader;
   private readonly inboundRateLimiter: InboundRateLimiter | undefined;
   /**
+   * Sender-id hasher used for `sender_id_hash` audit fields. Per Security
+   * BLESS-W1 (v0.2.2): operator-injected via `senderIdHash` opt to use the
+   * salted `AuditLog.senderIdHash`; when absent we fall back to the local
+   * weak `hashSenderId`. TODO(v0.3): remove fallback once daemon always
+   * wires the salted hasher.
+   */
+  private readonly senderIdHash: (id: string | number) => string;
+  /**
    * Tracks in-flight async media-download/save handlers spawned from the
    * (synchronous) grammy `bot.on(...)` callback.  Tests await `flushPending()`
    * to deterministically observe processInbound calls without tick-counting.
@@ -245,6 +266,12 @@ export class TelegramChannel implements Sink {
     this.inboundMediaStore = opts.inboundMediaStore;
     this.fileDownloader = opts.fileDownloader ?? defaultDownload;
     this.inboundRateLimiter = opts.inboundRateLimiter;
+    // Per Security BLESS-W1 (v0.2.2): prefer caller-supplied salted hasher;
+    // fall back to the local weak hash so existing tests and minimal-config
+    // callers continue to work.
+    this.senderIdHash = opts.senderIdHash
+      ? (id) => opts.senderIdHash!(String(id))
+      : (id) => hashSenderId(id);
 
     this.installMiddleware();
     this.installHandlers();
@@ -442,7 +469,7 @@ export class TelegramChannel implements Sink {
           event: "inbound_rate_limited",
           task_id: null,
           channel: "telegram",
-          sender_id_hash: hashSenderId(senderId),
+          sender_id_hash: this.senderIdHash(senderId),
           extra: { reason: verdict.reason },
         });
         return; // silent
@@ -459,7 +486,7 @@ export class TelegramChannel implements Sink {
           event: "dm_only_reject",
           task_id: null,
           channel: "telegram",
-          sender_id_hash: senderId !== undefined ? hashSenderId(senderId) : null,
+          sender_id_hash: senderId !== undefined ? this.senderIdHash(senderId) : null,
           extra: { chat_type: chatType ?? "unknown" },
         });
         return; // silent
@@ -470,7 +497,7 @@ export class TelegramChannel implements Sink {
           event: "allowlist_reject",
           task_id: null,
           channel: "telegram",
-          sender_id_hash: senderId !== undefined ? hashSenderId(senderId) : null,
+          sender_id_hash: senderId !== undefined ? this.senderIdHash(senderId) : null,
         });
         return; // silent
       }
@@ -562,15 +589,23 @@ export class TelegramChannel implements Sink {
     const senderName =
       ctx.from?.username ?? ctx.from?.first_name ?? undefined;
 
-    // Operator-side log of the inbound — the audit-event vocabulary
-    // (src/audit/schema.ts) does not yet include a dedicated `inbound_received`
-    // kind; the daemon (IMPL-13/15) emits `task_started` when it picks the
-    // message up, which is the canonical audit point.  Operator-logger keeps
-    // local visibility either way.
-    this.operatorLogger?.debug("telegram_inbound", {
+    // Per v0.2.2 PRODUCTION-FINDINGS-2026-05-03 §6.4 + Integration BLESS:
+    // promoted from debug to info so dropped messages have a forensic trail
+    // ("did the channel see this?"). Per Security BLESS-B1, this line and
+    // the parallel audit row MUST contain ONLY message_type + sender_id_hash
+    // — NO content fields (no text, no preview, no inbound_msg_hash).
+    const senderHash = this.senderIdHash(senderId);
+    this.operatorLogger?.info("telegram_inbound", {
       message_type: originalKind,
-      sender_id_hash: hashSenderId(senderId),
+      sender_id_hash: senderHash,
     });
+    void this.audit({
+      event: "telegram_inbound",
+      task_id: null,
+      channel: "telegram",
+      sender_id_hash: senderHash,
+      extra: { message_type: originalKind },
+    }).catch(() => undefined);
 
     if (
       media !== null &&

@@ -120,7 +120,7 @@ describe("operator-logger — preview() and includeContent", () => {
 });
 
 describe("operator-logger — banner()", () => {
-  it("pretty banner uses pi-comms header and 4 framed lines", () => {
+  it("pretty banner uses pi-comms header and 5 framed lines (incl. v0.2.2 diagnostic-mode tip)", () => {
     const { lines, logger } = capture({ style: "pretty" });
     logger.banner({
       bot: "@pi_bot",
@@ -130,7 +130,10 @@ describe("operator-logger — banner()", () => {
       sessions: "shared",
       extensions: "0",
     });
-    expect(lines).toHaveLength(4);
+    // v0.2.2 added a 5th line — the diagnostic-mode tip per UX BLESS-W6 +
+    // Observability BLESS-W8.  Operators staring at the log must be able
+    // to discover OPERATOR_LOG_LEVEL=debug without reading INSTALL.md.
+    expect(lines).toHaveLength(5);
     expect(lines[0]).toContain("pi-comms online");
     expect(lines[0]).not.toContain("Gemini Claw");
     expect(lines[1]).toContain("bot=@pi_bot");
@@ -139,7 +142,9 @@ describe("operator-logger — banner()", () => {
     expect(lines[2]).toContain("model=qwen3-coder");
     expect(lines[2]).toContain("sessions=shared");
     expect(lines[2]).toContain("ext=0");
-    expect(lines[3].startsWith("╰")).toBe(true);
+    expect(lines[3]).toContain("OPERATOR_LOG_LEVEL=debug");
+    expect(lines[3]).toContain("diagnostic mode");
+    expect(lines[4].startsWith("╰")).toBe(true);
   });
 
   it("plain banner emits a single startup line; json banner emits one object", () => {

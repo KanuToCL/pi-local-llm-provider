@@ -230,6 +230,19 @@ export interface WhatsappChannelOpts {
    * synthetic Buffer so they never need Baileys installed.
    */
   mediaDownloader?: WhatsappMediaDownloader;
+  /**
+   * Optional salted sender-id hasher (per Security BLESS-W1, v0.2.2).
+   * When provided, the channel uses this for the `sender_id_hash` field on
+   * audit rows + operator logs instead of the local non-salted `hashJid`.
+   * Production daemon wiring (IMPL-V2-C territory) hands down a closure
+   * that calls `AuditLog.senderIdHash(jid, installSalt)`.  When omitted
+   * (typical: tests + back-compat), the channel falls back to the local
+   * weak hash.  Either way the load-bearing privacy invariant ("raw jid
+   * never written to disk") is satisfied — only a hash is ever written.
+   * TODO(v0.3): remove the fallback once the daemon always wires the
+   * salted hasher.
+   */
+  senderIdHash?: (jid: string) => string;
 }
 
 // ---------------------------------------------------------------------------
@@ -446,6 +459,14 @@ export class WhatsappChannel implements Sink {
   private readonly inboundRateLimiter: InboundRateLimiter | undefined;
   private readonly inboundMediaStore: InboundMediaStore | undefined;
   private readonly mediaDownloader: WhatsappMediaDownloader;
+  /**
+   * Sender-id hasher used for `sender_id_hash` audit fields. Per Security
+   * BLESS-W1 (v0.2.2): operator-injected via `senderIdHash` opt to use the
+   * salted `AuditLog.senderIdHash`; when absent we fall back to the local
+   * weak `hashJid`. TODO(v0.3): remove fallback once daemon always wires
+   * the salted hasher.
+   */
+  private readonly senderIdHash: (jid: string) => string;
 
   private sock: WhatsappSocket | null = null;
   private connected = false;
@@ -493,6 +514,10 @@ export class WhatsappChannel implements Sink {
     this.inboundRateLimiter = opts.inboundRateLimiter;
     this.inboundMediaStore = opts.inboundMediaStore;
     this.mediaDownloader = opts.mediaDownloader ?? defaultBaileysDownload;
+    // Per Security BLESS-W1 (v0.2.2): prefer caller-supplied salted hasher;
+    // fall back to the local weak hash so existing tests and minimal-config
+    // callers continue to work.
+    this.senderIdHash = opts.senderIdHash ?? hashJid;
   }
 
   // -------------------------------------------------------------------------
@@ -926,7 +951,7 @@ export class WhatsappChannel implements Sink {
             event: "inbound_rate_limited",
             task_id: null,
             channel: "whatsapp",
-            sender_id_hash: hashJid(senderJid),
+            sender_id_hash: this.senderIdHash(senderJid),
             extra: { reason: verdict.reason },
           });
           continue;
@@ -939,7 +964,7 @@ export class WhatsappChannel implements Sink {
           event: "dm_only_reject",
           task_id: null,
           channel: "whatsapp",
-          sender_id_hash: hashJid(remoteJid),
+          sender_id_hash: this.senderIdHash(remoteJid),
           extra: { reason: "group_chat" },
         });
         continue;
@@ -950,7 +975,7 @@ export class WhatsappChannel implements Sink {
           event: "allowlist_reject",
           task_id: null,
           channel: "whatsapp",
-          sender_id_hash: hashJid(senderJid),
+          sender_id_hash: this.senderIdHash(senderJid),
           extra: { identity_model: this.identityModel },
         });
         continue;
@@ -960,10 +985,27 @@ export class WhatsappChannel implements Sink {
       if (!normalized) continue;
       const { inbound, media } = normalized;
 
-      this.operatorLogger?.debug("whatsapp_inbound", {
+      // Per v0.2.2 PRODUCTION-FINDINGS-2026-05-03 §6.4 + Integration BLESS:
+      // promoted from debug to info so dropped messages have a forensic
+      // trail ("did the channel see this?"). Per Security BLESS-B1, this
+      // line and the parallel audit row MUST contain ONLY message_type +
+      // sender_id_hash — NO content fields (no text, no preview, no
+      // inbound_msg_hash). `inbound.type` is the v1 enum value
+      // ("text" | "voice" | "image"); for documents the channel collapses
+      // to "image" but stamps `documentRef` on the payload, so the audit
+      // message_type stays in the v1 vocabulary.
+      const senderHash = this.senderIdHash(senderJid);
+      this.operatorLogger?.info("whatsapp_inbound", {
         message_type: inbound.type,
-        sender_id_hash: hashJid(senderJid),
+        sender_id_hash: senderHash,
       });
+      void this.audit({
+        event: "whatsapp_inbound",
+        task_id: null,
+        channel: "whatsapp",
+        sender_id_hash: senderHash,
+        extra: { message_type: inbound.type },
+      }).catch(() => undefined);
 
       const msgId = extractMessageId(msg);
 

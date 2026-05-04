@@ -130,6 +130,23 @@ const icons: Record<string, string> = {
   lock_engaged_reject: "🛡️",
   ipc_attach: "🔌",
   ipc_detach: "🔌",
+
+  // v0.2.2 — TaskState forensic / cyclicity events (IMPL-V2-A emits these via
+  // emitCasFailure + the suspiciously-fast guard + the restart-recovery path).
+  task_state_cas_failed: "🚧",
+  task_completed_suspiciously_fast: "⏱️",
+  task_state_recovered_on_restart: "♻️",
+
+  // v0.2.2 — channel-side inbound observability (IMPL-V2-B promotes these
+  // from debug→info per PRODUCTION-FINDINGS-2026-05-03 §6.4 so dropped
+  // messages have a forensic trail). NO content fields — sender_id_hash +
+  // message_type ONLY (Security BLESS-B1).
+  // `📥` chosen over `📱` to avoid collision with `tell_emit`.
+  telegram_inbound: "📥",
+  whatsapp_inbound: "💬",
+
+  // Per-sender / per-channel ingress rate limiting (FIX-B-3 Wave 8).
+  inbound_rate_limited: "🚦",
 };
 
 export function createOperatorLogger(options: OperatorLoggerOptions): OperatorLogger {
@@ -185,9 +202,14 @@ export function createOperatorLogger(options: OperatorLoggerOptions): OperatorLo
       const model = formatValue(fields.model) ?? "pi-mono default";
       const sessions = formatValue(fields.sessions) ?? "isolated";
       const extensions = formatValue(fields.extensions) ?? "0";
+      // Per UX BLESS-W6 + Observability BLESS-W8 (v0.2.2): footer line
+      // hints at diagnostic mode so an operator staring at the log can
+      // discover OPERATOR_LOG_LEVEL=debug without reading INSTALL.md.
+      // Padded to match the body-line width (54 chars between corners).
       write("╭─ pi-comms online ────────────────────────────────╮");
       write(`│ bot=${padRight(bot, 18)} mode=${padRight(mode, 8)} workers=${padRight(workers, 7)} │`);
       write(`│ model=${padRight(model, 17)} sessions=${padRight(sessions, 10)} ext=${padRight(extensions, 4)} │`);
+      write("│ tip: OPERATOR_LOG_LEVEL=debug for diagnostic mode    │");
       write("╰──────────────────────────────────────────────────╯");
     },
     info(event, fields) {
