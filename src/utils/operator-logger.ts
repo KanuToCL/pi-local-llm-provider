@@ -107,6 +107,7 @@ const icons: Record<string, string> = {
   studio_health_ok: "💚",
   studio_health_fail: "💔",
   studio_recovered: "💚",
+  studio_model_swap_detected: "🔄",
 
   // pi worker liveness
   pi_heartbeat: "💓",

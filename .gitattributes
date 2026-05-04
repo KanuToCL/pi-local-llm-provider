@@ -6,6 +6,6 @@
 # Belt-and-suspenders: explicit policy for prompt files specifically.
 prompts/*.txt text eol=lf
 
-# Same for shell scripts that get cargo-culted to Windows.
+# Shell scripts: LF for POSIX shells, CRLF for PowerShell (Windows-native).
 *.sh text eol=lf
 *.ps1 text eol=crlf

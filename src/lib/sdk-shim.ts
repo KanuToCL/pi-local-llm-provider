@@ -176,9 +176,13 @@ export async function loadSdk(): Promise<SdkLoaded> {
  *
  * Mapped kinds:
  *   - `message_end` (assistant turn) → wrap final assistant text into a
- *     synthetic `tell` ChannelEvent so the daemon can deliver it as the
- *     "framework auto-completion" reply (per plan §"Architectural revision
- *     (Option C)" — the framework, not the agent, owns the final reply).
+ *     `reply` ChannelEvent (no prefix; no urgency tag) — that IS the
+ *     conversation turn (per plan §"Architectural revision (Option C)" —
+ *     the framework, not the agent, owns the final reply). The text is
+ *     passed through `redactCredentialShapes` before emission to close
+ *     the credential-leak gap on the conversational path. See the
+ *     inline BUG-2026-05-03 comment in the implementation below for
+ *     full context.
  *   - tool_execution_end / tool_execution_start are NOT mapped to channels
  *     here; SessionManager logs them via the operator logger separately.
  *
