@@ -128,6 +128,31 @@ export const AuditEventType = z.enum([
   // forensic row BEFORE regenerating the salt so the audit trail records
   // what happened.
   "audit_log_corruption_detected",
+  // v0.2.2 — TaskState CAS-failure forensics (Architect/Data-Guardian/PE
+  // convergence).  Fires when a state-machine transition that should never
+  // legally fail under normal flow returns ok:false.  `extra.from` / `to` /
+  // `reason` / `context` carry the diagnostic.  `extra.task_id` (when
+  // available) carries the stuck task id.  Channel is "system" (daemon-
+  // internal bookkeeping).
+  "task_state_cas_failed",
+  // v0.2.2 — Premature-termination regression alarm (Observability BLESS-W1).
+  // Fires when a task_completed audit row's duration_ms < 100ms.  The v0.2.1
+  // bug class (IMPL-D-1's null-mapper-symmetry) produced duration_ms=7
+  // across all task rows; this audit catches future regressions before they
+  // ship.  `duration_ms` carries the actual measurement.
+  "task_completed_suspiciously_fast",
+  // v0.2.2 — Terminal-state-on-disk recovery (Adversarial re-bless NEW-2 +
+  // PE BLESS-B1).  Fires from daemon boot when restoreFromDisk finds a
+  // terminal state (completed/failed/cancelled) — indicates a crash between
+  // the terminal CAS and the idle flush.  `extra.prior_kind` + `task_id`
+  // identify the stuck task; post-incident review can correlate with
+  // channel-side delivery records.
+  "task_state_recovered_on_restart",
+  // v0.2.2 — Channel-side inbound observability promoted from debug→info
+  // (per Security BLESS-B1: NO content fields, ONLY message_type +
+  // sender_id_hash).  Per Files Touched table.
+  "telegram_inbound",
+  "whatsapp_inbound",
 ]);
 
 export type AuditEventType = z.infer<typeof AuditEventType>;

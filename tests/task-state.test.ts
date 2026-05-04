@@ -431,3 +431,191 @@ describe("TaskStateManager", () => {
     expect(persisted.kind).toBe("running");
   });
 });
+
+// ---------------------------------------------------------------------------
+// v0.2.2 — markTerminalAndIdle atomic primitive (Architect BLESS-B2 + DG B1).
+// ---------------------------------------------------------------------------
+
+describe("markTerminalAndIdle (v0.2.2 atomic primitive)", () => {
+  test("running → completed → idle in a single atomic call", async () => {
+    const mgr = new TaskStateManager();
+    mgr.tryTransition(running("T-OK"));
+    expect(mgr.get().kind).toBe("running");
+
+    const result = await mgr.markTerminalAndIdle({
+      kind: "completed",
+      taskId: "T-OK",
+      startedAt: 1_000,
+      finishedAt: 2_500,
+    });
+    expect(result.ok).toBe(true);
+    // Final resting state is `idle` — the terminal state was ephemeral.
+    expect(mgr.get().kind).toBe("idle");
+  });
+
+  test("running → failed → idle drains atomically", async () => {
+    const mgr = new TaskStateManager();
+    mgr.tryTransition(running("T-FAIL"));
+
+    const result = await mgr.markTerminalAndIdle({
+      kind: "failed",
+      taskId: "T-FAIL",
+      startedAt: 1_000,
+      finishedAt: 2_000,
+      error: "boom",
+    });
+    expect(result.ok).toBe(true);
+    expect(mgr.get().kind).toBe("idle");
+  });
+
+  test("backgrounded → cancelled → idle drains atomically", async () => {
+    const mgr = new TaskStateManager();
+    mgr.tryTransition(running("T-CAN"));
+    mgr.tryTransition(backgrounded("T-CAN", "auto"));
+
+    const result = await mgr.markTerminalAndIdle({
+      kind: "cancelled",
+      taskId: "T-CAN",
+      startedAt: 1_000,
+      cancelledAt: 4_000,
+      reason: "user",
+    });
+    expect(result.ok).toBe(true);
+    expect(mgr.get().kind).toBe("idle");
+  });
+
+  test("returns ok:false when terminal CAS fails (already in terminal state)", async () => {
+    const mgr = new TaskStateManager();
+    // Pre-condition: state is idle.  running → completed is the only legal
+    // first step; calling markTerminalAndIdle from idle directly is illegal
+    // (idle → completed not in transition table).
+    const result = await mgr.markTerminalAndIdle({
+      kind: "completed",
+      taskId: "T1",
+      startedAt: 1_000,
+      finishedAt: 2_000,
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toMatch(/invalid transition idle → completed/);
+    // State unchanged.
+    expect(mgr.get().kind).toBe("idle");
+  });
+
+  test("flush awaited before return (crash-window safety)", async () => {
+    const path = join(workDir, "task-state.json");
+    const mgr = new TaskStateManager({ persistencePath: path });
+    mgr.tryTransition(running("T-FLUSH"));
+
+    const before = Date.now();
+    await mgr.markTerminalAndIdle({
+      kind: "completed",
+      taskId: "T-FLUSH",
+      startedAt: 1_000,
+      finishedAt: 2_000,
+    });
+    void before; // tracked for clarity even if not asserted
+
+    // Re-instantiate a fresh manager pointing at the same file.  The on-disk
+    // state should be `idle` (NOT `completed`) because markTerminalAndIdle
+    // awaited the idle-flush before returning.
+    const m2 = new TaskStateManager({ persistencePath: path });
+    const restore = await m2.restoreFromDisk();
+    await m2.flush();
+    expect(restore.priorState.kind).toBe("idle");
+    expect(restore.recovered).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.2.2 — restoreFromDisk handles terminal states (Adversarial BLESS-B4 +
+// PE BLESS-B1 + Adversarial re-bless NEW-2/NEW-4/NEW-8).
+// ---------------------------------------------------------------------------
+
+describe("restoreFromDisk terminal-state recovery (v0.2.2)", () => {
+  test("completed state on disk → recovered.priorKind='completed' + state forced idle", async () => {
+    const path = join(workDir, "task-state.json");
+    const m1 = new TaskStateManager({ persistencePath: path });
+    m1.tryTransition(running("T-CRASH-1"));
+    m1.tryTransition(completed("T-CRASH-1"));
+    await m1.flush();
+
+    const m2 = new TaskStateManager({ persistencePath: path });
+    const restore = await m2.restoreFromDisk();
+    await m2.flush();
+
+    // priorState field PRESERVED per Adversarial re-bless NEW-4.
+    expect(restore.priorState.kind).toBe("completed");
+    expect(restore.abandoned).toBeNull();
+    // NEW field per Adversarial re-bless NEW-8 (RecoveredTaskInfo).
+    expect(restore.recovered).not.toBeNull();
+    expect(restore.recovered!.taskId).toBe("T-CRASH-1");
+    expect(restore.recovered!.priorKind).toBe("completed");
+    // State drained to idle so daemon can accept new work.
+    expect(m2.get().kind).toBe("idle");
+  });
+
+  test("failed state on disk → recovered.priorKind='failed'", async () => {
+    const path = join(workDir, "task-state.json");
+    const m1 = new TaskStateManager({ persistencePath: path });
+    m1.tryTransition(running("T-CRASH-2"));
+    m1.tryTransition(failed("T-CRASH-2"));
+    await m1.flush();
+
+    const m2 = new TaskStateManager({ persistencePath: path });
+    const restore = await m2.restoreFromDisk();
+    await m2.flush();
+
+    expect(restore.priorState.kind).toBe("failed");
+    expect(restore.abandoned).toBeNull();
+    expect(restore.recovered).not.toBeNull();
+    expect(restore.recovered!.taskId).toBe("T-CRASH-2");
+    expect(restore.recovered!.priorKind).toBe("failed");
+    expect(m2.get().kind).toBe("idle");
+  });
+
+  test("cancelled state on disk → recovered.priorKind='cancelled'", async () => {
+    const path = join(workDir, "task-state.json");
+    const m1 = new TaskStateManager({ persistencePath: path });
+    m1.tryTransition(running("T-CRASH-3"));
+    m1.tryTransition(cancelled("T-CRASH-3", "user"));
+    await m1.flush();
+
+    const m2 = new TaskStateManager({ persistencePath: path });
+    const restore = await m2.restoreFromDisk();
+    await m2.flush();
+
+    expect(restore.priorState.kind).toBe("cancelled");
+    expect(restore.abandoned).toBeNull();
+    expect(restore.recovered).not.toBeNull();
+    expect(restore.recovered!.taskId).toBe("T-CRASH-3");
+    expect(restore.recovered!.priorKind).toBe("cancelled");
+    expect(m2.get().kind).toBe("idle");
+  });
+
+  test("idle state on disk → recovered=null + abandoned=null (existing contract preserved)", async () => {
+    const path = join(workDir, "task-state.json");
+    const mgr = new TaskStateManager({ persistencePath: path });
+    const restore = await mgr.restoreFromDisk();
+    expect(restore.priorState.kind).toBe("idle");
+    expect(restore.abandoned).toBeNull();
+    expect(restore.recovered).toBeNull();
+  });
+
+  test("running state on disk → abandoned set + recovered=null (existing crash-recovery preserved)", async () => {
+    const path = join(workDir, "task-state.json");
+    const m1 = new TaskStateManager({ persistencePath: path });
+    m1.tryTransition(running("T-MID-FLIGHT", "telegram"));
+    await m1.flush();
+
+    const m2 = new TaskStateManager({ persistencePath: path });
+    const restore = await m2.restoreFromDisk();
+    await m2.flush();
+
+    expect(restore.priorState.kind).toBe("running");
+    // abandoned still fires for running/backgrounded — that pathway unchanged.
+    expect(restore.abandoned).not.toBeNull();
+    expect(restore.abandoned!.taskId).toBe("T-MID-FLIGHT");
+    // recovered is null — terminal-state recovery is mutually exclusive.
+    expect(restore.recovered).toBeNull();
+  });
+});

@@ -170,6 +170,23 @@ export interface AbandonedTask {
   startedAt: number;
 }
 
+/**
+ * Detail bundle for a task that was found in a TERMINAL state (completed/
+ * failed/cancelled) on disk. Per v0.2.2 contract change: terminal states are
+ * EPHEMERAL markers that should never persist long-term — `markTerminalAndIdle`
+ * awaits the idle-flush before returning. If `restoreFromDisk` finds a
+ * terminal state on disk, it indicates a crash between the terminal CAS and
+ * the idle flush. The caller (daemon boot) emits a
+ * `task_state_recovered_on_restart` audit event with the prior taskId so
+ * post-incident review can correlate with channel-side delivery records.
+ *
+ * Defined per Adversarial re-bless NEW-8.
+ */
+export interface RecoveredTaskInfo {
+  taskId: string;
+  priorKind: "completed" | "failed" | "cancelled";
+}
+
 /** Outcome of `restoreFromDisk`. */
 export interface RestoreResult {
   /** The state the manager was in before the boot (raw, post-deserialize). */
@@ -181,6 +198,16 @@ export interface RestoreResult {
    * or `idle`.
    */
   abandoned: AbandonedTask | null;
+  /**
+   * v0.2.2: set when the prior state was a TERMINAL state
+   * (completed/failed/cancelled).  Indicates a crash between the terminal
+   * CAS and the idle flush.  The user MAY have received the reply (subscriber
+   * fanOut fires before prompt() resolves) or may not.  Daemon caller emits
+   * `task_state_recovered_on_restart` audit event so post-incident review can
+   * correlate with channel-side delivery records.  `null` when the prior
+   * state was `idle`, `running`, `backgrounded`, or absent/corrupt.
+   */
+  recovered: RecoveredTaskInfo | null;
 }
 
 export interface TaskStateManagerOpts {
@@ -259,9 +286,60 @@ export class TaskStateManager {
    * and at shutdown. In production, the daemon does NOT need to wait
    * on every write — the `JsonStore` queues internally — but flushing
    * before exit avoids losing the final state-transition write.
+   *
+   * Per Adversarial re-bless NEW-5: USED by `markTerminalAndIdle` for
+   * crash-window safety.  Errors propagate (no swallow) — disk-full or IO
+   * errors during terminal-state flush should be loud (caller can audit-log).
    */
   async flush(): Promise<void> {
     await this.pendingWrite;
+  }
+
+  /**
+   * Atomic terminal-and-idle transition: writes the terminal state to disk
+   * (for audit-trail purposes), then immediately writes idle to disk so the
+   * state machine returns to its single resting state. Both writes go through
+   * JsonStore's serial queue (FIFO-guaranteed), and we await the IDLE write
+   * to flush before returning so a crash post-call cannot leave the daemon
+   * trapped in a terminal state.
+   *
+   * This is the SINGLE PATH to a terminal state in v0.2.2. Every caller
+   * (handleInbound's mark helpers, watchdog, /cancel) MUST use this. The
+   * cyclicity guard at handleInbound entry is defense-in-depth only.
+   *
+   * Returns the original CAS result so callers can audit-log + react. If
+   * the terminal CAS fails (e.g., race with another terminator), returns
+   * { ok: false, reason } and does NOT attempt the idle CAS.
+   *
+   * Per Architect BLESS-B2 + Data Guardian BLESS-B1: instead of every
+   * consumer doing the running→completed→idle two-step dance with crash-
+   * window vulnerability, the state machine itself owns the invariant.
+   */
+  async markTerminalAndIdle(
+    terminal: TaskState & { kind: "completed" | "failed" | "cancelled" },
+  ): Promise<TransitionResult> {
+    const terminalResult = this.tryTransition(terminal);
+    if (!terminalResult.ok) {
+      return terminalResult;
+    }
+
+    // Idle CAS: should always succeed (terminal → idle is in transition table).
+    // If it doesn't, something has gone deeply wrong; return the failure
+    // so the caller can audit-log it as a state-machine inconsistency.
+    const idleResult = this.tryTransition({ kind: "idle" });
+    if (!idleResult.ok) {
+      return idleResult;
+    }
+
+    // Crash-window safety: await the idle write to flush before returning.
+    // Without this, a crash between the in-memory CAS and the JsonStore
+    // write leaves disk in `terminal` state, which the cyclicity guard at
+    // handleInbound entry can recover from but produces audit-trail noise.
+    // Per Data Guardian BLESS-B1.  Per Adversarial re-bless NEW-5: USE the
+    // EXISTING flush() method (line above).  Errors propagate (no swallow).
+    await this.flush();
+
+    return { ok: true };
   }
 
   /**
@@ -270,26 +348,49 @@ export class TaskStateManager {
    * BEFORE accepting any inbound work.
    *
    * Behavior:
-   *   - Missing/corrupt file → priorState=idle, abandoned=null. Safe to
-   *     proceed.
-   *   - `idle` / `completed` / `cancelled` / `failed` persisted →
-   *     priorState=that, abandoned=null. (Terminal states drain to idle
-   *     so we accept new work.)
+   *   - Missing/corrupt file → priorState=idle, abandoned=null,
+   *     recovered=null. Safe to proceed.
+   *   - `idle` persisted → priorState=that, abandoned=null, recovered=null.
    *   - `running` / `backgrounded` persisted → priorState=that,
    *     abandoned={taskId, channel, userMessage, startedAt}. The daemon
    *     SHOULD emit a `task_abandoned_on_restart` audit event and a
    *     `tell()` to the originating channel.
+   *   - `completed` / `cancelled` / `failed` persisted →
+   *     priorState=that, recovered={taskId, priorKind}.
+   *
+   * Pre-v0.2.2: terminal states (completed/failed/cancelled) on disk meant
+   * "task ran cleanly to completion before previous shutdown." Drained to idle
+   * silently.
+   *
+   * v0.2.2 contract change: terminal states are EPHEMERAL markers that should
+   * never persist long-term — `markTerminalAndIdle` awaits the idle-flush
+   * before returning. If we find a terminal state on disk, it indicates a
+   * crash between the terminal CAS and the idle flush. The user MAY have
+   * received the reply (subscriber fanOut fires before prompt() resolves) or
+   * may not. Caller emits `task_state_recovered_on_restart` audit event with
+   * the prior taskId so post-incident review can correlate with channel-side
+   * delivery records.
    *
    * Always sets `this.state = idle` regardless of prior state.
+   *
+   * Per Adversarial re-bless NEW-4: PRESERVE the existing `priorState` field
+   * in RestoreResult — callers (session.ts:321 + tests/task-state.test.ts)
+   * depend on it. `recovered` is a NEW field added in v0.2.2; priorState is
+   * NOT removed.
    */
   async restoreFromDisk(): Promise<RestoreResult> {
     if (!this.store) {
       // No persistence configured — boot fresh.
-      return { priorState: { kind: "idle" }, abandoned: null };
+      return {
+        priorState: { kind: "idle" },
+        abandoned: null,
+        recovered: null,
+      };
     }
     const raw = await this.store.read();
     const priorState = deserialize(raw);
     let abandoned: AbandonedTask | null = null;
+    let recovered: RecoveredTaskInfo | null = null;
     if (priorState.kind === "running" || priorState.kind === "backgrounded") {
       abandoned = {
         taskId: priorState.taskId,
@@ -297,6 +398,15 @@ export class TaskStateManager {
         userMessage: priorState.userMessage,
         startedAt: priorState.startedAt,
       };
+    } else if (
+      priorState.kind === "completed" ||
+      priorState.kind === "cancelled" ||
+      priorState.kind === "failed"
+    ) {
+      // v0.2.2: terminal state on disk = crash between terminal CAS and
+      // idle flush.  Caller (daemon boot) emits
+      // `task_state_recovered_on_restart` audit event.
+      recovered = { taskId: priorState.taskId, priorKind: priorState.kind };
     }
     // Force the manager to a usable starting state. Only persist if the
     // prior on-disk state actually differed from `idle` — avoids
@@ -306,7 +416,7 @@ export class TaskStateManager {
     if (this.store && priorState.kind !== "idle") {
       this.pendingWrite = this.store.write(serialize(this.state));
     }
-    return { priorState, abandoned };
+    return { priorState, abandoned, recovered };
   }
 }
 
