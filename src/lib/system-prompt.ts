@@ -2,8 +2,10 @@
  * Compose the daemon's system prompt at boot time.
  *
  * Inputs:
- *   - basePromptPath: SHA-pinned base prompt (IMPL-5 owns
- *     `prompts/coding-agent.v1.txt`).
+ *   - basePromptPath: SHA-pinned base prompt (default
+ *     `prompts/coding-agent.v2.txt`; v1 was deleted in pi-comms v0.2.1
+ *     per Ring-of-Elders Triangle convergence — see
+ *     `tests/system-prompt.test.ts` SHA-pin discipline).
  *   - pointerPath: optional status-pointer file. Read best-effort: if it
  *     does not exist, is unreadable, or contains nothing useful, the
  *     pointer block is silently omitted (per plan §"Pitfall #9 corrupt-

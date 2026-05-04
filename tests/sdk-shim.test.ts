@@ -66,20 +66,27 @@ describe("mapAgentEventToChannelEvent — message_end → reply", () => {
     expect(out).toBeNull();
   });
 
-  test("returns null when text is whitespace-only", () => {
+  test("returns null when text is whitespace-only; logs reason='empty_text'", () => {
+    const debug = vi.fn();
     const out = mapAgentEventToChannelEvent(
       {
         type: "message_end",
         message: { role: "assistant", content: [{ type: "text", text: "   \n  " }] },
       },
-      { now: () => 1 },
+      { now: () => 1, logger: { debug } },
     );
     expect(out).toBeNull();
+    expect(debug).toHaveBeenCalledWith("framework_reply_dropped", { reason: "empty_text" });
   });
 
-  test("returns null when message field undefined", () => {
-    const out = mapAgentEventToChannelEvent({ type: "message_end" }, { now: () => 1 });
+  test("returns null when message field undefined; logs reason='no_message'", () => {
+    const debug = vi.fn();
+    const out = mapAgentEventToChannelEvent(
+      { type: "message_end" },
+      { now: () => 1, logger: { debug } },
+    );
     expect(out).toBeNull();
+    expect(debug).toHaveBeenCalledWith("framework_reply_dropped", { reason: "no_message" });
   });
 
   test("rejects non-assistant role (defensive)", () => {

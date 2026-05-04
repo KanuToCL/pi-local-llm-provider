@@ -229,6 +229,10 @@ export function mapAgentEventToChannelEvent(
   // bug has a forensic trail.
   if (kind === "message_end") {
     const message = evt.message as Record<string, unknown> | undefined;
+    if (!message) {
+      options.logger?.debug("framework_reply_dropped", { reason: "no_message" });
+      return null;
+    }
     const text = extractAssistantText(message);
     if (!text) {
       options.logger?.debug("framework_reply_dropped", { reason: "empty_text" });
