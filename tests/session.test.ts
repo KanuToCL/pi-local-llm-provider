@@ -800,7 +800,11 @@ describe("SessionManager.dispose()", () => {
 // ---------------------------------------------------------------------------
 
 describe("mapAgentEventToChannelEvent", () => {
-  test("maps message_end with assistant text → tell{urgency:done}", () => {
+  // BUG-2026-05-03 fix (plan v2 IMPL-B mapper change, commit 53fe7b0):
+  // mapper now emits `reply` (no urgency) instead of `tell{urgency:"done"}`
+  // for message_end. The Telegram channel formatter prefixed every `tell`
+  // with `📱`, which is why reply needed its own ChannelEvent variant.
+  test("maps message_end with assistant text → reply (no urgency, no prefix)", () => {
     const piEvent = {
       type: "message_end",
       message: {
@@ -812,9 +816,8 @@ describe("mapAgentEventToChannelEvent", () => {
     };
     const ce = mapAgentEventToChannelEvent(piEvent);
     expect(ce).not.toBeNull();
-    expect(ce!.type).toBe("tell");
-    if (ce!.type === "tell") {
-      expect(ce!.urgency).toBe("done");
+    expect(ce!.type).toBe("reply");
+    if (ce!.type === "reply") {
       expect(ce!.text).toBe("all done");
     }
   });
@@ -860,7 +863,7 @@ describe("mapAgentEventToChannelEvent", () => {
       message: { role: "assistant", content: "compact reply" },
     });
     expect(ce).not.toBeNull();
-    if (ce && ce.type === "tell") expect(ce.text).toBe("compact reply");
+    if (ce && ce.type === "reply") expect(ce.text).toBe("compact reply");
   });
 });
 

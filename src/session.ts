@@ -119,7 +119,11 @@ export interface SessionManagerOpts {
   sinks: SessionSinks;
   /** GPU-bound serializer. Defaults to a fresh `GlobalQueue` if omitted. */
   globalQueue?: GlobalQueue;
-  /** Path to the SHA-pinned base prompt. Defaults to `prompts/coding-agent.v1.txt`. */
+  /** Path to the SHA-pinned base prompt. Defaults to `prompts/coding-agent.v2.txt`
+   *  (v2 added the explicit Default Response Mode rule for small models that
+   *  treat every available tool as something they MUST call — see plan v2
+   *  Phase A). The default flips with every prompt rev; bump the v-number and
+   *  the SHA pin in `tests/system-prompt.test.ts` together. */
   basePromptPath?: string;
   /**
    * Optional callback fired whenever pi-mono shows life — at message_start /
@@ -303,7 +307,7 @@ export class SessionManager {
     // pi-mono on this boot.
     const promptText = composeSystemPrompt({
       basePromptPath:
-        this.opts.basePromptPath ?? "prompts/coding-agent.v1.txt",
+        this.opts.basePromptPath ?? "prompts/coding-agent.v2.txt",
       pointerPath: this.opts.pointerPath,
       pointerSizeCap: this.opts.pointerSizeCap ?? 2000,
     });
@@ -779,15 +783,35 @@ export class SessionManager {
         return;
       }
 
+      // Adapt OperatorLogger.debug (Record<string, LogValue>) to the mapper's
+      // looser Record<string, unknown> shape — the mapper field set is small
+      // and known-scalar (text_length: number, redaction_applied: boolean,
+      // reason: string) so widening to LogValue at the boundary is safe.
+      const opLogger = this.opts.operatorLogger;
+      const mapperLogger = opLogger
+        ? {
+            debug: (msg: string, fields?: Record<string, unknown>) => {
+              opLogger.debug(
+                msg,
+                fields as Record<string, string | number | boolean> | undefined,
+              );
+            },
+          }
+        : undefined;
       const channelEvent = mapAgentEventToChannelEvent(rawEvent, {
         now: this.now,
+        logger: mapperLogger,
       });
       if (!channelEvent) {
-        // Side effect: framework-completion gating. If the underlying event
-        // is `agent_end`, mark the task complete in TaskState so subsequent
-        // inbounds can run.
+        // Symmetric terminal-event handling (Round 2 Architect+Adversarial
+        // convergence): both `agent_end` AND `message_end` are terminal
+        // markers from pi-mono's perspective.  Handling `message_end` here
+        // (in addition to `agent_end`) closes the empty-text stuck-task
+        // hole that was the §5.1 production symptom — when the assistant
+        // message has no text content the mapper returns null, and without
+        // this branch the task would stay `running` forever.
         const evt = rawEvent as Record<string, unknown> | null;
-        if (evt && evt.type === "agent_end") {
+        if (evt && (evt.type === "agent_end" || evt.type === "message_end")) {
           this.markTaskCompleted();
         }
         return;
@@ -801,11 +825,11 @@ export class SessionManager {
       if (this.opts.sinks.telegram) sinkBag.telegram = this.opts.sinks.telegram;
       void fanOut(sinkBag as SinkBag, channelEvent).catch(() => undefined);
 
-      // After successful framework-completion fan-out, transition the task
-      // to completed (if we were running/backgrounded). This is the analog
-      // of the agent_end side-effect above — message_end can also be the
-      // terminal event in some pi-mono builds.
-      if (channelEvent.type === "tell" && channelEvent.urgency === "done") {
+      // Belt-and-suspenders: when reply landed AND no agent_end fires (some
+      // pi-mono builds emit message_end as the only terminal event), still
+      // mark complete.  Idempotent vs the null-mapper branch above thanks
+      // to markTaskCompleted's CAS guard inside taskState.tryTransition.
+      if (channelEvent.type === "reply") {
         this.markTaskCompleted();
       }
     });
@@ -813,7 +837,17 @@ export class SessionManager {
 
   /**
    * Mark the in-flight task as completed (idempotent w.r.t. terminal states).
-   * Called from event-stream side effects (agent_end / message_end-as-tell).
+   *
+   * Called from event-stream side effects:
+   *   - `agent_end` event (pi-mono full-loop completion).
+   *   - `message_end` event with NO mapped channel event (empty-text turn —
+   *     the plan v2 IMPL-D Round 2 convergence on the null-mapper symmetry
+   *     hole that was the §5.1 production stuck-task symptom).
+   *   - Mapped `reply` ChannelEvent (some pi-mono builds emit message_end as
+   *     the only terminal event; the belt-and-suspenders mirror).
+   *
+   * The task-state CAS guard (in taskState.tryTransition) makes this safe to
+   * call multiple times for the same task — only the first call wins.
    */
   private markTaskCompleted(): void {
     const state = this.opts.taskState.get();
