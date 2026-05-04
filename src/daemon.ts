@@ -369,6 +369,9 @@ async function bootAfterLock(
       fetchFn,
       logger: operatorLogger,
     });
+    operatorLogger.info("studio_swap_detection_armed", {
+      baseline_model: coldStartModelId,
+    });
   }
 
   // 7. Sandbox policy: load persisted state then unconditionally force-engage
@@ -494,6 +497,17 @@ async function bootAfterLock(
               fetchFn,
             })
         : undefined,
+    ...(coldStartStudioUrl && coldStartModelId
+      ? {
+          coldStartModelId,
+          getStudioLoadedModelIds: () =>
+            getStudioLoadedModelIds({
+              baseUrl: coldStartStudioUrl as string,
+              apiKey: config.unslothApiKey,
+              fetchFn,
+            }),
+        }
+      : {}),
   });
 
   if (!testMode) {
@@ -1443,28 +1457,61 @@ interface StudioProbeOpts {
   fetchFn: typeof fetch;
 }
 
+/**
+ * Lightweight "what models are loaded in Studio right now" probe.
+ *
+ * Used by SessionManager.checkForStudioModelSwap (per-inbound, fire-and-forget).
+ * Hardening per PE Skeptic W5: explicit AbortSignal.timeout(2000) so a hung
+ * Studio doesn't pile up phantom requests in the daemon's event loop.
+ *
+ * Returns the loaded[] array verbatim (typically length 1, but Studio
+ * supports multi-load) or null on any failure (timeout, network, parse).
+ * Never throws.
+ */
+export async function getStudioLoadedModelIds(opts: {
+  baseUrl: string;
+  apiKey: string;
+  fetchFn?: typeof fetch;
+  timeoutMs?: number;
+}): Promise<readonly string[] | null> {
+  const fetchFn = opts.fetchFn ?? fetch;
+  const timeoutMs = opts.timeoutMs ?? 2000;
+  try {
+    // Strip /v1 suffix if present — /api/inference/status lives at Studio root,
+    // not under /v1.  Matches the existing pattern in waitForStudioModelLoaded
+    // and probeStudioModelLoaded.
+    const root = opts.baseUrl.replace(/\/v1\/?$/, "");
+    const url = `${root}/api/inference/status`;
+    const res = await fetchFn(url, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${opts.apiKey}` },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!res.ok) return null;
+    const body = (await res.json()) as { loaded?: unknown };
+    if (!Array.isArray(body.loaded)) return null;
+    return body.loaded.filter(
+      (s): s is string => typeof s === "string" && s.length > 0,
+    );
+  } catch {
+    // SECURITY: do NOT log the caught error — fetch error chains may include
+    // URL+method but we keep silence to avoid any chance of accidentally
+    // serializing the Authorization header out of an undici internal field.
+    // Per Security Elder W2.
+    return null;
+  }
+}
+
 async function probeStudioModelLoaded(
   opts: StudioProbeOpts,
 ): Promise<boolean> {
-  const root = opts.baseUrl.replace(/\/v1\/?$/, "");
-  const statusUrl = `${root}/api/inference/status`;
-  try {
-    const res = await opts.fetchFn(statusUrl, {
-      method: "GET",
-      headers: { Authorization: `Bearer ${opts.apiKey}` },
-    });
-    if (!res.ok) return false;
-    const body = (await res.json().catch(() => ({}))) as Record<
-      string,
-      unknown
-    >;
-    const loaded = Array.isArray(body.loaded)
-      ? (body.loaded as unknown[]).map((v) => String(v))
-      : [];
-    return opts.modelId === AUTO_MODEL ? loaded.length > 0 : loaded.includes(opts.modelId);
-  } catch {
-    return false;
-  }
+  const ids = await getStudioLoadedModelIds({
+    baseUrl: opts.baseUrl,
+    apiKey: opts.apiKey,
+    fetchFn: opts.fetchFn,
+  });
+  if (ids === null) return false;
+  return opts.modelId === AUTO_MODEL ? ids.length > 0 : ids.includes(opts.modelId);
 }
 
 /**
