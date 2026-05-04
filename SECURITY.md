@@ -144,6 +144,22 @@ per-channel cooldown limit operator-visible spam.
 v0.3 followup: per-prompt hard ceiling (taskMaxDurationMs config) that
 overrides watchdog reset semantics for truly long single tasks.
 
+**Operator-side detection.** Grep `~/.pi-comms/audit/audit-YYYY-MM-DD.jsonl`
+for `task_completed` rows with `duration_ms > 60_000` (anything over a
+minute is unusual for a normal turn). Alert if N consecutive long tasks
+come from the same `channel` + `sender_id_hash`. Example one-liner:
+
+```
+jq -c 'select(.event=="task_completed" and .duration_ms > 60000) |
+  {ts, task_id, channel, sender_id_hash, duration_ms}' \
+  ~/.pi-comms/audit/audit-*.jsonl | sort -k2
+```
+
+The audit schema supports this query out-of-the-box (sender_id_hash is
+salted; channel is in the closed enum). v0.3 will add a per-prompt hard
+ceiling (`taskMaxDurationMs`) that makes this detection unnecessary, but
+until then the operator-side grep is the canonical mitigation.
+
 ---
 
 ## What this repo does about R2 specifically

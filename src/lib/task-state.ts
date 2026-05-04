@@ -412,9 +412,18 @@ export class TaskStateManager {
     // prior on-disk state actually differed from `idle` — avoids
     // gratuitous I/O on every cold boot and avoids a tempdir-race in
     // tests where the workDir is removed before the queued write runs.
+    //
+    // Per Architect BLESS N3: AWAIT the idle-flush before returning.
+    // Without this await, a daemon that boots, finds `completed` on
+    // disk, audits the recovery row, then crashes BEFORE the queued
+    // idle write lands would on next boot find `completed` AGAIN and
+    // emit another duplicate `task_state_recovered_on_restart` row for
+    // the same taskId. Awaiting the existing flush() makes the
+    // recovery fully durable before restoreFromDisk returns.
     this.state = { kind: "idle" };
     if (this.store && priorState.kind !== "idle") {
       this.pendingWrite = this.store.write(serialize(this.state));
+      await this.flush();
     }
     return { priorState, abandoned, recovered };
   }
