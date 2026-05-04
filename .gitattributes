@@ -1,0 +1,11 @@
+# Force LF line endings for all text files. Specifically guarantees that the
+# system-prompt SHA pin computed on macOS (LF) matches the SHA computed on
+# Windows (which would otherwise checkout CRLF) — see PRODUCTION-FINDINGS-2026-05-03.md §3 row B.
+* text=auto eol=lf
+
+# Belt-and-suspenders: explicit policy for prompt files specifically.
+prompts/*.txt text eol=lf
+
+# Same for shell scripts that get cargo-culted to Windows.
+*.sh text eol=lf
+*.ps1 text eol=crlf
