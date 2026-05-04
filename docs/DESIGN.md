@@ -23,9 +23,11 @@ Use **pi-mono** (terminal coding-agent harness — `read`, `write`, `edit`, `bas
 
 **Why bother:**
 - **Craftsmanship** — own the whole stack
-- **Privacy** — code never leaves the box
+- **Privacy** — code never leaves the box by default
 - **Single-daemon ergonomics** — one local LLM server can drive multiple surfaces (pi for code, custom Gradio UIs for domain work, scripts)
 - **Subscription-optional** — not subscription-replacement, but the option to step out for a week without losing your IDE
+
+**v2 horizon — hybrid local+cloud escalation:** the local-first default doesn't have to be a ceiling. When the user judges pi is stuck, they can send `/consult claude` (or any configured provider) from Telegram and get a targeted nudge from a frontier model without abandoning the local session. The cloud sees only what's needed to unblock the task; pi picks up the answer and continues. Pi never escalates autonomously — the decision to send data to a third party always belongs to the user. Privacy is preserved by default (preview + confirm before anything leaves the box) and cloud usage stays optional and audited. This keeps the "subscription-optional" promise intact while eliminating the frustrating ceiling of "local model can't figure this out, context-switch to Claude." See `V5-G` in `docs/plans/pi_comms_daemon.plan.md` for design requirements.
 
 **Why this might NOT work:** see §3. If the chosen backend doesn't emit OpenAI-shaped `tool_calls[]` for the model in question, pi-mono cannot parse the calls and the whole agent loop collapses silently. The probe settles this empirically before you commit.
 
@@ -210,6 +212,7 @@ This repo deliberately does NOT address:
 - Tier 2 upstream pi-mono PR (premature — see §2.4 and `RFC.md`)
 - Fixing pi-mono's two upstream data-layer bugs (literal env-var name leaked as bearer token; `/share` no-redact for tool outputs) — these would be separate PRs
 - Sandbox / containerization for pi's `bash` tool (R4 mitigation is operator discipline, not code)
+- Cloud escalation (`/consult`) — tracked as V5-G; explicitly out of scope for v1; no cloud calls are made without user opt-in
 
 ---
 

@@ -362,10 +362,10 @@ async function bootAfterLock(
     const studioUrl = extractStudioBaseUrl(modelsJson, config.piCommsDefaultModel);
     assertLoopbackUrl(studioUrl);
     coldStartStudioUrl = studioUrl;
-    coldStartModelId = extractModelId(config.piCommsDefaultModel);
-    await waitForStudioModelLoaded({
+    coldStartModelId = await waitForStudioModelLoaded({
       baseUrl: studioUrl,
-      modelId: coldStartModelId,
+      modelId: extractModelId(config.piCommsDefaultModel),
+      apiKey: config.unslothApiKey,
       fetchFn,
       logger: operatorLogger,
     });
@@ -490,6 +490,7 @@ async function bootAfterLock(
             probeStudioModelLoaded({
               baseUrl: coldStartStudioUrl as string,
               modelId: coldStartModelId as string,
+              apiKey: config.unslothApiKey,
               fetchFn,
             })
         : undefined,
@@ -1337,6 +1338,7 @@ export function assertLoopbackUrl(rawUrl: string): void {
 interface StudioWaitOpts {
   baseUrl: string;
   modelId: string;
+  apiKey: string;
   fetchFn: typeof fetch;
   logger: OperatorLogger;
 }
@@ -1347,20 +1349,28 @@ interface StudioWaitOpts {
  * not loaded" diagnostic if the port responds but the model isn't there.
  * Times out after 5 minutes total.
  */
-async function waitForStudioModelLoaded(opts: StudioWaitOpts): Promise<void> {
+// When PI_COMMS_DEFAULT_MODEL ends with "/auto", the daemon accepts whatever
+// model Studio currently has loaded rather than requiring a specific ID.
+const AUTO_MODEL = "auto";
+
+async function waitForStudioModelLoaded(opts: StudioWaitOpts): Promise<string> {
   const deadline = Date.now() + STUDIO_MODEL_WAIT_MS;
   // The /api/inference/status endpoint lives at the Studio root, not under
   // /v1. baseUrl is typically "http://localhost:8888/v1"; trim that suffix
   // before composing.
   const root = opts.baseUrl.replace(/\/v1\/?$/, "");
   const statusUrl = `${root}/api/inference/status`;
+  const isAuto = opts.modelId === AUTO_MODEL;
 
   let attempt = 0;
   let lastError: string | null = null;
   while (Date.now() < deadline) {
     attempt += 1;
     try {
-      const res = await opts.fetchFn(statusUrl, { method: "GET" });
+      const res = await opts.fetchFn(statusUrl, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${opts.apiKey}` },
+      });
       if (!res.ok) {
         lastError = `HTTP ${res.status}`;
         opts.logger.error("studio_health_fail", {
@@ -1375,16 +1385,20 @@ async function waitForStudioModelLoaded(opts: StudioWaitOpts): Promise<void> {
         const loaded = Array.isArray(body.loaded)
           ? (body.loaded as unknown[]).map((v) => String(v))
           : [];
-        if (loaded.includes(opts.modelId)) {
+        const matched = isAuto ? loaded[0] : (loaded.includes(opts.modelId) ? opts.modelId : undefined);
+        if (matched) {
           opts.logger.info("studio_health_ok", {
             attempt,
-            model: opts.modelId,
+            model: matched,
+            ...(isAuto && { auto_detected: true }),
           });
-          return;
+          return matched;
         }
-        lastError = `studio up, model '${opts.modelId}' not loaded (loaded=${
-          loaded.length === 0 ? "none" : loaded.join(",")
-        })`;
+        lastError = isAuto
+          ? "studio up, no model loaded yet"
+          : `studio up, model '${opts.modelId}' not loaded (loaded=${
+              loaded.length === 0 ? "none" : loaded.join(",")
+            })`;
         opts.logger.error("studio_health_fail", {
           attempt,
           reason: "model_not_loaded",
@@ -1425,6 +1439,7 @@ function sleep(ms: number): Promise<void> {
 interface StudioProbeOpts {
   baseUrl: string;
   modelId: string;
+  apiKey: string;
   fetchFn: typeof fetch;
 }
 
@@ -1434,7 +1449,10 @@ async function probeStudioModelLoaded(
   const root = opts.baseUrl.replace(/\/v1\/?$/, "");
   const statusUrl = `${root}/api/inference/status`;
   try {
-    const res = await opts.fetchFn(statusUrl, { method: "GET" });
+    const res = await opts.fetchFn(statusUrl, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${opts.apiKey}` },
+    });
     if (!res.ok) return false;
     const body = (await res.json().catch(() => ({}))) as Record<
       string,
@@ -1443,7 +1461,7 @@ async function probeStudioModelLoaded(
     const loaded = Array.isArray(body.loaded)
       ? (body.loaded as unknown[]).map((v) => String(v))
       : [];
-    return loaded.includes(opts.modelId);
+    return opts.modelId === AUTO_MODEL ? loaded.length > 0 : loaded.includes(opts.modelId);
   } catch {
     return false;
   }
