@@ -167,6 +167,8 @@ pwsh scripts\install-windows-task.ps1
 
 Verify with `pi-comms doctor`.
 
+**If something seems broken**, see [Diagnostic mode](docs/INSTALL.md#diagnostic-mode) for `OPERATOR_LOG_LEVEL=debug` instructions.
+
 ---
 
 ## What this is NOT

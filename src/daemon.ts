@@ -718,13 +718,26 @@ async function bootAfterLock(
         /* abort signals are best-effort */
       }
       const cancelledAt = Date.now();
-      taskState.tryTransition({
+      // v0.2.2 (Adversarial BLESS-B6): use the atomic markTerminalAndIdle
+      // primitive instead of bare CAS. This drains cancelled → idle in a
+      // single awaited call, preventing the v0.2.1 silent-drop trap from
+      // re-emerging via the cancel path. Cancel races (e.g., the task
+      // completed via prompt() resolution between `cur` snapshot and this
+      // call) are EXPECTED — emit at debug level, not warn.
+      const result = await taskState.markTerminalAndIdle({
         kind: "cancelled",
         taskId: cur.taskId,
         startedAt: cur.startedAt,
         cancelledAt,
         reason: "user",
       });
+      if (!result.ok) {
+        operatorLogger.debug("task_state_cas_lost_race", {
+          context: "onCancelTask:markTerminalAndIdle",
+          task_id: cur.taskId,
+          reason: result.reason ?? "unknown",
+        });
+      }
       // Audit task_cancelled with duration_ms so post-incident review can
       // correlate cancel latency with downstream events.
       void auditLog
@@ -930,13 +943,24 @@ async function bootAfterLock(
             /* best-effort */
           }
           const cancelledAt = Date.now();
-          taskState.tryTransition({
+          // v0.2.2 (Adversarial BLESS-B6): use the atomic markTerminalAndIdle
+          // primitive instead of bare CAS. Cancel races during shutdown are
+          // EXPECTED (the in-flight task may resolve via prompt() between
+          // `cur` snapshot and this call) — emit at debug level, not warn.
+          const result = await taskState.markTerminalAndIdle({
             kind: "cancelled",
             taskId: cur.taskId,
             startedAt: cur.startedAt,
             cancelledAt,
             reason: "shutdown",
           });
+          if (!result.ok) {
+            operatorLogger.debug("task_state_cas_lost_race", {
+              context: "shutdown:markTerminalAndIdle",
+              task_id: cur.taskId,
+              reason: result.reason ?? "unknown",
+            });
+          }
           void auditLog
             .append({
               event: "task_cancelled",

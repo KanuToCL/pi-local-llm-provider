@@ -334,6 +334,50 @@ plist / unit / task XML.
 
 ---
 
+## Diagnostic mode
+
+If you're debugging silent message drops or unexpected behavior, set:
+
+```
+OPERATOR_LOG_LEVEL=debug
+```
+
+in your `.env` and restart the daemon. This surfaces:
+- Per-poll Telegram/WhatsApp inbound events
+- State-machine CAS results for every inbound
+- Rate-limiter bucket consumption per sender + channel
+- Watchdog timer fires + cancellations
+- Studio swap-suppression suppressed-due-to-cooldown events
+
+WARNING — production-safety constraints when enabling debug:
+
+1. **Volume increase**: debug-level produces ~10x operator log volume.
+   The operator log file at `~/.pi-comms/operator.log.YYYY-MM-DD` will
+   grow significantly faster than at info-level. Verify your disk has
+   headroom and consider a shorter rotation window.
+
+2. **Content surface**: telegram_inbound and whatsapp_inbound fire per-poll
+   even for messages later silently rejected (DM-only, allowlist). The
+   default ships with NO message text (only message_type and sender hash),
+   but if you ALSO set `OPERATOR_LOG_CONTENT=true` you will see raw inbound
+   text. **Never combine `OPERATOR_LOG_LEVEL=debug` and `OPERATOR_LOG_CONTENT=true`**
+   in any environment where the log file could be read by an attacker
+   (multi-user box, shared machine, screen recording, public bug-report
+   attachments).
+
+3. **Sender hash exposure**: debug surfaces a `sender_id_hash` per inbound.
+   The hash is salted (see SECURITY.md R3), but a high-volume debug log
+   gives an attacker who reads it post-hoc the ability to count messages
+   per sender across time. Benign on a single-operator pi but not on a
+   multi-tenant box.
+
+4. **Audit-log volume**: independent of operator-log level, the new
+   `telegram_inbound` / `whatsapp_inbound` audit rows fire per-message at
+   ALL operator-log levels. Verify your audit-log retention
+   (`AuditLog.purgeOlderThan`, default 90 days) handles the increased rate.
+
+---
+
 ## Operator log paths (per OS)
 
 | OS | Lifecycle log (autostart layer) | Daemon's own logs (operator-logger output) |

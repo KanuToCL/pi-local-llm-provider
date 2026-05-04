@@ -129,6 +129,21 @@ The risks below cover the pi-comms daemon surface added in v0.2 (Track 2 in the 
 - **Operator** — habit / configuration choice; this repo can warn but cannot enforce
 - **Upstream** — depends on pi-mono / Baileys / grammy / OS — tracked but not solvable here
 
+### R31 — Lock-hold-time DoS surface (post-v0.2.2)
+
+Pre-v0.2.2: the GlobalQueue lock released in ~7ms per request due to the
+premature-termination bug. Post-v0.2.2: lock holds for full inference
+duration (5-30s typical, longer for tool-using turns). An attacker who
+can trigger a tool-loop pattern via prompt-injection through the watchdog
+reset (tool_execution_start extends the deadline) can hold the queue
+indefinitely.
+
+Mitigation today: 5min watchdog default + serial_queue_blocked notice +
+per-channel cooldown limit operator-visible spam.
+
+v0.3 followup: per-prompt hard ceiling (taskMaxDurationMs config) that
+overrides watchdog reset semantics for truly long single tasks.
+
 ---
 
 ## What this repo does about R2 specifically
