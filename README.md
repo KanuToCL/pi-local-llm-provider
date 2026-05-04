@@ -30,7 +30,7 @@ A long-lived TypeScript daemon that:
 - Writes a status pointer + audit log so you can grep what pi was doing 3 hours ago from any device.
 - Per-OS autostart: LaunchAgent (macOS), systemd-user (Linux), Scheduled Task (Windows).
 
-The daemon's plan, threat model, and design are in [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) (four-layer model), [`docs/INSTALL.md`](./docs/INSTALL.md) (per-OS autostart), [`docs/INSTALL-WHATSAPP.md`](./docs/INSTALL-WHATSAPP.md) (Baileys pairing + identity model), and [`SECURITY.md`](./SECURITY.md) (R15-R30 daemon-specific risks).
+The daemon's plan, threat model, and design are in [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) (four-layer model), [`docs/INSTALL.md`](./docs/INSTALL.md) (per-OS autostart), [`docs/INSTALL-WHATSAPP.md`](./docs/INSTALL-WHATSAPP.md) (Baileys pairing + identity model), [`docs/PRODUCTION-HANDOFF.md`](./docs/PRODUCTION-HANDOFF.md) (briefing for a fresh Claude Code instance picking this up on a production box), and [`SECURITY.md`](./SECURITY.md) (R15-R30 daemon-specific risks).
 
 ---
 
