@@ -56,6 +56,7 @@ import { composeSystemPrompt } from "./lib/system-prompt.js";
 import {
   type ChannelId,
   type TaskState,
+  type TaskStateKind,
   TaskStateManager,
 } from "./lib/task-state.js";
 import { defineSandboxedBashTool } from "./sandbox/wrap-bash.js";
@@ -529,6 +530,19 @@ export class SessionManager {
         return;
       }
 
+      // v0.2.2 cyclicity-normalize: defense-in-depth.  Every terminator now
+      // uses `taskState.markTerminalAndIdle` which transitions through to idle
+      // atomically — so this guard should be a no-op in practice.  If it
+      // fires (state is completed/failed/cancelled), something has bypassed
+      // the markTerminalAndIdle primitive; we recover + log + audit so post-
+      // incident review can correlate.  Per plan §A.2 + the MIB-2026-05-03
+      // production silent-drop regression that v0.2.2 fixes.
+      const normalizeResult = await this.normalizeTerminalState(msg.channel);
+      if (!normalizeResult.ok) {
+        // Audit + operator log already fired inside normalizeTerminalState.
+        return;
+      }
+
       const taskId = freshTaskId();
       const startedAt = this.now();
       const transitionResult = this.opts.taskState.tryTransition({
@@ -540,7 +554,27 @@ export class SessionManager {
         abort: new AbortController(),
       });
       if (!transitionResult.ok) {
-        // Race lost; another caller advanced state. Drop without side-effects.
+        // CAS-to-running failed.  Per UX BLESS-W7 + plan §A.2: emit
+        // user-facing notice so the user doesn't see a silent drop, AND
+        // audit/operator-log via emitCasFailure so post-incident review can
+        // diagnose.
+        this.emitCasFailure({
+          from: this.opts.taskState.get().kind,
+          to: "running",
+          reason: transitionResult.reason,
+          context: "handleInbound:cas-to-running",
+          channel: msg.channel,
+        });
+        const target = this.sinkFor(msg.channel);
+        if (target) {
+          const userNotice: ChannelEvent = {
+            type: "system_notice",
+            level: "info",
+            text: "pi: failed to start your request — please re-send.",
+            ts: this.now(),
+          };
+          void target.send(userNotice).catch(() => undefined);
+        }
         return;
       }
 
@@ -572,20 +606,22 @@ export class SessionManager {
       // checkForStudioModelSwap.
       void this.checkForStudioModelSwap(msg.channel);
 
+      let didThrow = false;
+      let errorMessage: string | null = null;
       try {
-        // Hand the message to pi-mono.  We pass the running TaskState's
-        // AbortController.signal so /cancel can actually stop the GPU —
-        // pi-mono ≥0.72 honors `options.signal` to cancel the inference
-        // loop and tool execution.  Without this, the SDK's own
-        // AbortController is internal and unreachable from /cancel.
-        // Errors are caught and logged but do NOT bubble out — the daemon
-        // would otherwise crash on a single bad turn.  The TaskState
-        // machine drives recovery instead.
+        // v0.2.2 §A.2: hand the message to pi-mono.  We pass the running
+        // TaskState's AbortController.signal so /cancel can actually stop
+        // the GPU — pi-mono ≥0.72 honors `options.signal` to cancel the
+        // inference loop and tool execution.
+        //
+        // CRITICAL: pi-mono's `await session.prompt()` resolves AFTER the
+        // agent loop completes → all events processed → all subscribers
+        // awaited → finishRun fires.  Verified empirically from pi-mono
+        // source `node_modules/@mariozechner/pi-agent-core/dist/agent.js:
+        // 215-396` (NOT just .d.ts).  This is the canonical terminal
+        // signal in v0.2.2 — the subscriber loses its termination role
+        // and becomes fan-out only (per plan §A.4 deletion checklist).
         if (this.session) {
-          // Re-read the current TaskState — by this point we have just
-          // CAS'd to running so the abort controller is the one we just
-          // installed; this also defends against tests that manipulate
-          // state out-of-band.
           const live = this.opts.taskState.get();
           const signal =
             (live.kind === "running" || live.kind === "backgrounded")
@@ -594,54 +630,298 @@ export class SessionManager {
           await this.session.prompt(msg.text, { signal });
         }
       } catch (err) {
-        const error = err instanceof Error ? err.message : String(err);
+        didThrow = true;
+        errorMessage = err instanceof Error ? err.message : String(err);
         this.opts.operatorLogger?.error("task_failed", {
           task_id: taskId,
-          error,
+          error: errorMessage,
         });
-        const cur = this.opts.taskState.get();
-        if (cur.kind === "running" || cur.kind === "backgrounded") {
-          const finishedAt = this.now();
-          this.opts.taskState.tryTransition({
-            kind: "failed",
-            taskId,
-            startedAt,
-            finishedAt,
-            error,
-          });
-          // Audit the failure with duration_ms so post-incident review can
-          // correlate task latency with the failure surface.
-          //
-          // BLESS Security defense-in-depth: pi-mono error chains can
-          // include URL+headers (e.g. an Anthropic SDK error stringifying
-          // a Bearer-bearing fetch).  Symmetric with the reply path's
-          // sanitization (mapper applies redactCredentialShapes to the
-          // assistant text); error_class also goes through the same
-          // scrubber before persistence.
-          void this.opts.auditLog
-            .append({
-              event: "task_failed",
-              task_id: taskId,
-              channel: msg.channel,
-              sender_id_hash: null,
-              duration_ms: Math.max(0, finishedAt - startedAt),
-              error_class: redactCredentialShapes(error.slice(0, 200)),
-            })
-            .catch(() => undefined);
-        }
       } finally {
+        // Always-runs cleanup per Integration W4 + PE W2.  These MUST fire
+        // regardless of throw/no-throw so the next inbound has a clean slate
+        // (no orphan timer + no leaked sandbox grant).
         this.clearAutoPromote();
         this.clearWatchdog();
-        // SandboxPolicy lifecycle: if a `next-task` un-sand grant was open,
-        // re-engage now (per plan §"v4.1 /unsand escape hatch" line 1387).
-        // Window-scoped grants outlive task boundaries by design.
         try {
           this.opts.sandboxPolicy.onTaskCompleted();
         } catch {
           /* sandbox bookkeeping is best-effort */
         }
       }
+
+      const finishedAt = this.now();
+      const durationMs = Math.max(0, finishedAt - startedAt);
+      // Re-read state to capture channel from the running snapshot for audit
+      // row provenance (Adversarial v2 B2 fix — don't lose state.channel via
+      // msg.channel shadowing if a watchdog/cancel race has already mutated
+      // state).
+      const finalLive = this.opts.taskState.get();
+      const auditChannel: ChannelId =
+        finalLive.kind === "running" || finalLive.kind === "backgrounded"
+          ? finalLive.channel
+          : msg.channel;
+
+      if (didThrow) {
+        await this.markTaskFailedAndIdle(
+          taskId,
+          startedAt,
+          finishedAt,
+          auditChannel,
+          errorMessage ?? "unknown_error",
+        );
+      } else {
+        await this.markTaskCompletedAndIdle(
+          taskId,
+          startedAt,
+          finishedAt,
+          auditChannel,
+          durationMs,
+        );
+      }
     });
+  }
+
+  // ---------------------------------------------------------------------
+  // Private — handleInbound helpers (plan v0.2.2 §A.2)
+  // ---------------------------------------------------------------------
+
+  /**
+   * Cyclicity-normalize: if state is terminal (completed/failed/cancelled),
+   * transition to idle so the next CAS to running can succeed.  This is
+   * defense-in-depth: in v0.2.2, every terminator uses
+   * `taskState.markTerminalAndIdle` which transitions through to idle
+   * atomically — so this guard should never fire in practice.  If it does,
+   * something has bypassed the markTerminalAndIdle primitive, which is
+   * worth a log line for forensics.  Per plan §A.2.
+   */
+  private async normalizeTerminalState(
+    channel: ChannelId,
+  ): Promise<{ ok: boolean }> {
+    const current = this.opts.taskState.get();
+    if (
+      current.kind !== "completed" &&
+      current.kind !== "failed" &&
+      current.kind !== "cancelled"
+    ) {
+      return { ok: true };
+    }
+
+    // Capture the stuck taskId for forensic correlation (per Data Guardian
+    // S2 + Obs W2 + Architect convergence).
+    const stuckTaskId = current.taskId;
+
+    const idleResult = this.opts.taskState.tryTransition({ kind: "idle" });
+    if (!idleResult.ok) {
+      this.emitCasFailure({
+        from: current.kind,
+        to: "idle",
+        reason: idleResult.reason,
+        context: "handleInbound:cyclicity-normalize",
+        channel,
+        stuckTaskId,
+      });
+      return { ok: false };
+    }
+
+    this.opts.operatorLogger?.debug("task_state_normalized_to_idle", {
+      from: current.kind,
+      stuck_task_id: stuckTaskId,
+    });
+    return { ok: true };
+  }
+
+  /**
+   * Centralized audit + operator log for state-machine CAS failures.
+   *
+   *   - Terminal-state CAS losses (race between watchdog and post-prompt
+   *     mark) are EXPECTED under concurrency; these emit at debug level
+   *     only (no audit row).
+   *   - True idle→ CAS failures or other anomalies emit at error level
+   *     (operator log) + audit row (forensic forever-trail).
+   *
+   * Per Adversarial BLESS-W2 + PE BLESS-S2 (demote terminal-CAS races to
+   * debug).  Per Adversarial re-bless NEW-1: include `from === "idle"` in
+   * the terminal-race set — common case is cancel/watchdog races with
+   * prompt() resolution.  Cancel handler uses markTerminalAndIdle which
+   * DRAINS to idle.  By the time handleInbound's catch fires
+   * markTaskFailedAndIdle, state is `idle` (not `cancelled`).  Without
+   * this expansion, every successful cancel would emit a spurious "true
+   * bug" warn + audit row.
+   */
+  private emitCasFailure(opts: {
+    from: TaskStateKind;
+    to: TaskStateKind;
+    reason: string | undefined;
+    context: string;
+    channel: ChannelId;
+    stuckTaskId?: string;
+  }): void {
+    const TERMINAL_RACE_KINDS = new Set<TaskStateKind>([
+      "completed",
+      "failed",
+      "cancelled",
+      "idle",
+    ]);
+    const isTerminalRace =
+      TERMINAL_RACE_KINDS.has(opts.from) && TERMINAL_RACE_KINDS.has(opts.to);
+
+    if (isTerminalRace) {
+      this.opts.operatorLogger?.debug("task_state_cas_lost_race", {
+        from: opts.from,
+        to: opts.to,
+        context: opts.context,
+        ...(opts.stuckTaskId ? { task_id: opts.stuckTaskId } : {}),
+      });
+      return;
+    }
+
+    // True bug — log error (closest level we have to "warn" in this logger)
+    // + audit row.  Per Adversarial BLESS-B1 #1: zod requires non-undefined
+    // values in extra; coalesce reason via `?? "unknown"`.  Per Security
+    // BLESS-B2: never include user-derived strings here.
+    this.opts.operatorLogger?.error("task_state_cas_failed", {
+      from: opts.from,
+      to: opts.to,
+      reason: opts.reason ?? "unknown",
+      context: opts.context,
+      ...(opts.stuckTaskId ? { task_id: opts.stuckTaskId } : {}),
+    });
+    void this.opts.auditLog
+      .append({
+        event: "task_state_cas_failed",
+        task_id: opts.stuckTaskId ?? null,
+        channel: "system", // per Adversarial BLESS-B1 #3 (daemon-internal bookkeeping)
+        sender_id_hash: null,
+        extra: {
+          from: opts.from,
+          to: opts.to,
+          reason: opts.reason ?? "unknown",
+          context: opts.context,
+        },
+      })
+      .catch(() => undefined);
+  }
+
+  /**
+   * Mark the in-flight task as completed + drain to idle atomically.  Uses
+   * the v0.2.2 `taskState.markTerminalAndIdle` primitive (Architect BLESS-B2
+   * + DG B1 — single atomic path).  Audits + operator-logs on success;
+   * emits a debug-level CAS-failure log on race-loss (terminal-state race
+   * is expected under concurrency).
+   *
+   * Defense-in-depth alarm per Observability BLESS-W1: catch future
+   * regressions of v0.2.1's premature-termination bug class.  Threshold =
+   * 100ms (below the realistic floor of HTTP roundtrip + token streaming).
+   */
+  private async markTaskCompletedAndIdle(
+    taskId: string,
+    startedAt: number,
+    finishedAt: number,
+    channel: ChannelId,
+    durationMs: number,
+  ): Promise<void> {
+    const result = await this.opts.taskState.markTerminalAndIdle({
+      kind: "completed",
+      taskId,
+      startedAt,
+      finishedAt,
+    });
+    if (!result.ok) {
+      // Race-lost — task was cancelled / failed by watchdog or /cancel
+      // between prompt() resolution and this call.  Demoted to debug
+      // (Adversarial W2 + PE S2).
+      this.emitCasFailure({
+        from: this.opts.taskState.get().kind,
+        to: "completed",
+        reason: result.reason,
+        context: "markTaskCompletedAndIdle:terminal-race-lost",
+        channel,
+        stuckTaskId: taskId,
+      });
+      return;
+    }
+
+    void this.opts.auditLog
+      .append({
+        event: "task_completed",
+        task_id: taskId,
+        channel,
+        sender_id_hash: null,
+        duration_ms: durationMs,
+      })
+      .catch(() => undefined);
+    this.opts.operatorLogger?.info("task_completed", { task_id: taskId });
+
+    // Defense-in-depth alarm per Observability BLESS-W1: catch future
+    // regressions of v0.2.1's premature-termination bug class (the smoking
+    // gun was duration_ms=7 across all task_completed audit rows).
+    // Threshold = 100ms (below the realistic floor of HTTP roundtrip +
+    // token streaming on local Studio).
+    if (durationMs < 100) {
+      this.opts.operatorLogger?.error("task_completed_suspiciously_fast", {
+        task_id: taskId,
+        duration_ms: durationMs,
+        threshold_ms: 100,
+      });
+      void this.opts.auditLog
+        .append({
+          event: "task_completed_suspiciously_fast",
+          task_id: taskId,
+          channel,
+          sender_id_hash: null,
+          duration_ms: durationMs,
+        })
+        .catch(() => undefined);
+    }
+  }
+
+  /**
+   * Mark the in-flight task as failed + drain to idle atomically.  Uses
+   * the v0.2.2 `taskState.markTerminalAndIdle` primitive.
+   *
+   * Per Adversarial re-bless NEW-3 (security defense-in-depth): preserves
+   * the v0.2.1 catch path's `error_class: redactCredentialShapes(slice(0,
+   * 200))` — pi-mono error chains can include URL+headers (e.g. an
+   * Anthropic SDK error stringifying a Bearer-bearing fetch).  Symmetric
+   * with the reply path's sanitization.  WITHOUT this, Bearer-token
+   * leakage from pi-mono error chains would land in the audit log.
+   */
+  private async markTaskFailedAndIdle(
+    taskId: string,
+    startedAt: number,
+    finishedAt: number,
+    channel: ChannelId,
+    errorMessage: string,
+  ): Promise<void> {
+    const result = await this.opts.taskState.markTerminalAndIdle({
+      kind: "failed",
+      taskId,
+      startedAt,
+      finishedAt,
+      error: errorMessage,
+    });
+    if (!result.ok) {
+      this.emitCasFailure({
+        from: this.opts.taskState.get().kind,
+        to: "failed",
+        reason: result.reason,
+        context: "markTaskFailedAndIdle:terminal-race-lost",
+        channel,
+        stuckTaskId: taskId,
+      });
+      return;
+    }
+
+    void this.opts.auditLog
+      .append({
+        event: "task_failed",
+        task_id: taskId,
+        channel,
+        sender_id_hash: null,
+        duration_ms: Math.max(0, finishedAt - startedAt),
+        error_class: redactCredentialShapes(errorMessage.slice(0, 200)),
+      })
+      .catch(() => undefined);
   }
 
   // ---------------------------------------------------------------------
@@ -827,7 +1107,10 @@ export class SessionManager {
     }
     const finishedAt = this.now();
     const reason = "watchdog_no_terminal_event";
-    const transitionResult = this.opts.taskState.tryTransition({
+    // v0.2.2 §A.5: use the atomic markTerminalAndIdle primitive so the
+    // watchdog drains all the way through to idle (terminal states are
+    // ephemeral in v0.2.2; nothing else now wires the completed→idle edge).
+    const transitionResult = await this.opts.taskState.markTerminalAndIdle({
       kind: "failed",
       taskId,
       startedAt: state.startedAt,
@@ -835,6 +1118,17 @@ export class SessionManager {
       error: reason,
     });
     if (!transitionResult.ok) {
+      // Race-lost — task already terminated between fireWatchdog's CAS guard
+      // above and this primitive call.  emitCasFailure demotes terminal-state
+      // races to debug; no audit row, no operator-log noise.
+      this.emitCasFailure({
+        from: this.opts.taskState.get().kind,
+        to: "failed",
+        reason: transitionResult.reason,
+        context: "fireWatchdog:terminal-race-lost",
+        channel: state.channel,
+        stuckTaskId: taskId,
+      });
       return;
     }
     this.clearAutoPromote();
@@ -1281,17 +1575,17 @@ export class SessionManager {
         logger: mapperLogger,
       });
       if (!channelEvent) {
-        // Symmetric terminal-event handling (Round 2 Architect+Adversarial
-        // convergence): both `agent_end` AND `message_end` are terminal
-        // markers from pi-mono's perspective.  Handling `message_end` here
-        // (in addition to `agent_end`) closes the empty-text stuck-task
-        // hole that was the §5.1 production symptom — when the assistant
-        // message has no text content the mapper returns null, and without
-        // this branch the task would stay `running` forever.
-        const evt = rawEvent as Record<string, unknown> | null;
-        if (evt && (evt.type === "agent_end" || evt.type === "message_end")) {
-          this.markTaskCompleted();
-        }
+        // v0.2.2 §A.4 deletion #1: the v0.2.1 null-mapper-symmetry branch
+        // that fired markTaskCompleted on every agent_end/message_end is
+        // GONE.  pi-mono fires multiple message_end per turn (user/tool/
+        // empty-assistant messages); the v0.2.1 path produced duration_ms=7
+        // across all task_completed rows because EVERY message_end fired
+        // termination, not just the final one.  In v0.2.2 termination is
+        // owned exclusively by handleInbound's `await session.prompt()`
+        // resolution — the canonical signal verified from agent.js source
+        // (lines 215-396; processEvents awaits every subscriber inside
+        // runWithLifecycle).  This branch becomes a no-op (the heartbeat
+        // touch above still fires; that's unrelated to termination).
         return;
       }
 
@@ -1305,12 +1599,12 @@ export class SessionManager {
       // (`src/channels/telegram.ts:790-793`); this branch is what makes the
       // task_completed code path live.
       //
-      // Mirror-trigger ordering: capture the markTaskCompleted decision
-      // BEFORE the rewrite so the condition stays based on the ORIGINAL
-      // event shape (reply).  Both shapes (rewritten task_completed and
-      // unrewritten reply) trigger the mirror; the rewrite only changes
-      // what the channel sees.
-      const shouldMarkCompleted = channelEvent.type === "reply";
+      // v0.2.2 §A.4 deletion #2 + §A.4 KEEP #4: the rewrite is preserved
+      // (cosmetic UX layer — no state side-effect — works correctly post-
+      // v0.2.2 because state is `backgrounded` until `await prompt()`
+      // returns).  The reply-mirror trigger that ALSO called
+      // markTaskCompleted is gone (handled exclusively by handleInbound's
+      // post-prompt mark helpers).
       let outboundEvent: ChannelEvent = channelEvent;
       if (channelEvent.type === "reply") {
         const cur = this.opts.taskState.get();
@@ -1331,77 +1625,16 @@ export class SessionManager {
       if (this.opts.sinks.whatsapp) sinkBag.whatsapp = this.opts.sinks.whatsapp;
       if (this.opts.sinks.telegram) sinkBag.telegram = this.opts.sinks.telegram;
       void fanOut(sinkBag as SinkBag, outboundEvent).catch(() => undefined);
-
-      // Belt-and-suspenders: when reply landed AND no agent_end fires (some
-      // pi-mono builds emit message_end as the only terminal event), still
-      // mark complete.  Idempotent vs the null-mapper branch above thanks
-      // to markTaskCompleted's CAS guard inside taskState.tryTransition.
-      // Uses the ORIGINAL channelEvent.type so the rewrite-to-task_completed
-      // above doesn't change which events trigger the mirror.
-      if (shouldMarkCompleted) {
-        this.markTaskCompleted();
-      }
     });
   }
 
-  /**
-   * Mark the in-flight task as completed (idempotent w.r.t. terminal states).
-   *
-   * Called from event-stream side effects:
-   *   - `agent_end` event (pi-mono full-loop completion).
-   *   - `message_end` event with NO mapped channel event (empty-text turn —
-   *     the plan v2 IMPL-D Round 2 convergence on the null-mapper symmetry
-   *     hole that was the §5.1 production stuck-task symptom).
-   *   - Mapped `reply` ChannelEvent (some pi-mono builds emit message_end as
-   *     the only terminal event; the belt-and-suspenders mirror).
-   *
-   * The task-state CAS guard (in taskState.tryTransition) makes this safe to
-   * call multiple times for the same task — only the first call wins.
-   */
-  private markTaskCompleted(): void {
-    const state = this.opts.taskState.get();
-    if (state.kind !== "running" && state.kind !== "backgrounded") {
-      return;
-    }
-    const finishedAt = this.now();
-    // BLESS Adversarial NEW-3: gate ALL side effects on tryTransition's
-    // `ok` field.  pi-mono can emit multiple `message_end` events per
-    // turn during streaming (and the subscriber loop also fires this from
-    // the `reply` ChannelEvent mirror); without this gate, audit row +
-    // operator log + sandboxPolicy.onTaskCompleted would double-fire.
-    // Mirrors the pattern fireWatchdog uses correctly at L763-765.
-    const transitionResult = this.opts.taskState.tryTransition({
-      kind: "completed",
-      taskId: state.taskId,
-      startedAt: state.startedAt,
-      finishedAt,
-    });
-    if (!transitionResult.ok) {
-      return; // Already in terminal state; another path won the race.
-    }
-    this.clearAutoPromote();
-    this.clearWatchdog();
-    // Emit task_completed with duration_ms so post-incident review can
-    // correlate task latency with downstream events.
-    void this.opts.auditLog
-      .append({
-        event: "task_completed",
-        task_id: state.taskId,
-        channel: state.channel,
-        sender_id_hash: null,
-        duration_ms: Math.max(0, finishedAt - state.startedAt),
-      })
-      .catch(() => undefined);
-    this.opts.operatorLogger?.info("task_completed", {
-      task_id: state.taskId,
-    });
-    // SandboxPolicy lifecycle hook: re-engage on next-task scope.
-    try {
-      this.opts.sandboxPolicy.onTaskCompleted();
-    } catch {
-      /* sandbox bookkeeping is best-effort */
-    }
-  }
+  // v0.2.2 §A.4 deletion #3: the `markTaskCompleted` private method is
+  // gone — its callers (subscriber's null-mapper branch + reply-mirror
+  // trigger) are all gone, and `markTaskCompletedAndIdle` /
+  // `markTaskFailedAndIdle` (declared above near handleInbound) replace it
+  // with the v0.2.2 atomic-primitive contract.  Kept this comment as a
+  // tripwire so a future implementer doesn't accidentally re-add a
+  // subscriber-fired mark path and re-introduce the v0.2.1 bug.
 
   // ---------------------------------------------------------------------
   // Private — custom-tools assembly
