@@ -263,6 +263,9 @@ export class SessionManager {
    *  (one-shot suppression).  `lastSwapNoticeAt` — per-channel timestamp of
    *  last swap notice, used for the 60s cooldown. */
   private lastSwapNoticeModelId: string | null = null;
+  // INVARIANT: bounded by ChannelId union cardinality (currently 3:
+  // terminal/whatsapp/telegram). If ChannelId becomes per-conversation
+  // (e.g. per-DM-thread IDs), add an LRU cap to prevent unbounded growth.
   private lastSwapNoticeAt: Map<ChannelId, number> = new Map();
   /** Adapter wrapping pending-confirms.ts to satisfy confirm.ts's interface. */
   private confirmRegistryAdapter: ConfirmToolRegistryContract | null = null;
@@ -738,6 +741,14 @@ export class SessionManager {
       return;
     }
     if (state.taskId !== taskId) {
+      // Defense-in-depth: this branch indicates a wedged schedule (a watchdog
+      // for an old task fired after a new task started without the previous
+      // task's watchdog being cleared).  If it ever fires, post-incident
+      // review needs the signal to correlate.
+      this.opts.operatorLogger?.debug("watchdog_drop_taskid_mismatch", {
+        expected: taskId,
+        current: state.taskId,
+      });
       return;
     }
     const finishedAt = this.now();
@@ -874,14 +885,20 @@ export class SessionManager {
     // Post-abort gate.
     if (this.opts.taskState.get().kind === "cancelled") return;
 
-    this.lastSwapNoticeModelId = current;
-    this.lastSwapNoticeAt.set(channel, this.now());
-
+    // AUDIT-D IMPORTANT 3: emit BEFORE arming the cooldown.  If
+    // emitStudioNotice throws synchronously (low probability — fanOut
+    // already swallows throws — but defense-in-depth), the cooldown stays
+    // un-armed so the next inbound can re-detect and re-attempt the
+    // notice.  Either the emit succeeds (state advances correctly) or it
+    // throws (state stays untouched).
     await this.emitStudioNotice(
       channel,
       "warn",
       `pi: Studio's loaded model changed since boot (was ${expected}, now ${current}). Daemon is still using ${expected} until next restart.`,
     );
+
+    this.lastSwapNoticeModelId = current;
+    this.lastSwapNoticeAt.set(channel, this.now());
 
     // Operator log.  OperatorLogger has no .warn — use .info for the
     // swap-detected event (the warning level is already reflected in the

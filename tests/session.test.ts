@@ -1147,6 +1147,12 @@ describe("TaskState watchdog (plan v2 IMPL-D)", () => {
     await new Promise((r) => setImmediate(r));
     expect(h.taskState.get().kind).toBe("completed");
 
+    // AUDIT-D NIT 9: defensive — ensure the watchdog did NOT emit a
+    // user-facing notice when firing against an already-completed task.
+    expect(
+      h.sinks.telegram.events.filter((e) => e.type === "system_notice"),
+    ).toHaveLength(0);
+
     session.resolveCurrentPrompt!();
     await inflight;
     await mgr.dispose();
