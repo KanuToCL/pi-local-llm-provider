@@ -8,7 +8,8 @@
  *   4. client send → handler.onSend called with text + attached client ref
  *   5. server.send(event) fans out to all attached clients → onEvent fires
  *      AND respects per-client `tell-only` filter (an `all` client gets
- *      everything, a `tell-only` client only gets `tell`/`confirm`)
+ *      everything, a `tell-only` client only gets `tell`/`confirm`/`reply`
+ *      — `reply` per BUG-2026-05-03 fix in src/ipc/server.ts commit 53fe7b0)
  *   6. server enforces buffer cap: pause client, send N+ events, assert
  *      oldest dropped + audit row recorded
  *   7. clean shutdown (server.stop) closes all clients
@@ -284,8 +285,13 @@ describe("IpcServer — fan-out + per-client filter", () => {
         "system_notice",
         "tell",
       ]);
-      // tell-only filter passes only tell + confirm_request.
-      expect(tellTypes).toEqual(["confirm_request", "tell"]);
+      // tell-only filter passes tell + confirm_request + reply.  `reply` was
+      // added to TELL_ONLY_EVENT_TYPES per BUG-2026-05-03 fix in
+      // src/ipc/server.ts (commit 53fe7b0, Integration Elder B1):
+      // framework-completion is now `reply` (not `tell+done`), so terminal
+      // IPC clients in tell-only mode MUST receive it or they see no agent
+      // replies.
+      expect(tellTypes).toEqual(["confirm_request", "reply", "tell"]);
     } finally {
       allClient.close();
       tellClient.close();
