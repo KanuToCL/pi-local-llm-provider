@@ -57,6 +57,7 @@ import {
   type TaskState,
 } from "./lib/task-state.js";
 import { PendingConfirmsRegistry } from "./tools/pending-confirms.js";
+import { InboundRateLimiter } from "./lib/inbound-rate-limit.js";
 import { SandboxPolicy, type SandboxState } from "./sandbox/policy.js";
 import { StatusPointerReader } from "./status-pointer/reader.js";
 import { StatusPointerWriter } from "./status-pointer/writer.js";
@@ -334,21 +335,6 @@ async function bootAfterLock(
     model: config.piCommsDefaultModel,
     sessions: "shared",
   });
-  // Audit a daemon_boot at the orchestrator level (the IPC server emits its
-  // own daemon_boot for socket bind; this row captures the env-load step
-  // independently so post-incident review can correlate the two).
-  void auditLog
-    .append({
-      event: "daemon_boot",
-      task_id: null,
-      channel: "system",
-      sender_id_hash: null,
-      extra: {
-        ipc_event: "orchestrator_start",
-        test_mode: testMode,
-      },
-    })
-    .catch(() => undefined);
 
   // 6. Studio readiness — both the loopback assertion and Phase 4.4 model-
   //    loaded check. Skipped in test mode so the integration smoke can boot
@@ -373,6 +359,33 @@ async function bootAfterLock(
       baseline_model: coldStartModelId,
     });
   }
+
+  // Audit a daemon_boot at the orchestrator level (the IPC server emits its
+  // own daemon_boot for socket bind; this row captures the env-load step
+  // independently so post-incident review can correlate the two).
+  // Emitted AFTER Studio readiness completes so `swap_detection_armed`
+  // (Observability NIT N3) reflects the actual cold-start probe state for
+  // this boot.  If the Studio probe throws, we never reach this row — but
+  // the operator-log banner above + the synchronous DaemonBootError that
+  // bubbles up provide that forensic trail.
+  void auditLog
+    .append({
+      event: "daemon_boot",
+      task_id: null,
+      channel: "system",
+      sender_id_hash: null,
+      extra: {
+        ipc_event: "orchestrator_start",
+        test_mode: testMode,
+        // Observability NIT N3: mirror the operator-log
+        // `studio_swap_detection_armed` signal into the daemon_boot audit
+        // row's `extra` field so a future operator grep on `daemon_boot`
+        // rows can see whether soft-swap detection was active during a
+        // given boot, even after the operator log has rotated.
+        swap_detection_armed: !!(coldStartStudioUrl && coldStartModelId),
+      },
+    })
+    .catch(() => undefined);
 
   // 7. Sandbox policy: load persisted state then unconditionally force-engage
   //    on boot (per plan §"v4.2 Sandbox state on daemon boot" line 1483).
@@ -403,6 +416,37 @@ async function bootAfterLock(
 
   // 9. Pending confirms registry (in-memory).
   const pendingConfirms = new PendingConfirmsRegistry();
+
+  // 9b. FIX-W4-A (Adversarial BLESS NEW-1 BLOCKER): construct the
+  //     InboundRateLimiter from config (per-sender + per-channel caps,
+  //     expressed as "per minute") and hand to BOTH channel constructors.
+  //     Without this, the new `serial_queue_blocked` system_notice (added
+  //     by IMPL-D-2) is wide open to flood: 100 follow-ups in 1s = 100
+  //     notices fanned to Telegram, well past Telegram's anti-spam
+  //     thresholds.  The limiter class + the channels' middleware were
+  //     already present pre-FIX-W4-A; only the wire-up was missing.
+  //
+  //     Conversion: PI_COMMS_INBOUND_RATE_PER_*_PER_MIN is integer/min;
+  //     RateBucketSpec wants `{capacity, refillRatePerMs}`.  Capacity =
+  //     burst tolerance = the per-min cap; refillRatePerMs = perMin /
+  //     60_000.  Matches the test-fixture pattern in
+  //     tests/inbound-rate-limit.ts (`defaultLimiter`).
+  //
+  //     maxSenderBuckets = 10_000 is the limiter's documented default —
+  //     far above any realistic single-user pi-comms sender count, with
+  //     LRU eviction so a long-lived daemon across many distinct senders
+  //     never leaks unbounded state.
+  const inboundRateLimiter = new InboundRateLimiter({
+    perSender: {
+      capacity: config.piCommsInboundRatePerSenderPerMin,
+      refillRatePerMs: config.piCommsInboundRatePerSenderPerMin / 60_000,
+    },
+    perChannel: {
+      capacity: config.piCommsInboundRatePerChannelPerMin,
+      refillRatePerMs: config.piCommsInboundRatePerChannelPerMin / 60_000,
+    },
+    maxSenderBuckets: 10_000,
+  });
 
   // 10. Status pointer reader + writer. Archive prior body BEFORE the boot
   //     header update destroys it (per Observability §"pointer-history.jsonl").
@@ -550,6 +594,7 @@ async function bootAfterLock(
         inboundProcessor,
         auditLog,
         operatorLogger,
+        inboundRateLimiter,
         onPoll: () => {
           void heartbeat
             .touchAlive({ source: "telegram-poll" })
@@ -599,6 +644,7 @@ async function bootAfterLock(
         inboundProcessor,
         auditLog,
         operatorLogger,
+        inboundRateLimiter,
         onPoll: () => {
           void heartbeat
             .touchAlive({ source: "baileys-poll" })
