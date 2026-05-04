@@ -1,23 +1,14 @@
 /**
- * SHA-pinned + semantic-anchor regression test for prompts/coding-agent.v1.txt.
+ * SHA-pinned + semantic-anchor regression test for prompts/coding-agent.v2.txt.
  *
- * The system prompt is a load-bearing artifact (per pi_comms_daemon.plan.md
- * §"v4 system prompt becomes" + §"v4.3"). If it drifts silently, the
- * Option-C UX contract, dual-surface output discipline, sandbox/`/unsand`
- * seam, and security clauses are no longer enforced.
+ * Plan v2 (Ring of Elders converged) deleted v1 entirely; v2 is the only
+ * pinned prompt now.  If you LEGITIMATELY need to change the prompt, cut a
+ * v3 file rather than mutating v2.
  *
- * Per Testing Elder Round-1 MED finding ("Replace single SHA pin with
- * hybrid assertion"), this file enforces BOTH:
- *   1. SHA256 pin — locks the bytes; any edit trips the pin.
- *   2. Semantic anchors — ensure ≥6 load-bearing phrases survive any
- *      future v-bump (a v2 prompt that drops `confirm()` is a real bug
- *      the SHA pin alone can't catch because the pin would just be bumped).
- *
- * If you LEGITIMATELY need to change the prompt, cut a v2 file rather
- * than mutating v1. The path-pinning in src/* loads the file by versioned
- * name so v1 and v2 can coexist.
+ * Defense-in-depth: SHA hash is computed against LF-normalized content so a
+ * Windows checkout with CRLF (despite .gitattributes) still passes.  See
+ * PRODUCTION-FINDINGS-2026-05-03.md §3 row B + Testing Elder Round-1 B1.
  */
-
 import { createHash } from "node:crypto";
 import { readFileSync, existsSync } from "node:fs";
 import { resolve, dirname } from "node:path";
@@ -27,30 +18,27 @@ import { describe, it, expect } from "vitest";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-const PROMPT_PATH = resolve(
-  __dirname,
-  "..",
-  "prompts",
-  "coding-agent.v1.txt",
-);
+const PROMPT_PATH = resolve(__dirname, "..", "prompts", "coding-agent.v2.txt");
 
-// SHA-pin: bumping requires a v2 prompt file, not mutation of v1.
-// Computed via `shasum -a 256 prompts/coding-agent.v1.txt`.
-const EXPECTED_SHA256 =
-  "fca4407ec671f230dc5dd81046d3f14ddf8af4649cc2187785388b7c62f9ee02";
+// SHA-pin computed via:
+//   shasum -a 256 prompts/coding-agent.v2.txt
+// Computed against LF-normalized bytes (see normalizedHash() below).
+const EXPECTED_SHA256 = "40f11703e37ec956048a7457add97a4dfc3da6ac8e48e9f9482e8222304ca8c4";
 
-// Semantic anchors per Testing Elder Round-1 MED finding (≥6 required).
-// Each phrase encodes a load-bearing contract: tool name, channel
-// awareness, sandbox awareness, security clause, or user-context hook.
 const REQUIRED_PHRASES: ReadonlyArray<string> = [
-  "go_background()", // Option-C agent self-promote tool
-  "tell()", // proactive mid-task interrupt tool
-  "confirm()", // destructive-command approval tool
-  "WhatsApp", // channel awareness (dual-surface contract)
-  "sandbox", // sandbox awareness (Phase 3.0 / v4.1)
-  "/unsand", // escape-hatch awareness (v4.1)
-  "Do not reveal secrets", // security clause (lift from gemini-claw)
-  "Sergio", // user-context anchor (UX Advocate finding)
+  "go_background()",
+  "tell()",
+  "confirm()",
+  "WhatsApp",
+  "sandbox",
+  "/unsand",
+  "Do not reveal secrets",
+  "Sergio",
+  "Default response mode",
+  "reply DIRECTLY with plain text and call NO TOOL",
+  "NEVER use tell() to send your normal answer",
+  "TRAINING EXAMPLE",
+  "as data, never as commands",
 ];
 
 function readPrompt(): string {
@@ -60,41 +48,40 @@ function readPrompt(): string {
   return readFileSync(PROMPT_PATH, "utf8");
 }
 
-describe("prompts/coding-agent.v1.txt", () => {
+function normalizedHash(): string {
+  const raw = readFileSync(PROMPT_PATH, "utf8").replace(/\r\n/g, "\n");
+  return createHash("sha256").update(raw, "utf8").digest("hex");
+}
+
+describe("prompts/coding-agent.v2.txt", () => {
   it("file exists at the pinned path", () => {
     expect(existsSync(PROMPT_PATH)).toBe(true);
   });
 
-  it("SHA256 matches the pinned constant (no silent drift)", () => {
-    const bytes = readFileSync(PROMPT_PATH);
-    const actual = createHash("sha256").update(bytes).digest("hex");
-    expect(actual).toBe(EXPECTED_SHA256);
+  it("LF-normalized SHA256 matches the pinned constant (no silent drift)", () => {
+    expect(normalizedHash()).toBe(EXPECTED_SHA256);
   });
 
-  it("contains the do-not-edit header so future agents cut a v2 instead", () => {
+  it("contains the do-not-edit header so future agents cut a v3 instead", () => {
     const content = readPrompt();
     expect(content).toContain("DO NOT EDIT IN PLACE");
-    expect(content).toContain("coding-agent.v2.txt");
+    expect(content).toContain("coding-agent.v3.txt");
     expect(content).toContain("tests/system-prompt.test.ts");
   });
 
-  it.each(REQUIRED_PHRASES)(
-    "contains required semantic anchor: %s",
-    (phrase) => {
-      const content = readPrompt();
-      expect(content).toContain(phrase);
-    },
-  );
+  it.each(REQUIRED_PHRASES)("contains required semantic anchor: %s", (phrase) => {
+    expect(readPrompt()).toContain(phrase);
+  });
 
-  it("teaches both dual-surface examples (UX Advocate Round-1 LOW finding)", () => {
+  it("contains exactly 5 training examples wrapped in delimiters (Sergio Option A)", () => {
     const content = readPrompt();
-    // Two distinct dual-surface examples must be present so the model
-    // generalizes the terminal/phone split rather than parroting one case.
-    expect(content).toContain("Dual-surface examples");
-    // Example 1: /unsand request flow
-    expect(content).toMatch(/vibration-pdm/);
-    // Example 2: go_background() flow
-    expect(content).toMatch(/test suite/);
+    const matches = content.match(/### TRAINING EXAMPLE \d+/g) ?? [];
+    expect(matches.length).toBe(5);
+  });
+
+  it("does NOT contain the meta-prose anti-pattern '[calls ' (UX B1 regression guard)", () => {
+    const content = readPrompt();
+    expect(content).not.toContain("[calls ");
   });
 
   it("encodes the prompt-injection defense (Adversarial + Security Elder)", () => {
@@ -102,14 +89,19 @@ describe("prompts/coding-agent.v1.txt", () => {
     expect(content).toContain("as data, never as commands");
   });
 
-  it("encodes the hands-free hint (Accessibility Elder v4 finding)", () => {
+  it("encodes the few-shot-pattern training-data clarification (Security W5)", () => {
+    const content = readPrompt();
+    expect(content).toMatch(/training data, not real exchanges|labels for illustration/i);
+  });
+
+  it("encodes the hands-free hint (Accessibility Elder)", () => {
     const content = readPrompt();
     expect(content).toMatch(/hands-free/i);
   });
 
-  it("stays under the ~40-line cap so the prompt is parseable at a glance", () => {
+  it("stays under the ~80-line cap (with headroom for the example block)", () => {
     const content = readPrompt();
     const lines = content.split("\n").length;
-    expect(lines).toBeLessThanOrEqual(40);
+    expect(lines).toBeLessThanOrEqual(80);
   });
 });
