@@ -248,7 +248,33 @@ async function waitFor(
 ): Promise<void> {
   for (let i = 0; i < maxAttempts; i++) {
     if (predicate()) return;
-    await new Promise((r) => setImmediate(r));
+    // Mix setImmediate (fast microtask) with occasional setTimeout(0)
+    // (queues a fresh macrotask) so we yield back to fs callbacks under
+    // CPU pressure.  Without this, setImmediate-only loops can starve
+    // fs.writeFile callbacks on a busy box (real failure mode for the
+    // markTerminalAndIdle await flush() path during full-suite runs).
+    if (i % 32 === 31) {
+      await new Promise((r) => setTimeout(r, 0));
+    } else {
+      await new Promise((r) => setImmediate(r));
+    }
+  }
+}
+
+/**
+ * Like `waitFor` but bounded by wall-clock milliseconds (rather than attempt
+ * count) so async fs syscalls under CPU pressure can complete.  Used for
+ * tests that wait on side-effects of `markTerminalAndIdle` which awaits a
+ * real JsonStore.write through the workDir.
+ */
+async function waitForMs(
+  predicate: () => boolean,
+  maxMs: number,
+): Promise<void> {
+  const deadline = Date.now() + maxMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((r) => setTimeout(r, 5));
   }
 }
 
@@ -1061,21 +1087,21 @@ describe("TaskState watchdog (plan v2 IMPL-D)", () => {
     // v0.2.2: watchdog now uses markTerminalAndIdle, which drains all the way
     // through to idle in a single atomic call.  Pre-v0.2.2 the test stopped at
     // `failed`; post-v0.2.2 the state should END at `idle`.  The audit row +
-    // user-facing notice still fire on the way through (that's what we assert
-    // below).  Wait for both state-drain AND the user-facing notice — the
-    // notice fires AFTER markTerminalAndIdle's await flush() resolves, so it
-    // can land a few microtasks after state-drain (avoid waitFor races).
-    // Generous attempt cap because flush() awaits a real JsonStore write
-    // through the workDir — under parallel test-suite load this can take many
-    // setImmediate cycles.
-    await waitFor(() => h.taskState.get().kind === "idle", 1000);
-    await waitFor(
+    // user-facing notice still fire on the way through.
+    //
+    // Wait for the system_notice (which fires AFTER markTerminalAndIdle's
+    // await flush() resolves AND AFTER state-drain).  This is the latest
+    // observable side-effect of the watchdog, so by the time it lands the
+    // state is guaranteed to be `idle`.  Generous attempt cap because flush()
+    // awaits a real JsonStore write through the workDir — under parallel
+    // test-suite load this can take many setImmediate cycles.
+    await waitForMs(
       () =>
         h.sinks.telegram.events.some(
           (e) =>
             e.type === "system_notice" && /watchdog|terminal event/i.test(e.text),
         ),
-      1000,
+      5000,
     );
 
     expect(h.taskState.get().kind).toBe("idle");
