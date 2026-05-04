@@ -24,7 +24,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -398,11 +398,16 @@ describe("SessionManager.handleInbound()", () => {
     await mgr.init();
 
     const inflight = mgr.handleInbound({ channel: "telegram", text: "hi" });
-    await waitFor(() => setTimeoutFn.mock.calls.length > 0);
+    // Wait for both auto-promote AND watchdog to be scheduled (plan v2
+    // IMPL-D Step D.4 added the watchdog as defense-in-depth).
+    await waitFor(() => setTimeoutFn.mock.calls.length >= 2);
 
-    // Exactly one auto-promote scheduled at config'd delay.
-    expect(setTimeoutFn).toHaveBeenCalledTimes(1);
-    expect((setTimeoutFn.mock.calls[0]![1] as number)).toBe(30_000);
+    // Exactly one auto-promote at the config'd delay; one watchdog at the
+    // 5min default.  Find by delay value rather than position so we don't
+    // care about scheduling order.
+    const delays = setTimeoutFn.mock.calls.map((c) => c[1] as number);
+    expect(delays).toContain(30_000);
+    expect(delays).toContain(300_000);
 
     session.resolveCurrentPrompt!();
     await inflight;
@@ -419,10 +424,12 @@ describe("auto-promote", () => {
     const h = makeHarness();
     const session = makeFakeSession();
 
-    let fireFn: (() => void) | null = null;
-    const setTimeoutFn = vi.fn((handler: () => void, _ms: number) => {
-      fireFn = handler;
-      return Symbol("handle");
+    // Capture EVERY setTimeout — both auto-promote (30s) and watchdog
+    // (5min) are scheduled now.  Filter by delay to grab the right one.
+    const captured: { handler: () => void; delay: number }[] = [];
+    const setTimeoutFn = vi.fn((handler: () => void, ms: number) => {
+      captured.push({ handler, delay: ms });
+      return Symbol(`handle-${captured.length}`);
     });
     const clearTimeoutFn = vi.fn();
 
@@ -442,11 +449,12 @@ describe("auto-promote", () => {
     await mgr.init();
 
     const inflight = mgr.handleInbound({ channel: "telegram", text: "long task" });
-    await waitFor(() => fireFn !== null);
+    await waitFor(() => captured.some((c) => c.delay === 30_000));
 
-    // Manually fire the captured timer.
-    expect(fireFn).not.toBeNull();
-    fireFn!();
+    // Manually fire the auto-promote (30_000 delay), not the watchdog.
+    const autoPromote = captured.find((c) => c.delay === 30_000);
+    expect(autoPromote).toBeDefined();
+    autoPromote!.handler();
     await waitFor(() => h.sinks.telegram.events.length > 0);
 
     // Telegram sink got the auto-promote notice.
@@ -491,12 +499,15 @@ describe("auto-promote", () => {
     await mgr.init();
 
     const inflight = mgr.handleInbound({ channel: "telegram", text: "long" });
-    await waitFor(() => captured.length >= 1);
-    expect(captured[0]!.delay).toBe(30_000);
+    // Wait for both auto-promote (30_000) AND watchdog (300_000 default)
+    // to be scheduled (plan v2 IMPL-D Step D.4).
+    await waitFor(() => captured.length >= 2);
+    const initialAutoPromote = captured.find((c) => c.delay === 30_000);
+    expect(initialAutoPromote).toBeDefined();
 
     // Fire 1: 30s mark → backgrounded + firingNumber=1.
     nowMs = 1_000_000 + 30_000;
-    captured[0]!.handler();
+    initialAutoPromote!.handler();
     await waitFor(() => h.sinks.telegram.events.length >= 1);
 
     expect(h.taskState.get().kind).toBe("backgrounded");
@@ -507,14 +518,18 @@ describe("auto-promote", () => {
       expect(e1.taskAgeSeconds).toBe(30);
     }
 
-    // Fire 1 must have re-armed; capture[1] is the next.
-    await waitFor(() => captured.length >= 2);
-    // Second fire is at 90s after the first (= total 2min from start).
-    expect(captured[1]!.delay).toBe(90_000);
+    // Fire 1 must have re-armed at +90s.  Find the 90_000 timer.
+    await waitFor(() => captured.some((c) => c.delay === 90_000));
+    const fire2 = captured.find((c) => c.delay === 90_000);
+    expect(fire2).toBeDefined();
 
-    // Fire 2.
+    // Fire 2.  Snapshot timer count BEFORE firing so we can identify the
+    // re-arm timer that gets pushed AFTER (find by length-delta, not delay,
+    // because the watchdog default is also 300_000 and was scheduled at
+    // task start).
+    const beforeFire2 = captured.length;
     nowMs = 1_000_000 + 30_000 + 90_000; // 2min mark
-    captured[1]!.handler();
+    fire2!.handler();
     await waitFor(() => h.sinks.telegram.events.length >= 2);
     const e2 = h.sinks.telegram.events[1]!;
     expect(e2.type).toBe("auto_promote_notice");
@@ -525,13 +540,15 @@ describe("auto-promote", () => {
     // State should still be backgrounded (re-fires don't re-transition).
     expect(h.taskState.get().kind).toBe("backgrounded");
 
-    // Fire 2 re-armed at +5min.
-    await waitFor(() => captured.length >= 3);
-    expect(captured[2]!.delay).toBe(300_000);
+    // Fire 2 re-armed at +5min.  Find the new timer pushed AFTER fire 2.
+    await waitFor(() => captured.length > beforeFire2);
+    const fire3 = captured.slice(beforeFire2).find((c) => c.delay === 300_000);
+    expect(fire3).toBeDefined();
 
-    // Fire 3: 7min mark.
+    // Fire 3: 7min mark.  Same snapshot pattern.
+    const beforeFire3 = captured.length;
     nowMs = 1_000_000 + 30_000 + 90_000 + 300_000;
-    captured[2]!.handler();
+    fire3!.handler();
     await waitFor(() => h.sinks.telegram.events.length >= 3);
     const e3 = h.sinks.telegram.events[2]!;
     if (e3.type === "auto_promote_notice") {
@@ -540,8 +557,9 @@ describe("auto-promote", () => {
     }
 
     // Fire 3 re-arms at +5min cap.
-    await waitFor(() => captured.length >= 4);
-    expect(captured[3]!.delay).toBe(300_000);
+    await waitFor(() => captured.length > beforeFire3);
+    const fire4 = captured.slice(beforeFire3).find((c) => c.delay === 300_000);
+    expect(fire4).toBeDefined();
 
     // Cancel the task to clean up.
     const cur = h.taskState.get();
@@ -637,10 +655,14 @@ describe("auto-promote", () => {
     await mgr.init();
 
     const inflight = mgr.handleInbound({ channel: "telegram", text: "x" });
-    await waitFor(() => captured.length >= 1);
+    // Wait for both auto-promote (30_000) AND watchdog (300_000 default).
+    await waitFor(() => captured.length >= 2);
 
-    // Fire 1 — model not ready (attempt 1) — emits warming notice + reschedules.
-    captured[0]!.handler();
+    // Fire 1 (auto-promote, 30_000 delay) — model not ready (attempt 1) —
+    // emits warming notice + reschedules.
+    const fire1 = captured.find((c) => c.delay === 30_000);
+    expect(fire1).toBeDefined();
+    fire1!.handler();
     await waitFor(() => h.sinks.telegram.events.length >= 1);
     const e1 = h.sinks.telegram.events[0]!;
     expect(e1.type).toBe("system_notice");
@@ -649,20 +671,23 @@ describe("auto-promote", () => {
     }
     // No backgrounded transition yet.
     expect(h.taskState.get().kind).toBe("running");
-    // Reschedule at +30s.
-    await waitFor(() => captured.length >= 2);
-    expect(captured[1]!.delay).toBe(30_000);
+    // Reschedule at +30s — second 30_000 timer (cold-start retry).
+    await waitFor(() => captured.filter((c) => c.delay === 30_000).length >= 2);
+    const fire2 = captured.filter((c) => c.delay === 30_000)[1];
+    expect(fire2).toBeDefined();
 
     // Fire 2 — model not ready (attempt 2) — another warming notice.
-    captured[1]!.handler();
+    fire2!.handler();
     await waitFor(() => h.sinks.telegram.events.length >= 2);
     const e2 = h.sinks.telegram.events[1]!;
     expect(e2.type).toBe("system_notice");
     expect(h.taskState.get().kind).toBe("running");
 
     // Fire 3 — model ready — fires the real auto_promote_notice.
-    await waitFor(() => captured.length >= 3);
-    captured[2]!.handler();
+    await waitFor(() => captured.filter((c) => c.delay === 30_000).length >= 3);
+    const fire3 = captured.filter((c) => c.delay === 30_000)[2];
+    expect(fire3).toBeDefined();
+    fire3!.handler();
     await waitFor(
       () =>
         h.sinks.telegram.events.length >= 3 &&
@@ -940,5 +965,293 @@ describe("init() restore-from-disk", () => {
     expect(h.sinks.telegram.events).toHaveLength(0);
     expect(h.sinks.terminal.events).toHaveLength(0);
     expect(h.sinks.whatsapp.events).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Helper: read all audit-log lines emitted today.
+// ---------------------------------------------------------------------------
+
+function readAuditLines(auditDir: string): Record<string, unknown>[] {
+  const today = new Date().toISOString().slice(0, 10);
+  const file = join(auditDir, `audit.${today}.jsonl`);
+  try {
+    const raw = readFileSync(file, "utf8");
+    return raw
+      .split("\n")
+      .filter((s) => s.length > 0)
+      .map((s) => JSON.parse(s) as Record<string, unknown>);
+  } catch {
+    return [];
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Stuck-task fix (plan v2 IMPL-D Step D.4): TaskState watchdog.
+// ---------------------------------------------------------------------------
+
+describe("TaskState watchdog (plan v2 IMPL-D)", () => {
+  test("force-completes a task stuck running past taskWatchdogMs", async () => {
+    const h = makeHarness();
+    const session = makeFakeSession();
+    // Capture every setTimeout so we can identify + manually-fire the
+    // watchdog's timer (vs. the auto-promote's timer).
+    const captured: { handler: () => void; delay: number; id: symbol }[] = [];
+    const setTimeoutFn = vi.fn((handler: () => void, ms: number) => {
+      const id = Symbol(`timer-${captured.length}`);
+      captured.push({ handler, delay: ms, id });
+      return id;
+    });
+    const clearTimeoutFn = vi.fn();
+
+    const mgr = new SessionManager({
+      config: h.config,
+      taskState: h.taskState,
+      pendingConfirms: h.pendingConfirms,
+      sandboxPolicy: h.sandboxPolicy,
+      auditLog: h.auditLog,
+      sinks: h.sinks,
+      basePromptPath: h.basePromptPath,
+      validateModelsJsonOverride: noopValidate,
+      loadSdkOverride: makeFakeSdkLoader(session),
+      setTimeoutFn,
+      clearTimeoutFn,
+      taskWatchdogMs: 100,
+    });
+    await mgr.init();
+
+    const inflight = mgr.handleInbound({ channel: "telegram", text: "stuck task" });
+    // Wait for both the auto-promote (30_000) and the watchdog (100) to be
+    // scheduled.
+    await waitFor(() => captured.length >= 2);
+    const watchdog = captured.find((t) => t.delay === 100);
+    expect(watchdog).toBeDefined();
+
+    // Fire the watchdog timer.
+    watchdog!.handler();
+    await waitFor(() => h.taskState.get().kind === "failed");
+
+    // State transitioned to failed (not idle, since failed is the rescue
+    // sink for stuck-task watchdogs).
+    expect(h.taskState.get().kind).toBe("failed");
+
+    // System notice was emitted to the originating channel.
+    await waitFor(() => h.sinks.telegram.events.length > 0);
+    const notice = h.sinks.telegram.events.find(
+      (e) => e.type === "system_notice",
+    );
+    expect(notice).toBeDefined();
+    if (notice && notice.type === "system_notice") {
+      expect(notice.text).toMatch(/watchdog|stuck|terminal event/i);
+    }
+
+    // Audit entry recorded with reason "watchdog_no_terminal_event".
+    await waitFor(
+      () =>
+        readAuditLines(join(workDir, "audit")).some((e) =>
+          (e.event === "task_failed" &&
+            typeof e.extra === "object" &&
+            e.extra !== null &&
+            (e.extra as Record<string, unknown>).reason ===
+              "watchdog_no_terminal_event"),
+        ),
+    );
+    const found = readAuditLines(join(workDir, "audit")).find(
+      (e) =>
+        e.event === "task_failed" &&
+        typeof e.extra === "object" &&
+        e.extra !== null &&
+        (e.extra as Record<string, unknown>).reason ===
+          "watchdog_no_terminal_event",
+    );
+    expect(found).toBeDefined();
+
+    session.resolveCurrentPrompt!();
+    await inflight;
+    await mgr.dispose();
+  });
+
+  test("watchdog is cancelled when task completes normally (no spurious failure)", async () => {
+    const h = makeHarness();
+    const session = makeFakeSession();
+    const captured: { handler: () => void; delay: number; id: symbol }[] = [];
+    const setTimeoutFn = vi.fn((handler: () => void, ms: number) => {
+      const id = Symbol(`timer-${captured.length}`);
+      captured.push({ handler, delay: ms, id });
+      return id;
+    });
+    const clearedIds: unknown[] = [];
+    const clearTimeoutFn = vi.fn((id: unknown) => {
+      clearedIds.push(id);
+    });
+
+    const mgr = new SessionManager({
+      config: h.config,
+      taskState: h.taskState,
+      pendingConfirms: h.pendingConfirms,
+      sandboxPolicy: h.sandboxPolicy,
+      auditLog: h.auditLog,
+      sinks: h.sinks,
+      basePromptPath: h.basePromptPath,
+      validateModelsJsonOverride: noopValidate,
+      loadSdkOverride: makeFakeSdkLoader(session),
+      setTimeoutFn,
+      clearTimeoutFn,
+      taskWatchdogMs: 100,
+    });
+    await mgr.init();
+
+    const inflight = mgr.handleInbound({ channel: "telegram", text: "ok task" });
+    await waitFor(() => captured.length >= 2);
+    const watchdogTimer = captured.find((t) => t.delay === 100);
+    expect(watchdogTimer).toBeDefined();
+
+    // Simulate a normal completion: emit agent_end via the subscriber.
+    session.emit({ type: "agent_end" });
+    await waitFor(() => h.taskState.get().kind === "completed");
+
+    // The watchdog timer ID should have been cleared.
+    expect(clearedIds).toContain(watchdogTimer!.id);
+
+    // Even if the watchdog handler somehow fired now, the task is in
+    // `completed` state so it should be a no-op (the watchdog checks
+    // running/backgrounded only).
+    watchdogTimer!.handler();
+    await new Promise((r) => setImmediate(r));
+    expect(h.taskState.get().kind).toBe("completed");
+
+    session.resolveCurrentPrompt!();
+    await inflight;
+    await mgr.dispose();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// serial_queue_blocked user notice (plan v2 IMPL-D Step D.5).
+// ---------------------------------------------------------------------------
+
+describe("serial_queue_blocked user notice (plan v2 IMPL-D)", () => {
+  test("second concurrent inbound emits system_notice to originating channel + audit entry", async () => {
+    const h = makeHarness();
+    const session = makeFakeSession();
+    const mgr = new SessionManager({
+      config: h.config,
+      taskState: h.taskState,
+      pendingConfirms: h.pendingConfirms,
+      sandboxPolicy: h.sandboxPolicy,
+      auditLog: h.auditLog,
+      sinks: h.sinks,
+      basePromptPath: h.basePromptPath,
+      validateModelsJsonOverride: noopValidate,
+      loadSdkOverride: makeFakeSdkLoader(session),
+    });
+    await mgr.init();
+
+    // First inbound — starts running.
+    const a = mgr.handleInbound({ channel: "telegram", text: "long task" });
+    await waitFor(() => session.promptCalls.length >= 1);
+    expect(h.taskState.get().kind).toBe("running");
+
+    // Force-complete the queue lock by NOT releasing the prompt yet, then
+    // fire a second inbound.  Because GlobalQueue serializes the run, the
+    // second inbound will run AFTER the first.  We need to test what happens
+    // when the second one acquires the lock and finds running state.
+
+    // Release the first prompt + drain via going to backgrounded so the lock
+    // releases, but state is still busy when the second inbound acquires.
+    const cur = h.taskState.get();
+    if (cur.kind === "running") {
+      h.taskState.tryTransition({
+        kind: "backgrounded",
+        taskId: cur.taskId,
+        startedAt: cur.startedAt,
+        channel: cur.channel,
+        userMessage: cur.userMessage,
+        abort: cur.abort,
+        promotedAt: Date.now(),
+        promotedBy: "auto",
+      });
+    }
+    session.resolveCurrentPrompt!();
+    await a;
+
+    // Now state is `backgrounded`. A second inbound should be rejected
+    // and emit a user-facing notice + audit entry.
+    h.sinks.telegram.events = [];
+    await mgr.handleInbound({ channel: "telegram", text: "follow-up" });
+
+    // System notice on originating channel.
+    expect(h.sinks.telegram.events.length).toBeGreaterThan(0);
+    const notice = h.sinks.telegram.events.find(
+      (e) => e.type === "system_notice",
+    );
+    expect(notice).toBeDefined();
+    if (notice && notice.type === "system_notice") {
+      expect(notice.text).toMatch(/still working|previous request|follow-up/i);
+    }
+
+    // Audit entry recorded.
+    await waitFor(
+      () =>
+        readAuditLines(join(workDir, "audit")).some(
+          (e) => e.event === "serial_queue_blocked",
+        ),
+    );
+    const auditLines = readAuditLines(join(workDir, "audit"));
+    const blocked = auditLines.find((e) => e.event === "serial_queue_blocked");
+    expect(blocked).toBeDefined();
+    expect(blocked!.channel).toBe("telegram");
+
+    // Cleanup.
+    const cur2 = h.taskState.get();
+    if (cur2.kind === "backgrounded") {
+      h.taskState.tryTransition({
+        kind: "completed",
+        taskId: cur2.taskId,
+        startedAt: cur2.startedAt,
+        finishedAt: Date.now(),
+      });
+    }
+    await mgr.dispose();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// prompt_version_changed wiring (plan v2 IMPL-D Step D.6).
+// ---------------------------------------------------------------------------
+
+describe("prompt_version_changed audit (plan v2 IMPL-D)", () => {
+  test("init() emits prompt_version_changed audit entry with path + sha256_first8", async () => {
+    const h = makeHarness();
+    const session = makeFakeSession();
+    const mgr = new SessionManager({
+      config: h.config,
+      taskState: h.taskState,
+      pendingConfirms: h.pendingConfirms,
+      sandboxPolicy: h.sandboxPolicy,
+      auditLog: h.auditLog,
+      sinks: h.sinks,
+      basePromptPath: h.basePromptPath,
+      validateModelsJsonOverride: noopValidate,
+      loadSdkOverride: makeFakeSdkLoader(session),
+    });
+    await mgr.init();
+
+    await waitFor(() =>
+      readAuditLines(join(workDir, "audit")).some(
+        (e) => e.event === "prompt_version_changed",
+      ),
+    );
+    const lines = readAuditLines(join(workDir, "audit"));
+    const entry = lines.find((e) => e.event === "prompt_version_changed");
+    expect(entry).toBeDefined();
+    expect(entry!.task_id).toBeNull();
+    expect(entry!.channel).toBe("system");
+    const extra = entry!.extra as Record<string, unknown>;
+    expect(extra.path).toBe(h.basePromptPath);
+    expect(typeof extra.sha256_first8).toBe("string");
+    expect((extra.sha256_first8 as string).length).toBe(8);
+
+    await mgr.dispose();
   });
 });

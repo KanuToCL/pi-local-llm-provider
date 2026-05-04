@@ -41,7 +41,7 @@
  *     correlate.
  */
 
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 
 import type { AppConfig } from "./config.js";
 import { GlobalQueue } from "./lib/chat-queue.js";
@@ -171,6 +171,15 @@ export interface SessionManagerOpts {
    * Delay between cold-start retries (ms).  Default 30s per Pitfall #20.
    */
   coldStartRetryMs?: number;
+  /** Max duration (ms) a task can stay running/backgrounded before the
+   *  watchdog force-completes it. Defaults to 5 min (300_000 ms).  Adversarial
+   *  Round 2: defense-in-depth against pi-mono builds where neither agent_end
+   *  nor message_end fires (network stall, SDK throw, compaction wedge that
+   *  the null-mapper symmetry doesn't catch).  On expiry the in-flight task
+   *  transitions to `failed` with reason `watchdog_no_terminal_event`, a
+   *  `system_notice` is fanned out to the originating channel, and an audit
+   *  entry is appended.  Tests use a shorter value (e.g. 100ms). */
+  taskWatchdogMs?: number;
   /** Time source (ms). Defaults to Date.now. */
   now?: () => number;
   /** setTimeout function (for fake-timer tests). Defaults to global setTimeout. */
@@ -223,6 +232,11 @@ export class SessionManager {
   /** Cold-start retry counter for the current task.  Cleared when
    *  `clearAutoPromote()` runs. */
   private autoPromoteColdRetries = 0;
+  /** TaskState watchdog timer handle (plan v2 IMPL-D Step D.4).  Set when a
+   *  task transitions to running; cleared on completion / cancel / fail. */
+  private watchdogHandle: unknown = null;
+  /** Task id the watchdog is bound to — CAS guard for late firings. */
+  private watchdogTaskId: string | null = null;
   /** Adapter wrapping pending-confirms.ts to satisfy confirm.ts's interface. */
   private confirmRegistryAdapter: ConfirmToolRegistryContract | null = null;
 
@@ -305,9 +319,10 @@ export class SessionManager {
     // SessionManager does not touch directly. The prompt content is logged
     // via the operator logger so the operator can see what we're feeding
     // pi-mono on this boot.
+    const promptPath =
+      this.opts.basePromptPath ?? "prompts/coding-agent.v2.txt";
     const promptText = composeSystemPrompt({
-      basePromptPath:
-        this.opts.basePromptPath ?? "prompts/coding-agent.v2.txt",
+      basePromptPath: promptPath,
       pointerPath: this.opts.pointerPath,
       pointerSizeCap: this.opts.pointerSizeCap ?? 2000,
     });
@@ -315,6 +330,31 @@ export class SessionManager {
       prompt_chars: promptText.length,
       tools: customTools.length,
     });
+
+    // Plan v2 IMPL-D Step D.6 (PE Skeptic W2 + Observability W3): emit a
+    // forensic-trail audit entry + operator-log entry for the prompt that
+    // was loaded.  The basePromptPath flip (v1 → v2) silently changes
+    // agent behavior; without this, an operator on the production box
+    // can't tell which prompt is in flight from the boot screenshot.  The
+    // audit-schema entry `prompt_version_changed` already exists at
+    // src/audit/schema.ts:113 (added in IMPL-A).
+    const promptSha8 = createHash("sha256")
+      .update(promptText, "utf8")
+      .digest("hex")
+      .slice(0, 8);
+    this.opts.operatorLogger?.info("prompt_version_changed", {
+      path: promptPath,
+      sha256_first8: promptSha8,
+    });
+    void this.opts.auditLog
+      .append({
+        event: "prompt_version_changed",
+        task_id: null,
+        channel: "system",
+        sender_id_hash: null,
+        extra: { path: promptPath, sha256_first8: promptSha8 },
+      })
+      .catch(() => undefined);
 
     const result = await this.sdk.createAgentSession({
       cwd: this.opts.config.piCommsWorkspace,
@@ -353,6 +393,7 @@ export class SessionManager {
       this.unsubscribe = null;
     }
     this.clearAutoPromote();
+    this.clearWatchdog();
     if (this.session) {
       try {
         const close = (this.session as Record<string, unknown>).close;
@@ -395,6 +436,24 @@ export class SessionManager {
     await this.globalQueue.run("global", async () => {
       const current = this.opts.taskState.get();
       if (current.kind === "running" || current.kind === "backgrounded") {
+        // Plan v2 IMPL-D Step D.5 (UX W1 + Adversarial B4): tell the user
+        // their follow-up was eaten.  The §5.1 production symptom was that
+        // multi-message follow-ups silently disappeared; users had no way
+        // to know whether the message was queued, dropped, or just ignored.
+        // Now we emit a single `system_notice` to the originating channel
+        // BEFORE the silent return so the user knows to re-send when the
+        // current task finishes.
+        const notice: ChannelEvent = {
+          type: "system_notice",
+          level: "info",
+          text: "pi: still working on the previous request — your follow-up arrived but is being dropped (single in-flight task). Re-send when this one finishes.",
+          ts: this.now(),
+        };
+        const noticeBag: Record<string, Sink | undefined> = {};
+        const target = this.sinkFor(msg.channel);
+        if (target) noticeBag[msg.channel] = target;
+        void fanOut(noticeBag as SinkBag, notice).catch(() => undefined);
+
         // Drop. Plan §"Architectural revision (Option C)": single in-flight
         // task; channels surface "busy" UX upstream of SessionManager.
         void this.opts.auditLog
@@ -440,6 +499,7 @@ export class SessionManager {
         .catch(() => undefined);
 
       this.scheduleAutoPromote(taskId);
+      this.scheduleWatchdog(taskId);
 
       try {
         // Hand the message to pi-mono.  We pass the running TaskState's
@@ -493,6 +553,7 @@ export class SessionManager {
         }
       } finally {
         this.clearAutoPromote();
+        this.clearWatchdog();
         // SandboxPolicy lifecycle: if a `next-task` un-sand grant was open,
         // re-engage now (per plan §"v4.1 /unsand escape hatch" line 1387).
         // Window-scoped grants outlive task boundaries by design.
@@ -587,6 +648,111 @@ export class SessionManager {
     this.autoPromoteTaskId = null;
     this.autoPromoteFiringNumber = 0;
     this.autoPromoteColdRetries = 0;
+  }
+
+  // ---------------------------------------------------------------------
+  // Private — TaskState watchdog (plan v2 IMPL-D Step D.4)
+  // ---------------------------------------------------------------------
+
+  /**
+   * Schedule the watchdog timer for the in-flight task.  On expiry, if the
+   * task is STILL running/backgrounded, force-transition to `failed` with
+   * reason `watchdog_no_terminal_event`, emit a `system_notice` to the
+   * originating channel, and append an audit entry.
+   *
+   * Defense-in-depth (Round 2 Architect+Adversarial): the null-mapper
+   * symmetry fix (Step D.3) closes the empty-text-message_end hole; this
+   * watchdog catches the deeper hole where pi-mono itself stops emitting
+   * any terminal event (network stall, SDK throw, compaction wedge,
+   * Studio sub-process death).
+   */
+  private scheduleWatchdog(taskId: string): void {
+    this.clearWatchdog();
+    this.watchdogTaskId = taskId;
+    const delay = this.opts.taskWatchdogMs ?? 300_000;
+    this.watchdogHandle = this.setTimeoutFn(() => {
+      void this.fireWatchdog(taskId);
+    }, delay);
+  }
+
+  private clearWatchdog(): void {
+    if (this.watchdogHandle !== null) {
+      try {
+        this.clearTimeoutFn(this.watchdogHandle);
+      } catch {
+        /* ignore */
+      }
+      this.watchdogHandle = null;
+    }
+    this.watchdogTaskId = null;
+  }
+
+  /**
+   * Watchdog handler.  CAS-guarded: drops if the schedule has been cleared
+   * (e.g. task already completed) — even if the captured handler still
+   * fires (fake-timer tests, externally-held references).
+   */
+  private async fireWatchdog(taskId: string): Promise<void> {
+    this.watchdogHandle = null;
+    if (this.watchdogTaskId !== taskId) {
+      return;
+    }
+    const state = this.opts.taskState.get();
+    if (state.kind !== "running" && state.kind !== "backgrounded") {
+      return;
+    }
+    if (state.taskId !== taskId) {
+      return;
+    }
+    const finishedAt = this.now();
+    const reason = "watchdog_no_terminal_event";
+    const transitionResult = this.opts.taskState.tryTransition({
+      kind: "failed",
+      taskId,
+      startedAt: state.startedAt,
+      finishedAt,
+      error: reason,
+    });
+    if (!transitionResult.ok) {
+      return;
+    }
+    this.clearAutoPromote();
+    this.watchdogTaskId = null;
+
+    this.opts.operatorLogger?.error("task_watchdog_fired", {
+      task_id: taskId,
+      reason,
+    });
+
+    const sink = this.sinkFor(state.channel);
+    if (sink) {
+      const notice: ChannelEvent = {
+        type: "system_notice",
+        text: "pi: previous task didn't emit a terminal event within the watchdog window — force-completing so new requests can run.",
+        level: "warn",
+        ts: finishedAt,
+      };
+      void sink.send(notice).catch(() => undefined);
+    }
+
+    void this.opts.auditLog
+      .append({
+        event: "task_failed",
+        task_id: taskId,
+        channel: state.channel,
+        sender_id_hash: null,
+        duration_ms: Math.max(0, finishedAt - state.startedAt),
+        error_class: reason,
+        extra: { reason },
+      })
+      .catch(() => undefined);
+
+    // SandboxPolicy bookkeeping — same path as a normal completion.
+    try {
+      this.opts.sandboxPolicy.onTaskCompleted();
+    } catch {
+      /* sandbox bookkeeping is best-effort */
+    }
   }
 
   /**
@@ -862,6 +1028,7 @@ export class SessionManager {
       finishedAt,
     });
     this.clearAutoPromote();
+    this.clearWatchdog();
     // Emit task_completed with duration_ms so post-incident review can
     // correlate task latency with downstream events.
     void this.opts.auditLog
