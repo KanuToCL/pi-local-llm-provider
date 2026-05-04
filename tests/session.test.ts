@@ -1937,3 +1937,380 @@ describe("checkForStudioModelSwap (plan v2 IMPL-D)", () => {
     await mgr.dispose();
   });
 });
+
+// ---------------------------------------------------------------------------
+// task_completed ChannelEvent rewrite (BLESS S4 — Architect + UX +
+// Integration convergence).  When a `backgrounded` task transitions to
+// `completed`, the user must see a `task_completed` ChannelEvent (which the
+// channel formatters render as `pi: ✅ done.`) — NOT a plain `reply` (which
+// is indistinguishable from a fresh chat reply).
+// ---------------------------------------------------------------------------
+
+describe("backgrounded → completed task_completed rewrite (BLESS S4)", () => {
+  test("backgrounded task → reply rewritten to task_completed ChannelEvent", async () => {
+    const h = makeHarness();
+    const session = makeFakeSession();
+    const mgr = new SessionManager({
+      config: h.config,
+      taskState: h.taskState,
+      pendingConfirms: h.pendingConfirms,
+      sandboxPolicy: h.sandboxPolicy,
+      auditLog: h.auditLog,
+      sinks: h.sinks,
+      basePromptPath: h.basePromptPath,
+      validateModelsJsonOverride: noopValidate,
+      loadSdkOverride: makeFakeSdkLoader(session),
+    });
+    await mgr.init();
+
+    const inflight = mgr.handleInbound({ channel: "telegram", text: "long task" });
+    await waitFor(() => session.promptCalls.length > 0);
+
+    // Manually drive the task to backgrounded (simulating auto-promote
+    // having fired).  This is the precondition for the rewrite.
+    const cur = h.taskState.get();
+    expect(cur.kind).toBe("running");
+    if (cur.kind === "running") {
+      h.taskState.tryTransition({
+        kind: "backgrounded",
+        taskId: cur.taskId,
+        startedAt: cur.startedAt,
+        channel: cur.channel,
+        userMessage: cur.userMessage,
+        abort: cur.abort,
+        promotedAt: Date.now(),
+        promotedBy: "auto",
+      });
+    }
+    const taskIdAtBg = (h.taskState.get() as { taskId: string }).taskId;
+
+    h.sinks.telegram.events = [];
+
+    // pi-mono emits message_end with the assistant's final reply.
+    session.emit({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "all done with that task" }],
+      },
+    });
+    await waitFor(() => h.sinks.telegram.events.length > 0);
+
+    // The ChannelEvent that landed on Telegram MUST be task_completed, NOT
+    // reply.  This is what the channel formatter renders as `pi: ✅ done.`.
+    const evt = h.sinks.telegram.events[0]!;
+    expect(evt.type).toBe("task_completed");
+    if (evt.type === "task_completed") {
+      expect(evt.taskId).toBe(taskIdAtBg);
+      expect(evt.finalMessage).toBe("all done with that task");
+    }
+
+    // markTaskCompleted MUST still fire — task should be `completed`.
+    expect(h.taskState.get().kind).toBe("completed");
+
+    session.resolveCurrentPrompt!();
+    await inflight;
+    await mgr.dispose();
+  });
+
+  test("running (not backgrounded) task → reply unchanged (no rewrite)", async () => {
+    const h = makeHarness();
+    const session = makeFakeSession();
+    const mgr = new SessionManager({
+      config: h.config,
+      taskState: h.taskState,
+      pendingConfirms: h.pendingConfirms,
+      sandboxPolicy: h.sandboxPolicy,
+      auditLog: h.auditLog,
+      sinks: h.sinks,
+      basePromptPath: h.basePromptPath,
+      validateModelsJsonOverride: noopValidate,
+      loadSdkOverride: makeFakeSdkLoader(session),
+    });
+    await mgr.init();
+
+    const inflight = mgr.handleInbound({ channel: "telegram", text: "quick" });
+    await waitFor(() => session.promptCalls.length > 0);
+    expect(h.taskState.get().kind).toBe("running");
+
+    h.sinks.telegram.events = [];
+
+    session.emit({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "hi" }],
+      },
+    });
+    await waitFor(() => h.sinks.telegram.events.length > 0);
+
+    // Task was running (not backgrounded), so the rewrite must NOT fire —
+    // the channel sees a plain reply.
+    const evt = h.sinks.telegram.events[0]!;
+    expect(evt.type).toBe("reply");
+
+    session.resolveCurrentPrompt!();
+    await inflight;
+    await mgr.dispose();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// serial_queue_blocked notice cooldown (BLESS PE Skeptic IMPORTANT 3 + UX
+// IMPORTANT 1).  Spam follow-ups (30 messages) must NOT trigger 30 user-
+// facing system_notices (Telegram 429 risk), but the audit log row should
+// still fire per drop (forensic value preserved).
+// ---------------------------------------------------------------------------
+
+describe("serial_queue_blocked cooldown (BLESS PE Skeptic + UX)", () => {
+  test("second drop within 30s suppressed; audit row still fires", async () => {
+    const h = makeHarness();
+    const session = makeFakeSession();
+    const nowMs = { value: 1_000_000 };
+    const mgr = new SessionManager({
+      config: h.config,
+      taskState: h.taskState,
+      pendingConfirms: h.pendingConfirms,
+      sandboxPolicy: h.sandboxPolicy,
+      auditLog: h.auditLog,
+      sinks: h.sinks,
+      basePromptPath: h.basePromptPath,
+      validateModelsJsonOverride: noopValidate,
+      loadSdkOverride: makeFakeSdkLoader(session),
+      now: () => nowMs.value,
+    });
+    await mgr.init();
+
+    // Move to backgrounded so the queue lock releases but state is still busy.
+    const a = mgr.handleInbound({ channel: "telegram", text: "long" });
+    await waitFor(() => session.promptCalls.length > 0);
+    const cur = h.taskState.get();
+    if (cur.kind === "running") {
+      h.taskState.tryTransition({
+        kind: "backgrounded",
+        taskId: cur.taskId,
+        startedAt: cur.startedAt,
+        channel: cur.channel,
+        userMessage: cur.userMessage,
+        abort: cur.abort,
+        promotedAt: nowMs.value,
+        promotedBy: "auto",
+      });
+    }
+    session.resolveCurrentPrompt!();
+    await a;
+
+    h.sinks.telegram.events = [];
+
+    // First dropped follow-up — emits notice + audit row.
+    await mgr.handleInbound({ channel: "telegram", text: "drop 1" });
+    const noticesAfterFirst = h.sinks.telegram.events.filter(
+      (e) => e.type === "system_notice" && /still working|previous request/i.test(e.text),
+    );
+    expect(noticesAfterFirst).toHaveLength(1);
+
+    // Second dropped follow-up at +5s (within the 30s cooldown) — audit row
+    // STILL fires, but NO new user-facing notice.
+    nowMs.value += 5_000;
+    await mgr.handleInbound({ channel: "telegram", text: "drop 2" });
+    const noticesAfterSecond = h.sinks.telegram.events.filter(
+      (e) => e.type === "system_notice" && /still working|previous request/i.test(e.text),
+    );
+    expect(noticesAfterSecond).toHaveLength(1); // STILL 1 — suppressed.
+
+    // Third dropped follow-up AFTER cooldown (advance past 30s from FIRST) —
+    // notice fires again.
+    nowMs.value += 30_000; // total +35s from first
+    await mgr.handleInbound({ channel: "telegram", text: "drop 3" });
+    const noticesAfterThird = h.sinks.telegram.events.filter(
+      (e) => e.type === "system_notice" && /still working|previous request/i.test(e.text),
+    );
+    expect(noticesAfterThird).toHaveLength(2);
+
+    // Audit log: should have THREE serial_queue_blocked rows (one per drop).
+    let blockedCount = 0;
+    await waitFor(() => {
+      const lines = readAuditLines(join(workDir, "audit"));
+      blockedCount = lines.filter((e) => e.event === "serial_queue_blocked").length;
+      return blockedCount >= 3;
+    }, 1000);
+    expect(blockedCount).toBe(3);
+
+    // Cleanup.
+    const cur2 = h.taskState.get();
+    if (cur2.kind === "backgrounded") {
+      h.taskState.tryTransition({
+        kind: "completed",
+        taskId: cur2.taskId,
+        startedAt: cur2.startedAt,
+        finishedAt: nowMs.value,
+      });
+    }
+    await mgr.dispose();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Watchdog reset on tool_execution_start (BLESS Adversarial NEW-4 + PE).
+// The 5min watchdog default kills legit long tasks (compile kernel, full
+// vitest suite, transcribe 30min audio).  Each tool_execution_start event
+// from pi-mono shows life and re-arms the watchdog.
+// ---------------------------------------------------------------------------
+
+describe("watchdog reset on tool_execution_start (BLESS NEW-4)", () => {
+  test("tool_execution_start re-arms timer; original deadline extended", async () => {
+    const h = makeHarness();
+    const session = makeFakeSession();
+    const captured: { handler: () => void; delay: number; id: symbol }[] = [];
+    const setTimeoutFn = vi.fn((handler: () => void, ms: number) => {
+      const id = Symbol(`timer-${captured.length}`);
+      captured.push({ handler, delay: ms, id });
+      return id;
+    });
+    const clearedIds: unknown[] = [];
+    const clearTimeoutFn = vi.fn((id: unknown) => {
+      clearedIds.push(id);
+    });
+
+    const mgr = new SessionManager({
+      config: h.config,
+      taskState: h.taskState,
+      pendingConfirms: h.pendingConfirms,
+      sandboxPolicy: h.sandboxPolicy,
+      auditLog: h.auditLog,
+      sinks: h.sinks,
+      basePromptPath: h.basePromptPath,
+      validateModelsJsonOverride: noopValidate,
+      loadSdkOverride: makeFakeSdkLoader(session),
+      setTimeoutFn,
+      clearTimeoutFn,
+      taskWatchdogMs: 100,
+    });
+    await mgr.init();
+
+    const inflight = mgr.handleInbound({ channel: "telegram", text: "long task" });
+    // Wait for both auto-promote (30_000) and watchdog (100) to be scheduled.
+    await waitFor(() => captured.length >= 2);
+    const initialWatchdog = captured.find((t) => t.delay === 100);
+    expect(initialWatchdog).toBeDefined();
+    const initialWatchdogId = initialWatchdog!.id;
+
+    // pi-mono emits tool_execution_start (life signal).
+    session.emit({ type: "tool_execution_start" });
+    await new Promise((r) => setImmediate(r));
+
+    // The OLD watchdog timer was cleared, and a NEW one armed.
+    expect(clearedIds).toContain(initialWatchdogId);
+    const newWatchdogTimers = captured.filter((t) => t.delay === 100);
+    expect(newWatchdogTimers.length).toBeGreaterThanOrEqual(2);
+
+    // Multiple tool_execution_start events keep extending.
+    session.emit({ type: "tool_execution_start" });
+    await new Promise((r) => setImmediate(r));
+    const afterTwo = captured.filter((t) => t.delay === 100).length;
+    expect(afterTwo).toBeGreaterThanOrEqual(3);
+
+    session.resolveCurrentPrompt!();
+    await inflight;
+    await mgr.dispose();
+  });
+
+  test("tool_execution_start when no task running → no-op", async () => {
+    const h = makeHarness();
+    const session = makeFakeSession();
+    const captured: { handler: () => void; delay: number; id: symbol }[] = [];
+    const setTimeoutFn = vi.fn((handler: () => void, ms: number) => {
+      const id = Symbol(`timer-${captured.length}`);
+      captured.push({ handler, delay: ms, id });
+      return id;
+    });
+    const clearedIds: unknown[] = [];
+    const clearTimeoutFn = vi.fn((id: unknown) => clearedIds.push(id));
+
+    const mgr = new SessionManager({
+      config: h.config,
+      taskState: h.taskState,
+      pendingConfirms: h.pendingConfirms,
+      sandboxPolicy: h.sandboxPolicy,
+      auditLog: h.auditLog,
+      sinks: h.sinks,
+      basePromptPath: h.basePromptPath,
+      validateModelsJsonOverride: noopValidate,
+      loadSdkOverride: makeFakeSdkLoader(session),
+      setTimeoutFn,
+      clearTimeoutFn,
+    });
+    await mgr.init();
+
+    expect(h.taskState.get().kind).toBe("idle");
+    const beforeCount = captured.length;
+    const beforeClearedCount = clearedIds.length;
+
+    // No task running — emit a stray tool_execution_start.  Should be a no-op.
+    session.emit({ type: "tool_execution_start" });
+    await new Promise((r) => setImmediate(r));
+
+    expect(captured.length).toBe(beforeCount);
+    expect(clearedIds.length).toBe(beforeClearedCount);
+
+    await mgr.dispose();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Mapper logger task_id injection (BLESS Observability N1).  The mapper's
+// framework_reply_dropped / framework_reply_emitted log entries must carry
+// task_id so forensic correlation across audit + operator log + per-task
+// lifecycle events is seamless.
+// ---------------------------------------------------------------------------
+
+describe("mapper logger task_id injection (BLESS Obs N1)", () => {
+  test("mapper logger injects task_id into framework_reply_emitted", async () => {
+    const h = makeHarness();
+    const debugEntries: { event: string; fields: Record<string, unknown> }[] = [];
+    const operatorLogger = {
+      includeContent: true,
+      preview: (s: string | undefined) => s,
+      banner: () => {},
+      info: () => {},
+      debug: (event: string, fields?: Record<string, unknown>) => {
+        debugEntries.push({ event, fields: (fields ?? {}) as Record<string, unknown> });
+      },
+      error: () => {},
+    };
+
+    const session = makeFakeSession();
+    const mgr = new SessionManager({
+      config: h.config,
+      taskState: h.taskState,
+      pendingConfirms: h.pendingConfirms,
+      sandboxPolicy: h.sandboxPolicy,
+      auditLog: h.auditLog,
+      sinks: h.sinks,
+      operatorLogger,
+      basePromptPath: h.basePromptPath,
+      validateModelsJsonOverride: noopValidate,
+      loadSdkOverride: makeFakeSdkLoader(session),
+    });
+    await mgr.init();
+
+    const inflight = mgr.handleInbound({ channel: "telegram", text: "x" });
+    await waitFor(() => session.promptCalls.length > 0);
+    const taskIdAtRun = (h.taskState.get() as { taskId: string }).taskId;
+
+    session.emit({
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: "answer" }] },
+    });
+    await waitFor(() => h.sinks.telegram.events.length > 0);
+
+    // Find the mapper's framework_reply_emitted entry — must have task_id.
+    const emitted = debugEntries.find((e) => e.event === "framework_reply_emitted");
+    expect(emitted).toBeDefined();
+    expect(emitted!.fields.task_id).toBe(taskIdAtRun);
+
+    session.resolveCurrentPrompt!();
+    await inflight;
+    await mgr.dispose();
+  });
+});

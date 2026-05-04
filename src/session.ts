@@ -267,6 +267,13 @@ export class SessionManager {
   // terminal/whatsapp/telegram). If ChannelId becomes per-conversation
   // (e.g. per-DM-thread IDs), add an LRU cap to prevent unbounded growth.
   private lastSwapNoticeAt: Map<ChannelId, number> = new Map();
+  /** BLESS PE Skeptic IMPORTANT 3 + UX IMPORTANT 1: per-channel cooldown
+   *  for serial_queue_blocked notices.  30 messages spammed in a burst
+   *  must NOT produce 30 user-facing notices (Telegram 429 risk), but the
+   *  audit-log row STILL fires per drop (forensic value preserved).
+   *  INVARIANT: bounded by ChannelId union cardinality (currently 3).
+   *  Same shape + same future-tripwire as lastSwapNoticeAt. */
+  private lastQueueBlockedNoticeAt: Map<ChannelId, number> = new Map();
   /** Adapter wrapping pending-confirms.ts to satisfy confirm.ts's interface. */
   private confirmRegistryAdapter: ConfirmToolRegistryContract | null = null;
 
@@ -397,12 +404,22 @@ export class SessionManager {
     // pi-mono's default bash entirely.  This cannot be verified without
     // an installed pi-mono on a Windows production box (the spike rig
     // covers Probe 5 — `tool_call_interception`).  Until that integration
-    // test exists, surface a one-line WARN at boot so post-incident
-    // review sees the assumption in context.
-    this.opts.operatorLogger?.error("classifier_block", {
-      reason:
-        "ASSUMPTION: pi-mono customTools[name='bash'] overrides default; " +
-        "verify by spike on Windows production box (scripts/sdk-spike.ts probe 5).",
+    // test exists, surface a caveat at boot so post-incident review sees
+    // the assumption in context.
+    //
+    // BLESS Architect NEW-1 + Observability N6: re-tagged from
+    // `error("classifier_block", ...)` to `info("daemon_boot", ...)`.
+    // The `classifier_block` event vocabulary is grepped by operators
+    // looking for security incidents (sandboxed-bash classifier flagged
+    // a destructive command); polluting it with a boot-time caveat
+    // poisons that signal.  This is a benign caveat about an unverified
+    // assumption — `info`-level + a `daemon_boot` event makes the
+    // intent unambiguous.
+    this.opts.operatorLogger?.info("daemon_boot", {
+      caveat:
+        "ASSUMPTION: pi-mono customTools[name='bash'] override unverified " +
+        "post-spike. If pi-mono ignores customTools/bash, the unsandboxed " +
+        "default bash tool is exposed (verify via scripts/sdk-spike.ts probe 5).",
     });
 
     this.subscribeToEvents();
@@ -473,19 +490,34 @@ export class SessionManager {
         // Now we emit a single `system_notice` to the originating channel
         // BEFORE the silent return so the user knows to re-send when the
         // current task finishes.
-        const notice: ChannelEvent = {
-          type: "system_notice",
-          level: "info",
-          text: "pi: still working on the previous request — your follow-up arrived but is being dropped (single in-flight task). Re-send when this one finishes.",
-          ts: this.now(),
-        };
-        const noticeBag: Record<string, Sink | undefined> = {};
-        const target = this.sinkFor(msg.channel);
-        if (target) noticeBag[msg.channel] = target;
-        void fanOut(noticeBag as SinkBag, notice).catch(() => undefined);
+        //
+        // BLESS PE Skeptic IMPORTANT 3 + UX IMPORTANT 1: per-channel
+        // cooldown.  30 spammed follow-ups must NOT produce 30 notices
+        // (Telegram 429 risk).  30s cooldown is shorter than swap's 60s
+        // because re-sends are time-sensitive (the user needs to know
+        // their message bounced sooner rather than later) — but still
+        // long enough that a burst of follow-ups collapses to one notice.
+        const QB_COOLDOWN_MS = 30_000;
+        const lastQbAt = this.lastQueueBlockedNoticeAt.get(msg.channel) ?? 0;
+        if (this.now() - lastQbAt >= QB_COOLDOWN_MS) {
+          this.lastQueueBlockedNoticeAt.set(msg.channel, this.now());
+          const notice: ChannelEvent = {
+            type: "system_notice",
+            level: "info",
+            text: "pi: still working on the previous request — your follow-up arrived but is being dropped (single in-flight task). Re-send when this one finishes.",
+            ts: this.now(),
+          };
+          // BLESS Architect NEW-2: typed sinkFor() builder, no `as` cast.
+          const target = this.sinkFor(msg.channel);
+          const noticeBag: SinkBag = target ? { [msg.channel]: target } : {};
+          void fanOut(noticeBag, notice).catch(() => undefined);
+        }
 
         // Drop. Plan §"Architectural revision (Option C)": single in-flight
         // task; channels surface "busy" UX upstream of SessionManager.
+        // Audit-log append fires UNCONDITIONALLY (forensic value preserved
+        // — every drop is recorded for post-incident review even if the
+        // user-facing notice was suppressed by cooldown).
         void this.opts.auditLog
           .append({
             event: "serial_queue_blocked",
@@ -579,6 +611,13 @@ export class SessionManager {
           });
           // Audit the failure with duration_ms so post-incident review can
           // correlate task latency with the failure surface.
+          //
+          // BLESS Security defense-in-depth: pi-mono error chains can
+          // include URL+headers (e.g. an Anthropic SDK error stringifying
+          // a Bearer-bearing fetch).  Symmetric with the reply path's
+          // sanitization (mapper applies redactCredentialShapes to the
+          // assistant text); error_class also goes through the same
+          // scrubber before persistence.
           void this.opts.auditLog
             .append({
               event: "task_failed",
@@ -586,7 +625,7 @@ export class SessionManager {
               channel: msg.channel,
               sender_id_hash: null,
               duration_ms: Math.max(0, finishedAt - startedAt),
-              error_class: error.slice(0, 200),
+              error_class: redactCredentialShapes(error.slice(0, 200)),
             })
             .catch(() => undefined);
         }
@@ -724,6 +763,41 @@ export class SessionManager {
       this.watchdogHandle = null;
     }
     this.watchdogTaskId = null;
+  }
+
+  /**
+   * BLESS Adversarial NEW-4 + PE Skeptic: re-arm the watchdog timer when
+   * pi-mono shows life via `tool_execution_start`.  The default 5min
+   * window kills legitimate long tasks (e.g. compile the kernel,
+   * transcribe 30min audio, the v2 prompt's own example "run vitest full
+   * suite") before they can complete.  By resetting on tool activity, the
+   * watchdog becomes "tool-activity-aware" — only TRULY-stalled sessions
+   * (no tool call for 5min) trip the watchdog.
+   *
+   * No-op when:
+   *   - No watchdog is currently armed (watchdogTaskId === null).
+   *   - The task isn't running/backgrounded (idle/completed/failed/cancelled).
+   *   - The current task's id doesn't match the watchdog's bound id (CAS
+   *     guard against a tool_execution_start event for an old task firing
+   *     after a new task started).
+   */
+  private resetWatchdogIfRunning(): void {
+    const taskId = this.watchdogTaskId;
+    if (taskId === null) return;
+    const state = this.opts.taskState.get();
+    if (state.kind !== "running" && state.kind !== "backgrounded") return;
+    if (state.taskId !== taskId) return;
+    // Re-arm: clear current timer + schedule a new one for the FULL window.
+    if (this.watchdogHandle !== null) {
+      try {
+        this.clearTimeoutFn(this.watchdogHandle);
+      } catch {
+        /* ignore */
+      }
+    }
+    this.watchdogHandle = this.setTimeoutFn(() => {
+      void this.fireWatchdog(taskId);
+    }, this.opts.taskWatchdogMs ?? 300_000);
   }
 
   /**
@@ -959,13 +1033,18 @@ export class SessionManager {
       text,
       ts: this.now(),
     };
-    const sinkBag: Record<string, Sink | undefined> = {};
-    const target = this.opts.sinks[channel as "telegram" | "whatsapp" | "terminal"];
-    if (target) sinkBag[channel] = target;
-    if (this.opts.sinks.terminal && channel !== "terminal") {
-      sinkBag.terminal = this.opts.sinks.terminal;
-    }
-    await fanOut(sinkBag as SinkBag, notice).catch(() => undefined);
+    // BLESS Architect NEW-2: use the typed sinkFor() helper instead of
+    // building the bag with an `as "telegram"|"whatsapp"|"terminal"` cast.
+    // sinkFor() already provides the correct typed lookup; the spread
+    // builder makes the explicit terminal-mirror step a separate concern.
+    const target = this.sinkFor(channel);
+    const terminalMirror =
+      channel !== "terminal" ? this.sinkFor("terminal") : undefined;
+    const sinkBag: SinkBag = {
+      ...(target ? { [channel]: target } : {}),
+      ...(terminalMirror ? { terminal: terminalMirror } : {}),
+    };
+    await fanOut(sinkBag, notice).catch(() => undefined);
   }
 
   /**
@@ -1156,6 +1235,15 @@ export class SessionManager {
         }
       }
 
+      // BLESS Adversarial NEW-4 + PE Skeptic: tool-activity-aware watchdog.
+      // When pi-mono kicks off a tool execution, extend the watchdog so a
+      // long-running tool (compile, full vitest suite, audio transcription)
+      // doesn't get force-killed by the 5min default.  Only truly-stalled
+      // sessions (no tool calls for the full window) now trip it.
+      if (kind === "tool_execution_start") {
+        this.resetWatchdogIfRunning();
+      }
+
       // Cross-cutting safety gate: post-abort silence.
       const stateKind = this.opts.taskState.get().kind;
       if (stateKind === "cancelled") {
@@ -1166,13 +1254,24 @@ export class SessionManager {
       // looser Record<string, unknown> shape — the mapper field set is small
       // and known-scalar (text_length: number, redaction_applied: boolean,
       // reason: string) so widening to LogValue at the boundary is safe.
+      //
+      // BLESS Observability N1: inject task_id into every fields bag so the
+      // mapper's framework_reply_dropped / framework_reply_emitted log
+      // entries can be correlated with audit-log task_id and per-task
+      // operator-log lifecycle events (task_started / task_completed /
+      // task_failed).  task_id is null when no task is active (mapper
+      // shouldn't fire then, but defense-in-depth).
       const opLogger = this.opts.operatorLogger;
       const mapperLogger = opLogger
         ? {
             debug: (msg: string, fields?: Record<string, unknown>) => {
+              const enriched = {
+                ...(fields ?? {}),
+                task_id: this.currentTaskId() ?? null,
+              };
               opLogger.debug(
                 msg,
-                fields as Record<string, string | number | boolean> | undefined,
+                enriched as Record<string, string | number | boolean> | undefined,
               );
             },
           }
@@ -1196,19 +1295,50 @@ export class SessionManager {
         return;
       }
 
+      // BLESS S4 (Architect dissent + UX S4 + Integration B2 — three-elder
+      // convergent finding): when a `backgrounded` task transitions to
+      // `completed`, the user must see a `task_completed` ChannelEvent
+      // (channels render it as `pi: ✅ done. ${finalMessage}`) — NOT a plain
+      // `reply` (indistinguishable from a fresh chat reply).  Both event
+      // types already exist in `src/channels/base.ts` (lines 138-148) and
+      // Telegram's formatChannelEvent already handles them
+      // (`src/channels/telegram.ts:790-793`); this branch is what makes the
+      // task_completed code path live.
+      //
+      // Mirror-trigger ordering: capture the markTaskCompleted decision
+      // BEFORE the rewrite so the condition stays based on the ORIGINAL
+      // event shape (reply).  Both shapes (rewritten task_completed and
+      // unrewritten reply) trigger the mirror; the rewrite only changes
+      // what the channel sees.
+      const shouldMarkCompleted = channelEvent.type === "reply";
+      let outboundEvent: ChannelEvent = channelEvent;
+      if (channelEvent.type === "reply") {
+        const cur = this.opts.taskState.get();
+        if (cur.kind === "backgrounded") {
+          outboundEvent = {
+            type: "task_completed",
+            taskId: cur.taskId,
+            finalMessage: channelEvent.text,
+            ts: channelEvent.ts,
+          };
+        }
+      }
+
       // Fan out to ALL configured sinks. This is the "framework auto-
       // completion" path per plan §"Architectural revision (Option C)".
       const sinkBag: Record<string, Sink | undefined> = {};
       if (this.opts.sinks.terminal) sinkBag.terminal = this.opts.sinks.terminal;
       if (this.opts.sinks.whatsapp) sinkBag.whatsapp = this.opts.sinks.whatsapp;
       if (this.opts.sinks.telegram) sinkBag.telegram = this.opts.sinks.telegram;
-      void fanOut(sinkBag as SinkBag, channelEvent).catch(() => undefined);
+      void fanOut(sinkBag as SinkBag, outboundEvent).catch(() => undefined);
 
       // Belt-and-suspenders: when reply landed AND no agent_end fires (some
       // pi-mono builds emit message_end as the only terminal event), still
       // mark complete.  Idempotent vs the null-mapper branch above thanks
       // to markTaskCompleted's CAS guard inside taskState.tryTransition.
-      if (channelEvent.type === "reply") {
+      // Uses the ORIGINAL channelEvent.type so the rewrite-to-task_completed
+      // above doesn't change which events trigger the mirror.
+      if (shouldMarkCompleted) {
         this.markTaskCompleted();
       }
     });
