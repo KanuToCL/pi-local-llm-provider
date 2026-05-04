@@ -563,13 +563,21 @@ export class SessionManager {
 
       const taskId = freshTaskId();
       const startedAt = this.now();
+      // PE NEW-5 (FIX-W5-A): capture the AbortController locally at CAS time
+      // and reuse the local reference when calling prompt() below.  Re-reading
+      // state to extract the signal opens a microsecond race window: if a
+      // watchdog or /cancel demotes state from running/backgrounded to
+      // terminal/idle BETWEEN the CAS-to-running and the re-read, `signal`
+      // becomes undefined and subsequent /cancel attempts can NOT abort the
+      // in-flight inference.  The local reference closes the race entirely.
+      const abortController = new AbortController();
       const transitionResult = this.opts.taskState.tryTransition({
         kind: "running",
         taskId,
         startedAt,
         channel: msg.channel,
         userMessage: msg.text,
-        abort: new AbortController(),
+        abort: abortController,
       });
       if (!transitionResult.ok) {
         // CAS-to-running failed.  Per UX BLESS-W7 + plan §A.2: emit
@@ -640,12 +648,15 @@ export class SessionManager {
         // signal in v0.2.2 — the subscriber loses its termination role
         // and becomes fan-out only (per plan §A.4 deletion checklist).
         if (this.session) {
-          const live = this.opts.taskState.get();
-          const signal =
-            (live.kind === "running" || live.kind === "backgrounded")
-              ? live.abort.signal
-              : undefined;
-          await this.session.prompt(msg.text, { signal });
+          // PE NEW-5 (FIX-W5-A): use the locally-captured AbortController's
+          // signal directly.  The `transitionResult.ok` branch above guarantees
+          // we own the running state for `taskId`; any subsequent demotion
+          // (watchdog/cancel/auto-promote) reuses the same controller (see
+          // schedulePromote at line ~1451) so the local reference remains the
+          // one and only signal pi-mono honors.
+          await this.session.prompt(msg.text, {
+            signal: abortController.signal,
+          });
         }
       } catch (err) {
         didThrow = true;
@@ -1122,6 +1133,18 @@ export class SessionManager {
         current: state.taskId,
       });
       return;
+    }
+    // Adversarial WARNING (FIX-W5-A): mirror the cancel handler — abort the
+    // in-flight pi-mono prompt BEFORE draining state to idle.  Without this,
+    // pi-mono continues streaming after the watchdog fires; eventually a
+    // delayed `reply` ChannelEvent fans out to the user, who sees BOTH a
+    // "force-completing" notice AND a delayed reply for what they perceive as
+    // one task.  Best-effort: an already-aborted or torn-down controller must
+    // not derail the watchdog drain.
+    try {
+      state.abort.abort();
+    } catch {
+      /* best-effort */
     }
     const finishedAt = this.now();
     const reason = "watchdog_no_terminal_event";

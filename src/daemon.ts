@@ -961,16 +961,25 @@ async function bootAfterLock(
               reason: result.reason ?? "unknown",
             });
           }
-          void auditLog
-            .append({
-              event: "task_cancelled",
-              task_id: cur.taskId,
-              channel: cur.channel,
-              sender_id_hash: null,
-              duration_ms: Math.max(0, cancelledAt - cur.startedAt),
-              extra: { reason: "shutdown" },
-            })
-            .catch(() => undefined);
+          // PE NEW-2 (FIX-W5-A): gate the task_cancelled audit emit on CAS
+          // success.  If markTerminalAndIdle returned ok=false, the race was
+          // lost to handleInbound's catch path which already wrote the
+          // task_failed row for this taskId; emitting task_cancelled here too
+          // would produce TWO audit rows for the same task and confuse
+          // post-incident review.  Race-loser stays silent; race-winner writes
+          // the canonical row.
+          if (result.ok) {
+            void auditLog
+              .append({
+                event: "task_cancelled",
+                task_id: cur.taskId,
+                channel: cur.channel,
+                sender_id_hash: null,
+                duration_ms: Math.max(0, cancelledAt - cur.startedAt),
+                extra: { reason: "shutdown" },
+              })
+              .catch(() => undefined);
+          }
         }
         await taskState.flush();
         // Persist any pending session-ack-tracker writes so the next
