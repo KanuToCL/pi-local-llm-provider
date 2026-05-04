@@ -1062,15 +1062,28 @@ describe("TaskState watchdog (plan v2 IMPL-D)", () => {
     // through to idle in a single atomic call.  Pre-v0.2.2 the test stopped at
     // `failed`; post-v0.2.2 the state should END at `idle`.  The audit row +
     // user-facing notice still fire on the way through (that's what we assert
-    // below).
-    await waitFor(() => h.taskState.get().kind === "idle");
+    // below).  Wait for both state-drain AND the user-facing notice — the
+    // notice fires AFTER markTerminalAndIdle's await flush() resolves, so it
+    // can land a few microtasks after state-drain (avoid waitFor races).
+    // Generous attempt cap because flush() awaits a real JsonStore write
+    // through the workDir — under parallel test-suite load this can take many
+    // setImmediate cycles.
+    await waitFor(() => h.taskState.get().kind === "idle", 1000);
+    await waitFor(
+      () =>
+        h.sinks.telegram.events.some(
+          (e) =>
+            e.type === "system_notice" && /watchdog|terminal event/i.test(e.text),
+        ),
+      1000,
+    );
 
     expect(h.taskState.get().kind).toBe("idle");
 
     // System notice was emitted to the originating channel.
-    await waitFor(() => h.sinks.telegram.events.length > 0);
     const notice = h.sinks.telegram.events.find(
-      (e) => e.type === "system_notice",
+      (e) =>
+        e.type === "system_notice" && /watchdog|terminal event/i.test(e.text),
     );
     expect(notice).toBeDefined();
     if (notice && notice.type === "system_notice") {
@@ -2312,6 +2325,547 @@ describe("mapper logger task_id injection (BLESS Obs N1)", () => {
 
     session.resolveCurrentPrompt!();
     await inflight;
+    await mgr.dispose();
+  });
+});
+
+// ===========================================================================
+// v0.2.2 plan §A.6 — Tests 2-9.  Test 1 lives at line ~1192.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Test 2 — duration_ms realism (Testing B2 + Obs S2).
+// ---------------------------------------------------------------------------
+describe("v0.2.2 §A.6 Test 2: duration_ms realism", () => {
+  test("task_completed duration_ms reflects actual prompt() wall-clock, not subscriber-event arrival time", async () => {
+    const h = makeHarness();
+    const session = makeFakeSession();
+    let nowMs = 1_000_000;
+    const mgr = new SessionManager({
+      config: h.config,
+      taskState: h.taskState,
+      pendingConfirms: h.pendingConfirms,
+      sandboxPolicy: h.sandboxPolicy,
+      auditLog: h.auditLog,
+      sinks: h.sinks,
+      basePromptPath: h.basePromptPath,
+      validateModelsJsonOverride: noopValidate,
+      loadSdkOverride: makeFakeSdkLoader(session),
+      now: () => nowMs,
+    });
+    await mgr.init();
+
+    const inflight = mgr.handleInbound({ channel: "telegram", text: "x" });
+    await waitFor(() => session.promptCalls.length > 0);
+
+    // Intermediate events at +7ms (the v0.2.1 smoking gun was duration_ms=7
+    // because EVERY message_end fired markTaskCompleted).  In v0.2.2 these
+    // are pure no-ops vs termination.
+    nowMs += 7;
+    session.emit({
+      type: "message_end",
+      message: { role: "assistant", content: [] },
+    });
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+
+    // Real inference takes 2 seconds.
+    nowMs += 2000;
+    session.resolveCurrentPrompt!();
+    await inflight;
+
+    // Find the task_completed audit row.
+    let completed: Record<string, unknown> | undefined;
+    await waitFor(() => {
+      const lines = readAuditLines(join(workDir, "audit"));
+      completed = lines.find((e) => e.event === "task_completed");
+      return completed !== undefined;
+    }, 1000);
+    expect(completed).toBeDefined();
+    expect(completed!.duration_ms).toBeGreaterThanOrEqual(2000);
+    expect(completed!.duration_ms).not.toBe(7);
+
+    // Defense-in-depth: no `task_completed_suspiciously_fast` alarm
+    // (duration_ms ≥ 100).
+    const lines = readAuditLines(join(workDir, "audit"));
+    expect(
+      lines.filter((e) => e.event === "task_completed_suspiciously_fast"),
+    ).toHaveLength(0);
+
+    await mgr.dispose();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test 3 — task_completed_suspiciously_fast fires when duration_ms < 100ms.
+// ---------------------------------------------------------------------------
+describe("v0.2.2 §A.6 Test 3: suspiciously-fast alarm (Obs W1)", () => {
+  test("task_completed_suspiciously_fast audit fires when duration_ms < 100ms — catches v0.2.1 bug regression", async () => {
+    const h = makeHarness();
+    const session = makeFakeSession();
+    let nowMs = 1_000_000;
+    const mgr = new SessionManager({
+      config: h.config,
+      taskState: h.taskState,
+      pendingConfirms: h.pendingConfirms,
+      sandboxPolicy: h.sandboxPolicy,
+      auditLog: h.auditLog,
+      sinks: h.sinks,
+      basePromptPath: h.basePromptPath,
+      validateModelsJsonOverride: noopValidate,
+      loadSdkOverride: makeFakeSdkLoader(session),
+      now: () => nowMs,
+    });
+    await mgr.init();
+
+    const inflight = mgr.handleInbound({ channel: "telegram", text: "x" });
+    await waitFor(() => session.promptCalls.length > 0);
+
+    // Resolve the prompt at +50ms (well below 100ms threshold).
+    nowMs += 50;
+    session.resolveCurrentPrompt!();
+    await inflight;
+
+    let fast: Record<string, unknown> | undefined;
+    await waitFor(() => {
+      const lines = readAuditLines(join(workDir, "audit"));
+      fast = lines.find(
+        (e) => e.event === "task_completed_suspiciously_fast",
+      );
+      return fast !== undefined;
+    }, 1000);
+    expect(fast).toBeDefined();
+    expect(fast!.duration_ms).toBe(50);
+
+    await mgr.dispose();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test 4 — N=10 sequential inbounds all complete; cyclicity survives.
+// ---------------------------------------------------------------------------
+describe("v0.2.2 §A.6 Test 4: N=10 cyclicity (Testing B3)", () => {
+  test("N=10 sequential inbounds all complete: state cyclicity survives across many turns", async () => {
+    const h = makeHarness();
+    const session = makeFakeSession();
+    let nowMs = 1_000_000;
+    const mgr = new SessionManager({
+      config: h.config,
+      taskState: h.taskState,
+      pendingConfirms: h.pendingConfirms,
+      sandboxPolicy: h.sandboxPolicy,
+      auditLog: h.auditLog,
+      sinks: h.sinks,
+      basePromptPath: h.basePromptPath,
+      validateModelsJsonOverride: noopValidate,
+      loadSdkOverride: makeFakeSdkLoader(session),
+      now: () => nowMs,
+    });
+    await mgr.init();
+
+    for (let i = 0; i < 10; i++) {
+      const inflight = mgr.handleInbound({
+        channel: "telegram",
+        text: `msg ${i}`,
+      });
+      await waitFor(() => session.promptCalls.length === i + 1);
+      expect(h.taskState.get().kind).toBe("running");
+      nowMs += 200;
+      session.resolveCurrentPrompt!();
+      await inflight;
+      // Cyclicity: state MUST drain back to idle for each round so the next
+      // CAS to running can succeed.
+      expect(h.taskState.get().kind).toBe("idle");
+    }
+
+    // Audit-log shape: 10 task_started + 10 task_completed + 0 cas_failed.
+    let startedCount = 0;
+    let completedCount = 0;
+    await waitFor(() => {
+      const lines = readAuditLines(join(workDir, "audit"));
+      startedCount = lines.filter((e) => e.event === "task_started").length;
+      completedCount = lines.filter((e) => e.event === "task_completed").length;
+      return startedCount === 10 && completedCount === 10;
+    }, 2000);
+    expect(startedCount).toBe(10);
+    expect(completedCount).toBe(10);
+
+    const lines = readAuditLines(join(workDir, "audit"));
+    expect(
+      lines.filter((e) => e.event === "task_state_cas_failed"),
+    ).toHaveLength(0);
+
+    await mgr.dispose();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test 5 — Mixed N=10 (throws + successes) cyclicity.
+// ---------------------------------------------------------------------------
+describe("v0.2.2 §A.6 Test 5: mixed N=10 cyclicity", () => {
+  test("mixed N=10 (throws + successes) all reach a terminal state, NO silent drops", async () => {
+    const h = makeHarness();
+    const session = makeFakeSession();
+    let nowMs = 1_000_000;
+    const mgr = new SessionManager({
+      config: h.config,
+      taskState: h.taskState,
+      pendingConfirms: h.pendingConfirms,
+      sandboxPolicy: h.sandboxPolicy,
+      auditLog: h.auditLog,
+      sinks: h.sinks,
+      basePromptPath: h.basePromptPath,
+      validateModelsJsonOverride: noopValidate,
+      loadSdkOverride: makeFakeSdkLoader(session),
+      now: () => nowMs,
+    });
+    await mgr.init();
+
+    // Replace fake session.prompt() to throw on odd iterations.  The
+    // override owns the prompt-call bookkeeping (do NOT delegate to the
+    // original, otherwise promptCalls double-counts).
+    let iteration = 0;
+    session.prompt = async function (text: string): Promise<void> {
+      this.promptCalls.push({ text });
+      const myIter = iteration++;
+      if (myIter % 2 === 1) {
+        throw new Error(`iteration ${myIter} failed`);
+      }
+      // Even iterations: block until resolveCurrentPrompt fires.
+      await new Promise<void>((resolve) => {
+        this.resolveCurrentPrompt = resolve;
+      });
+    };
+
+    for (let i = 0; i < 10; i++) {
+      const inflight = mgr.handleInbound({
+        channel: "telegram",
+        text: `msg ${i}`,
+      });
+      // For successes, wait for prompt then resolve.  For throws, the
+      // prompt-call is recorded synchronously then throws, so we just await.
+      if (i % 2 === 0) {
+        await waitFor(() => session.promptCalls.length === i + 1);
+        nowMs += 200;
+        session.resolveCurrentPrompt!();
+      }
+      await inflight;
+      expect(h.taskState.get().kind).toBe("idle");
+    }
+
+    let startedCount = 0;
+    let completedCount = 0;
+    let failedCount = 0;
+    await waitFor(() => {
+      const lines = readAuditLines(join(workDir, "audit"));
+      startedCount = lines.filter((e) => e.event === "task_started").length;
+      completedCount = lines.filter((e) => e.event === "task_completed").length;
+      failedCount = lines.filter((e) => e.event === "task_failed").length;
+      return startedCount === 10 && completedCount + failedCount === 10;
+    }, 2000);
+    expect(startedCount).toBe(10);
+    expect(completedCount).toBe(5);
+    expect(failedCount).toBe(5);
+
+    const lines = readAuditLines(join(workDir, "audit"));
+    expect(
+      lines.filter((e) => e.event === "task_state_cas_failed"),
+    ).toHaveLength(0);
+
+    await mgr.dispose();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test 6 — Production-replay regression trap (MIB-2026-05-03-2336).
+// ---------------------------------------------------------------------------
+describe("v0.2.2 §A.6 Test 6: MIB-2026-05-03-2336 regression trap", () => {
+  test("3 sequential inbounds (the production transcript) all produce replies + realistic duration_ms", async () => {
+    const h = makeHarness();
+    const session = makeFakeSession();
+    let nowMs = 1_000_000;
+    const mgr = new SessionManager({
+      config: h.config,
+      taskState: h.taskState,
+      pendingConfirms: h.pendingConfirms,
+      sandboxPolicy: h.sandboxPolicy,
+      auditLog: h.auditLog,
+      sinks: h.sinks,
+      basePromptPath: h.basePromptPath,
+      validateModelsJsonOverride: noopValidate,
+      loadSdkOverride: makeFakeSdkLoader(session),
+      now: () => nowMs,
+    });
+    await mgr.init();
+
+    const inputs = [
+      "say only: i am terminator",
+      "say now: im snow white",
+      "again?",
+    ];
+
+    for (let i = 0; i < inputs.length; i++) {
+      const inflight = mgr.handleInbound({
+        channel: "telegram",
+        text: inputs[i]!,
+      });
+      await waitFor(() => session.promptCalls.length === i + 1);
+
+      // Simulate pi-mono streaming: emit a couple of intermediate
+      // message_end events (user/tool/empty) — pre-v0.2.2 each of these
+      // would have terminated the task with duration_ms=7.
+      session.emit({
+        type: "message_end",
+        message: { role: "user", content: [{ type: "text", text: inputs[i]! }] },
+      });
+      session.emit({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: `reply to msg ${i}` }],
+        },
+      });
+
+      // Realistic inference time.
+      nowMs += 500;
+      session.resolveCurrentPrompt!();
+      await inflight;
+
+      // After each: state idle (cyclicity preserved — pre-v0.2.2 messages
+      // 2 + 3 silently dropped because state stuck in `completed`).
+      expect(h.taskState.get().kind).toBe("idle");
+    }
+
+    // ALL 3 task_completed audit rows must have realistic duration_ms ≥ 100ms.
+    await waitFor(() => {
+      const lines = readAuditLines(join(workDir, "audit"));
+      return (
+        lines.filter((e) => e.event === "task_completed").length === 3
+      );
+    }, 2000);
+    const lines = readAuditLines(join(workDir, "audit"));
+    const completedRows = lines.filter((e) => e.event === "task_completed");
+    expect(completedRows).toHaveLength(3);
+    for (const row of completedRows) {
+      expect(row.duration_ms as number).toBeGreaterThanOrEqual(500);
+      expect(row.duration_ms as number).not.toBe(7);
+    }
+    // No suspiciously-fast alarms.
+    expect(
+      lines.filter((e) => e.event === "task_completed_suspiciously_fast"),
+    ).toHaveLength(0);
+    // All 3 reply ChannelEvents made it to the telegram sink.
+    expect(
+      h.sinks.telegram.events.filter((e) => e.type === "reply"),
+    ).toHaveLength(3);
+
+    await mgr.dispose();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test 7 — task_state_cas_failed audit zod-safety (Adversarial B1).
+// ---------------------------------------------------------------------------
+describe("v0.2.2 §A.6 Test 7: task_state_cas_failed audit zod-safety", () => {
+  test("task_state_cas_failed audit row passes zod schema validation (no undefined fields)", async () => {
+    const h = makeHarness();
+    const session = makeFakeSession();
+    const mgr = new SessionManager({
+      config: h.config,
+      taskState: h.taskState,
+      pendingConfirms: h.pendingConfirms,
+      sandboxPolicy: h.sandboxPolicy,
+      auditLog: h.auditLog,
+      sinks: h.sinks,
+      basePromptPath: h.basePromptPath,
+      validateModelsJsonOverride: noopValidate,
+      loadSdkOverride: makeFakeSdkLoader(session),
+    });
+    await mgr.init();
+
+    // Trigger a TRUE-bug CAS failure (NOT a terminal-state race): patch
+    // tryTransition to refuse the CAS-to-running.  emitCasFailure routes
+    // {from: idle, to: running} as a true bug because `to` is non-terminal
+    // (TERMINAL_RACE_KINDS only includes idle + completed/failed/cancelled).
+    const origTryTransition = h.taskState.tryTransition.bind(h.taskState);
+    h.taskState.tryTransition = function (next): { ok: boolean; reason?: string } {
+      if (next.kind === "running") {
+        return { ok: false, reason: "synthetic test failure" };
+      }
+      return origTryTransition(next);
+    };
+
+    await mgr.handleInbound({ channel: "telegram", text: "follow-up" });
+
+    // Restore.
+    h.taskState.tryTransition = origTryTransition;
+
+    // Audit row must be present + schema-valid (no missing extra.reason etc).
+    let row: Record<string, unknown> | undefined;
+    await waitFor(() => {
+      const lines = readAuditLines(join(workDir, "audit"));
+      row = lines.find((e) => e.event === "task_state_cas_failed");
+      return row !== undefined;
+    }, 1000);
+    expect(row).toBeDefined();
+    expect(row!.channel).toBe("system");
+    const extra = row!.extra as Record<string, unknown>;
+    expect(extra).toBeDefined();
+    expect(typeof extra.from).toBe("string");
+    expect(typeof extra.to).toBe("string");
+    expect(typeof extra.reason).toBe("string");
+    expect(typeof extra.context).toBe("string");
+    // Reason must be the synthetic one (no `?? "unknown"` fallback firing).
+    expect(extra.reason).toBe("synthetic test failure");
+    expect(extra.from).toBe("idle");
+    expect(extra.to).toBe("running");
+
+    await mgr.dispose();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test 8 — restoreFromDisk emits task_state_recovered_on_restart audit.
+// ---------------------------------------------------------------------------
+describe("v0.2.2 §A.6 Test 8: terminal-state recovery audit", () => {
+  test("init() with completed state on disk emits task_state_recovered_on_restart audit", async () => {
+    const h = makeHarness();
+    const persistencePath = join(workDir, "task-state.json");
+    // Pre-populate disk with a completed state (simulates crash between
+    // markTerminalAndIdle's terminal CAS and idle flush).
+    writeFileSync(
+      persistencePath,
+      JSON.stringify({
+        kind: "completed",
+        taskId: "T-RECOVERED",
+        startedAt: 1_000,
+        finishedAt: 2_500,
+      }),
+      "utf8",
+    );
+
+    const taskState = new TaskStateManager({ persistencePath });
+    activeTaskState = taskState;
+    const session = makeFakeSession();
+    const mgr = new SessionManager({
+      config: h.config,
+      taskState,
+      pendingConfirms: h.pendingConfirms,
+      sandboxPolicy: h.sandboxPolicy,
+      auditLog: h.auditLog,
+      sinks: h.sinks,
+      basePromptPath: h.basePromptPath,
+      validateModelsJsonOverride: noopValidate,
+      loadSdkOverride: makeFakeSdkLoader(session),
+    });
+    await mgr.init();
+
+    // State drained to idle.
+    expect(taskState.get().kind).toBe("idle");
+
+    // Audit row emitted with prior_kind + task_id.
+    let row: Record<string, unknown> | undefined;
+    await waitFor(() => {
+      const lines = readAuditLines(join(workDir, "audit"));
+      row = lines.find(
+        (e) => e.event === "task_state_recovered_on_restart",
+      );
+      return row !== undefined;
+    }, 1000);
+    expect(row).toBeDefined();
+    expect(row!.task_id).toBe("T-RECOVERED");
+    expect(row!.channel).toBe("system");
+    const extra = row!.extra as Record<string, unknown>;
+    expect(extra.prior_kind).toBe("completed");
+
+    await mgr.dispose();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test 9 — handleInbound terminal-state cyclicity-normalize (the MIB §3
+// silent-drop regression).
+// ---------------------------------------------------------------------------
+describe("v0.2.2 §A.6 Test 9: cyclicity-normalize on stuck-completed state", () => {
+  test("inbound after stuck-in-completed: cyclicity guard recovers + new task_started fires", async () => {
+    const h = makeHarness();
+    const session = makeFakeSession();
+    const mgr = new SessionManager({
+      config: h.config,
+      taskState: h.taskState,
+      pendingConfirms: h.pendingConfirms,
+      sandboxPolicy: h.sandboxPolicy,
+      auditLog: h.auditLog,
+      sinks: h.sinks,
+      basePromptPath: h.basePromptPath,
+      validateModelsJsonOverride: noopValidate,
+      loadSdkOverride: makeFakeSdkLoader(session),
+    });
+    await mgr.init();
+
+    // Force state to `completed` (bypassing markTerminalAndIdle to simulate
+    // the v0.2.1 silent-drop regression: the subscriber's mirror would set
+    // state to completed and nothing would call the completed→idle edge).
+    h.taskState.tryTransition({
+      kind: "running",
+      taskId: "T-STUCK",
+      startedAt: 1_000,
+      channel: "telegram",
+      userMessage: "x",
+      abort: new AbortController(),
+    });
+    h.taskState.tryTransition({
+      kind: "completed",
+      taskId: "T-STUCK",
+      startedAt: 1_000,
+      finishedAt: 2_000,
+    });
+    expect(h.taskState.get().kind).toBe("completed");
+
+    // Pre-v0.2.2 this inbound would silently drop (CAS to running fails
+    // because state is in `completed`, not `idle`).  Post-v0.2.2 the
+    // cyclicity-normalize guard inside handleInbound recovers via the
+    // completed→idle edge, then CAS to running succeeds.
+    const inflight = mgr.handleInbound({
+      channel: "telegram",
+      text: "follow-up after stuck",
+    });
+    await waitFor(() => session.promptCalls.length > 0);
+
+    // task_started audit row fires for the new task.
+    let started: Record<string, unknown> | undefined;
+    await waitFor(() => {
+      const lines = readAuditLines(join(workDir, "audit"));
+      started = lines.find((e) => e.event === "task_started");
+      return started !== undefined;
+    }, 1000);
+    expect(started).toBeDefined();
+
+    // State is now running for the NEW task (not the stuck T-STUCK).
+    const cur = h.taskState.get();
+    expect(cur.kind).toBe("running");
+    if (cur.kind === "running") {
+      expect(cur.taskId).not.toBe("T-STUCK");
+    }
+
+    // Emit a message_end so the subscriber fans out a reply ChannelEvent
+    // (terminating side-effects are owned by markTaskCompletedAndIdle in
+    // v0.2.2; the subscriber is fan-out only).
+    session.emit({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "I recovered from the stuck state" }],
+      },
+    });
+    session.resolveCurrentPrompt!();
+    await inflight;
+    // Reply landed (no silent drop) AND state drained back to idle.
+    expect(h.sinks.telegram.events.length).toBeGreaterThan(0);
+    const reply = h.sinks.telegram.events.find((e) => e.type === "reply");
+    expect(reply).toBeDefined();
+    expect(h.taskState.get().kind).toBe("idle");
+
     await mgr.dispose();
   });
 });

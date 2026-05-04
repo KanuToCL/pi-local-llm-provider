@@ -345,6 +345,24 @@ export class SessionManager {
         await sink.send(event).catch(() => undefined);
       }
     }
+    // v0.2.2: terminal state on disk = crash between markTerminalAndIdle's
+    // terminal CAS and idle flush.  Per Adversarial re-bless NEW-2 + PE
+    // BLESS-B1: emit a `task_state_recovered_on_restart` audit event with
+    // the prior taskId + kind so post-incident review can correlate with
+    // channel-side delivery records (the user MAY have received the reply).
+    // Channel = "system" (daemon-internal bookkeeping).
+    if (restore.recovered) {
+      const rec = restore.recovered;
+      await this.opts.auditLog
+        .append({
+          event: "task_state_recovered_on_restart",
+          task_id: rec.taskId,
+          channel: "system",
+          sender_id_hash: null,
+          extra: { prior_kind: rec.priorKind },
+        })
+        .catch(() => undefined);
+    }
 
     const loader = this.opts.loadSdkOverride ?? loadSdk;
     this.sdk = await loader();
