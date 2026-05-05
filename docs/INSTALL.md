@@ -376,6 +376,27 @@ WARNING — production-safety constraints when enabling debug:
    ALL operator-log levels. Verify your audit-log retention
    (`AuditLog.purgeOlderThan`, default 90 days) handles the increased rate.
 
+### v0.3 semantic shift — `pi_stuck_suspected stale_source=telegram-poll`
+
+Pre-v0.3, this audit row was **noisy**: the `telegram-poll` heartbeat only
+refreshed on update-receipt, so a 10-minute idle window with no inbound DMs
+was indistinguishable from a wedged poller. Most pre-v0.3 operators learned
+to ignore it, which made it useless as a signal.
+
+Post-v0.3, this audit row is **actionable**. The G1 grammY transformer
+refreshes `telegram-poll` on every successful `getUpdates` long-poll resolve
+(empty *or* with updates), so a stale heartbeat now genuinely means the
+polling layer is silent — which is itself the trigger condition for the G2
+watchdog to call `telegramChannel.restart()` automatically.
+
+If you see a `pi_stuck_suspected stale_source=telegram-poll` row on a v0.3+
+daemon, treat it as the leading edge of a real polling-layer issue. The
+matching restart cycle (`telegram_restart`, optional `telegram_restart_failed`,
+optional `telegram_restart_skipped`) will follow in the same audit file. The
+canonical investigation recipes — including the forensic jq one-liner and
+the three common incident patterns — live in
+[`docs/audit-log-query-playbook.md`](./audit-log-query-playbook.md).
+
 ---
 
 ## Operator log paths (per OS)
