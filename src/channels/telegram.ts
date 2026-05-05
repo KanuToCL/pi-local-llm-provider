@@ -39,9 +39,11 @@ import type {
   Sink,
 } from "./base.js";
 import type { AuditLog } from "../audit/log.js";
-import type { AuditEntry } from "../audit/schema.js";
+import type { AuditEntry, RestartReason } from "../audit/schema.js";
 import type { InboundRateLimiter } from "../lib/inbound-rate-limit.js";
 import type { OperatorLogger } from "../utils/operator-logger.js";
+import { monotonicMs } from "../lib/clock.js";
+import { installPollAttemptTransformer } from "./poll-attempt-transformer.js";
 
 /**
  * Pluggable downloader used to fetch a Telegram file given its API URL.
@@ -203,8 +205,11 @@ const TELEGRAM_FILE_API_BASE = "https://api.telegram.org/file/bot";
  *   stop():   bot.stop(), clear typing timer, emit `telegram_disconnect`.
  */
 export class TelegramChannel implements Sink {
-  private readonly bot: Bot;
+  // NOT readonly — `restart()` (Plan v3 §1.2c) reassigns this with a freshly
+  // constructed Bot to recover from outbound TCP wedges (Adversarial B2).
+  private bot: Bot;
   private readonly botToken: string;
+  private readonly botFactory: (token: string) => Bot;
   private readonly allowedUserIds: ReadonlySet<string>;
   private readonly inboundProcessor: InboundProcessor;
   private readonly chunkSize: number;
@@ -252,9 +257,11 @@ export class TelegramChannel implements Sink {
   private startPromise: Promise<void> | null = null;
 
   constructor(opts: TelegramChannelOpts) {
-    this.bot = opts.botFactory
-      ? opts.botFactory(opts.botToken)
-      : new Bot(opts.botToken);
+    // Save factory so restart() (Plan v3 §1.2c) can reconstruct the Bot via
+    // the same path the constructor used. Default factory matches v0.2.2
+    // semantics (`new Bot(token)`) so absent-factory callers don't change.
+    this.botFactory = opts.botFactory ?? ((token: string) => new Bot(token));
+    this.bot = this.botFactory(opts.botToken);
     this.botToken = opts.botToken;
     this.allowedUserIds = opts.allowedUserIds;
     this.inboundProcessor = opts.inboundProcessor;
@@ -272,6 +279,18 @@ export class TelegramChannel implements Sink {
     this.senderIdHash = opts.senderIdHash
       ? (id) => opts.senderIdHash!(String(id))
       : (id) => hashSenderId(id);
+
+    // Plan v3 §1.2b — wire heartbeat through the API transformer so it
+    // fires on every successful `getUpdates` (incl. empty long-poll
+    // returns), not just on update receipt. Replaces the v0.2.2
+    // first-middleware that touched onPoll.
+    installPollAttemptTransformer(this.bot, () => {
+      try {
+        this.onPoll?.();
+      } catch {
+        /* heartbeat best-effort; never break the bot loop */
+      }
+    });
 
     this.installMiddleware();
     this.installHandlers();
@@ -319,9 +338,15 @@ export class TelegramChannel implements Sink {
     this.startPromise = this.bot.start().catch((error) => {
       // Long-poll failures are non-fatal at this layer; log + audit and
       // let the daemon decide whether to restart.
+      // Plan v3 §1.2d (Security B1): grammY error messages may carry the
+      // bot token (e.g., embedded in the api.telegram.org URL). Redact
+      // before stamping into operator logs.
       this.operatorLogger?.error("telegram_polling_error", {
         error_class: error instanceof Error ? error.name : "unknown",
-        message: error instanceof Error ? error.message : String(error),
+        message: redactBotToken(
+          this.botToken,
+          error instanceof Error ? error.message : String(error),
+        ),
       });
       void this.audit({
         event: "telegram_disconnect",
@@ -351,6 +376,126 @@ export class TelegramChannel implements Sink {
       channel: "telegram",
       sender_id_hash: null,
     });
+  }
+
+  /**
+   * Tear down the current Bot and reconstruct a fresh one (Plan v3 §1.2c —
+   * Adversarial B2).
+   *
+   * Why full reconstruction (not just `bot.stop()` + `bot.start()`):
+   *
+   *   The H1/H2 production hangs (MIB-2026-05-05-1751) presented as wedged
+   *   long-poll loops where the entire `Bot.api` outbound transport had
+   *   stopped delivering. A simple stop+start re-uses the same underlying
+   *   node-fetch agent + TCP connection-keepalive table — if the kernel-side
+   *   handle is wedged, those persist across `start()`. By going through
+   *   `botFactory(token)` again we get fresh `Bot`, fresh `bot.api`, fresh
+   *   transformer chain, fresh fetch agent. New TCP connections from
+   *   scratch.
+   *
+   * Audit semantics:
+   *
+   *   - `telegram_restart` is emitted BEFORE `bot.stop()` so a partial
+   *     failure (e.g., reconstruction throw) still leaves a forensic row.
+   *     The watchdog correlates `telegram_restart` against the lack of a
+   *     subsequent `telegram_restart_completed` operator log to detect
+   *     restart-attempt failures across daemon boots.
+   *   - `telegram_restart_failed` is emitted in the catch block with the
+   *     error class + redacted message + monotonic latency_ms.
+   *
+   * Latency math uses `monotonicMs()` (Adversarial CONCERN-2): a host
+   * suspend mid-restart MUST NOT surface a phantom multi-hour latency
+   * — the OS pauses hrtime alongside the process so resume-after-suspend
+   * is naturally bounded.
+   *
+   * Throws if reconstruction fails. The watchdog catches and surfaces this
+   * as a consecutive-failure for the restart cooldown / panic ladder.
+   */
+  async restart(reason: RestartReason): Promise<void> {
+    // Audit BEFORE the operation so a partial-failure leaves the row.
+    await this.audit({
+      event: "telegram_restart",
+      task_id: null,
+      channel: "telegram",
+      sender_id_hash: null,
+      extra: { reason },
+    });
+    // OperatorLogger has no `warn` method (info/debug/error only — see
+    // src/utils/operator-logger.ts:43); restart-initiated is operator-
+    // visible and not an error so it goes to info.
+    this.operatorLogger?.info("telegram_restart_initiated", { reason });
+
+    const startMs = monotonicMs();
+    try {
+      // Stop the in-flight poller. AbortSignal threading is grammY-internal
+      // (see node_modules/grammy/out/bot.js:290-297, 424). Returns within
+      // ~pollTimeoutSec worst case; typically <100ms for healthy stops.
+      // Hung-poll case waits for the long-poll's TCP-level timeout — which
+      // is exactly the case the watchdog sized its restart-deadline against.
+      if (this.bot.isRunning()) await this.bot.stop();
+
+      // FULL Bot reconstruction (Adversarial B2). New TCP connections,
+      // fresh node-fetch agent, fresh handle table on Windows. Addresses
+      // the H1/H2 root-cause scenarios where the entire Bot.api transport
+      // is wedged.
+      this.bot = this.botFactory(this.botToken);
+      installPollAttemptTransformer(this.bot, () => {
+        try {
+          this.onPoll?.();
+        } catch {
+          /* heartbeat best-effort */
+        }
+      });
+      this.installErrorHandler();
+      this.installMiddleware();
+      this.installHandlers();
+      // Re-probe — same as initial connect(). Confirms the fresh Bot
+      // actually reaches Telegram before we declare ourselves alive.
+      await this.bot.api.getMe();
+      // Immediately enter the loop. bot.start() resolves only on stop(),
+      // so we MUST NOT await it.
+      void this.bot.start().catch((error) => {
+        this.operatorLogger?.error("telegram_polling_error", {
+          error_class: error instanceof Error ? error.name : "unknown",
+          message: redactBotToken(
+            this.botToken,
+            error instanceof Error ? error.message : String(error),
+          ),
+        });
+      });
+      this.connected = true;
+      const latencyMs = monotonicMs() - startMs;
+      this.operatorLogger?.info("telegram_restart_completed", {
+        reason,
+        latency_ms: latencyMs,
+      });
+    } catch (e) {
+      const latencyMs = monotonicMs() - startMs;
+      const errorClass = e instanceof Error ? e.name : "unknown";
+      // Plan v3 §1.2d (Security B1): redact the failure message before it
+      // hits the operator log — grammY errors can carry the bot token in
+      // embedded api.telegram.org URLs.
+      const message = redactBotToken(
+        this.botToken,
+        e instanceof Error ? e.message : String(e),
+      );
+      this.operatorLogger?.error("telegram_restart_failed", {
+        reason,
+        latency_ms: latencyMs,
+        error_class: errorClass,
+        message,
+      });
+      await this.audit({
+        event: "telegram_restart_failed",
+        task_id: null,
+        channel: "telegram",
+        sender_id_hash: null,
+        error_class: errorClass,
+        extra: { reason, latency_ms: latencyMs },
+      });
+      this.connected = false;
+      throw e; // surface to watchdog for consecutive-failure tracking
+    }
   }
 
   isConnected(): boolean {
@@ -431,18 +576,15 @@ export class TelegramChannel implements Sink {
    * always records the rejection reason.
    */
   private installMiddleware(): void {
-    // First middleware: heartbeat-touch on EVERY inbound update.  Per
-    // Heartbeat invariant, this fires regardless of whether the update is
-    // ultimately admitted (DM-only / allowlist filters happen later).  The
-    // poll itself succeeded so the long-poll liveness is real.
-    this.bot.use(async (_ctx, next) => {
-      try {
-        this.onPoll?.();
-      } catch {
-        /* heartbeat is best-effort; never break the bot loop */
-      }
-      await next();
-    });
+    // NOTE (Plan v3 §1.2b): the v0.2.2 first-middleware that fired
+    // `onPoll?.()` on every inbound update is REMOVED in v0.3 — heartbeat
+    // is now wired through the grammY API transformer
+    // (`installPollAttemptTransformer`, called from the constructor and
+    // from `restart()`). The transformer fires on every successful
+    // `getUpdates` poll attempt regardless of update count, fixing the
+    // F2 false-positive ("healthy-but-quiet bot indistinguishable from
+    // wedged bot") that bit production on 2026-05-04
+    // (MIB-2026-05-05-1751).
 
     // Per-sender / per-channel rate-limit gate (FIX-B-3 Wave 8).  Runs
     // BEFORE DM-only / allowlist so a flooding sender cannot exhaust
@@ -841,6 +983,45 @@ export function formatChannelEvent(event: ChannelEvent): string {
 // ---------------------------------------------------------------------------
 // Internal — sender-id hashing for audit
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Internal — bot-token redactor (INLINE TEMPORARY for v0.3 Wave 1.1)
+// ---------------------------------------------------------------------------
+
+/**
+ * Strip any occurrence of the literal bot token AND the canonical
+ * `<digits>:<token>` shape from a string. Defense-in-depth so grammY
+ * error messages — which can carry the token embedded in
+ * api.telegram.org URLs — don't end up in operator logs (Security B1).
+ *
+ * Two redaction passes:
+ *   1. Literal substring of the install's bot token (catches the raw form).
+ *   2. The Telegram-bot-token shape (`<id>:<secret>`) anywhere in the
+ *      string (catches URL-embedded forms regardless of which install
+ *      the token belongs to — defense if a copy/paste mishap puts another
+ *      bot's token through this code path).
+ *
+ * TODO(IMPL-W1-G8): replace inline with `src/lib/redact.ts` import once
+ * the wave-sibling implementation lands. The signatures are intentionally
+ * different right now (this one takes the install's token as a leading
+ * arg for the literal-substring pass) so the integration commit can do
+ * a focused review of the consolidated helper.
+ */
+function redactBotToken(installToken: string, message: string): string {
+  if (!message) return "";
+  let out = message;
+  // Pass 1: the install's literal token. Cheap split/join (no regex
+  // escaping concerns).
+  if (installToken && installToken.length >= 16) {
+    out = out.split(installToken).join("[REDACTED]");
+  }
+  // Pass 2: any Telegram-bot-token-shaped substring.
+  out = out.replace(
+    /\b\d{8,12}:[A-Za-z0-9_-]{30,}\b/g,
+    "[REDACTED]",
+  );
+  return out;
+}
 
 /**
  * Quick non-salted hash for inline use during request handling.  The
