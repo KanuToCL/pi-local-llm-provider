@@ -429,21 +429,21 @@ export class TelegramPollWatchdog {
     // watchdog exists to provide. Drop snapshot from the hot path and
     // fire it best-effort AFTER the decision (see operator-log call below).
     //
-    // FIX-C (post-AUDIT-G2 MINOR-3): emit `heartbeat_ages_json` so any
-    // future heartbeat source flows into operator logs without a code
-    // change here.  Empty object on the synchronous emit; the post-
-    // decision fire-and-forget snapshot enriches forensic context with
-    // the real ages.
-    //
     // OperatorLogger has no `warn` method (info/debug/error only — see
     // src/utils/operator-logger.ts:46-49). Plan v3 §2.1b says `warn`; we
     // adapt to `info` per the plan's "match G1's adaptation" guidance,
     // since stale-restart is not an error (the daemon is self-healing) but
     // is operator-visible.
+    //
+    // FIX-W5 (post-BLESS Adversarial IMP-2 + Obs W1 + Security C1, 3-elder
+    // convergence): the synchronous emit no longer carries a perpetually-
+    // empty `heartbeat_ages_json: "{}"` field — operators grepping it just
+    // saw `{}` and got nothing useful. The full heartbeat snapshot lands in
+    // the deferred `telegram_poll_stale_restart_full_snapshot` line below.
+    // Operators correlate via timestamp + age_ms.
     this.operatorLogger.info("telegram_poll_stale_restart", {
       age_ms: ageMs,
       threshold_ms: this.staleMs,
-      heartbeat_ages_json: JSON.stringify({}),
     });
 
     // FIX-B continued: fire-and-forget snapshot AFTER the decision is made.

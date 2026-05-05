@@ -147,6 +147,22 @@ const icons: Record<string, string> = {
 
   // Per-sender / per-channel ingress rate limiting (FIX-B-3 Wave 8).
   inbound_rate_limited: "🚦",
+
+  // v0.3 — telegram self-healing watchdog + restart family (FIX-W5,
+  // post-BLESS UX NIT). Icons consistent with existing vocabulary:
+  // `🔄` reuses studio_model_swap_detected for "in progress",
+  // `🔁` reuses task_abandoned_on_restart for "completed", `💔` reuses
+  // studio_health_fail for "failed", `🛑` reuses task_cancelled for
+  // "giving up", `🤔` reuses pi_stuck_suspected for "stale-suspected",
+  // `📊` is new (forensic snapshot), `⚙️` reuses task_running for
+  // "watchdog tick error".
+  telegram_restart_initiated: "🔄",
+  telegram_restart_completed: "🔁",
+  telegram_restart_failed: "💔",
+  telegram_restart_giving_up: "🛑",
+  telegram_poll_stale_restart: "🤔",
+  telegram_poll_stale_restart_full_snapshot: "📊",
+  telegram_poll_watchdog_error: "⚙️",
 };
 
 export function createOperatorLogger(options: OperatorLoggerOptions): OperatorLogger {

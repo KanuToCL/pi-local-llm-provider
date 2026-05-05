@@ -985,10 +985,6 @@ export function formatChannelEvent(event: ChannelEvent): string {
 // Internal — sender-id hashing for audit
 // ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// Internal — bot-token redactor (INLINE TEMPORARY for v0.3 Wave 1.1)
-// ---------------------------------------------------------------------------
-
 /**
  * Quick non-salted hash for inline use during request handling.  The
  * daemon's full audit pipeline (AuditLog.senderIdHash) uses a salted
