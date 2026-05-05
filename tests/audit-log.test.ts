@@ -46,12 +46,18 @@ function readAllLines(file: string): unknown[] {
 }
 
 describe("AuditLog.append", () => {
-  test("rejects an unknown event kind", async () => {
+  test("rejects an empty event identifier", async () => {
+    // v0.3 (Plan v3 §1.1c, Integration I1): the AuditEntrySchema.event
+    // field was relaxed from a closed enum to z.string() so v0.2.2 can
+    // replay v0.3+ logs without ZodError. The closed-enum guard moved
+    // to the WRITE-SIDE AuditEventTypeSchema constant (callers validate
+    // their inputs there). The append() validator now only enforces the
+    // shape contract: non-empty, ≤64 chars.
     const log = new AuditLog({ dir: workDir, daemonStartTs: Date.now() });
     await expect(
       log.append({
-        // @ts-expect-error — deliberately bad enum
-        event: "not_a_real_event",
+        // Empty string fails the AuditEntrySchema.event refine (length>0).
+        event: "",
         task_id: null,
         channel: "system",
         sender_id_hash: null,

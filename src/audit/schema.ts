@@ -57,8 +57,19 @@ import { z } from "zod";
  *   - session bookkeeping: recreate, autocompaction
  *   - sandbox / un-sand: enabled, disabled, force-engaged-on-boot
  *   - prompt versioning: prompt_version_changed
+ *
+ * v0.3 (Plan v3 §1.1): defense-in-depth split — `AuditEventTypeSchema` is the
+ * write-side closed enum (callers use it to validate inputs at WRITE time).
+ * `AuditEntrySchema.event` is read-side relaxed to `z.string()` so v0.2.2
+ * daemons can replay v0.3+ audit logs without ZodError. Write-side typing is
+ * preserved by callers using the typed enum at the call site
+ * (`event: "telegram_restart" as const` etc.).
+ *
+ * NOTE: `AuditEventType` (no `Schema` suffix) is preserved as the historical
+ * value-export name AND the Zod-inferred type alias for backwards compatibility
+ * with existing callers; `AuditEventTypeSchema` is the v0.3 spec-aligned alias.
  */
-export const AuditEventType = z.enum([
+export const AuditEventTypeSchema = z.enum([
   // Daemon lifecycle
   "daemon_boot",
   "daemon_shutdown",
@@ -153,17 +164,61 @@ export const AuditEventType = z.enum([
   // sender_id_hash).  Per Files Touched table.
   "telegram_inbound",
   "whatsapp_inbound",
+  // v0.3 — Telegram polling resilience (Plan v3 §1.1a).
+  // Watchdog-driven restart lifecycle:
+  //   - "telegram_restart"          : restart attempt initiated
+  //   - "telegram_restart_failed"   : restart attempt threw an error
+  //   - "telegram_restart_skipped"  : watchdog skipped restart due to cooldown
+  // `extra.reason` for these events MUST be a `RestartReason` (closed enum
+  // below). Future free-form reason additions require enum extension — never
+  // operator-supplied strings.
+  "telegram_restart",
+  "telegram_restart_failed",
+  "telegram_restart_skipped",
 ]);
 
-export type AuditEventType = z.infer<typeof AuditEventType>;
+/**
+ * v0.3 alias for the historical export name. Existing callers that imported
+ * `AuditEventType` keep working; new v0.3 code uses `AuditEventType` (the
+ * type alias declared just below) for the inferred TS type.
+ */
+export const AuditEventType = AuditEventTypeSchema;
+export type AuditEventType = z.infer<typeof AuditEventTypeSchema>;
+
+/**
+ * Closed enum of permissible `extra.reason` values for any
+ * `telegram_restart*` audit event (Plan v3 §1.1b, Security B2).
+ *
+ * Write-side discipline: callers constructing a `telegram_restart*` row
+ * SHOULD validate `extra.reason` against this schema before append. The
+ * AuditEntrySchema itself does NOT enforce this (extra is a generic scalar
+ * record) so that v0.3 daemons can still parse v0.4+ rows that introduce
+ * new reason values — same forward-compat shape as the `event` field.
+ *
+ * Adding a new reason requires extending this enum AND updating the
+ * dashboards / replay tooling that aggregate restart-reason histograms.
+ * Operator-supplied free-form reasons are never permitted.
+ */
+export const RestartReasonSchema = z.enum(["poll_silent_too_long", "manual"]);
+export type RestartReason = z.infer<typeof RestartReasonSchema>;
 
 export const AuditEntrySchema = z.object({
   /** ISO-8601 UTC timestamp produced at append time. */
   ts: z.string(),
   /** Integer seconds since daemon boot. */
   daemon_uptime_s: z.number().int().nonnegative(),
-  /** Event kind — see `AuditEventType` for the closed enumeration. */
-  event: AuditEventType,
+  /**
+   * Event kind. Read-side relaxed (Plan v3 §1.1c, Integration I1):
+   * accepts any non-empty short identifier so a v0.2.2 daemon can replay
+   * v0.3+ audit logs containing future event kinds without ZodError.
+   *
+   * Write-side typing remains strict — callers should construct rows
+   * using the exported `AuditEventTypeSchema` constant (or the typed
+   * literal at the call site, e.g. `event: "telegram_restart" as const`).
+   */
+  event: z.string().refine((v) => v.length > 0 && v.length <= 64, {
+    message: "audit event must be a non-empty short identifier",
+  }),
   /** Task this event belongs to, or `null` for daemon-wide events. */
   task_id: z.string().nullable(),
   /** Originating channel; 'system' for daemon-internal events. */
