@@ -120,11 +120,13 @@ export interface SessionManagerOpts {
   sinks: SessionSinks;
   /** GPU-bound serializer. Defaults to a fresh `GlobalQueue` if omitted. */
   globalQueue?: GlobalQueue;
-  /** Path to the SHA-pinned base prompt. Defaults to `prompts/coding-agent.v2.txt`
-   *  (v2 added the explicit Default Response Mode rule for small models that
-   *  treat every available tool as something they MUST call — see plan v2
-   *  Phase A). The default flips with every prompt rev; bump the v-number and
-   *  the SHA pin in `tests/system-prompt.test.ts` together. */
+  /** Path to the SHA-pinned base prompt. Defaults to `prompts/coding-agent.v3.txt`
+   *  (v3 added the conditional Host environment section per Ring of Elders
+   *  v0.3 §1.3 — substitutes `${HOST_ENV_SECTION}` with OS-specific shell
+   *  guidance to stop pi-mono from emitting POSIX-only commands on Windows.
+   *  v2 is preserved as the config-rollback fallback fixture per PE I5).
+   *  The default flips with every prompt rev; bump the v-number and the SHA
+   *  pin in `tests/system-prompt.test.ts` together. */
   basePromptPath?: string;
   /**
    * Optional callback fired whenever pi-mono shows life — at message_start /
@@ -376,11 +378,18 @@ export class SessionManager {
     // via the operator logger so the operator can see what we're feeding
     // pi-mono on this boot.
     const promptPath =
-      this.opts.basePromptPath ?? "prompts/coding-agent.v2.txt";
+      this.opts.basePromptPath ?? "prompts/coding-agent.v3.txt";
     const promptText = composeSystemPrompt({
       basePromptPath: promptPath,
       pointerPath: this.opts.pointerPath,
       pointerSizeCap: this.opts.pointerSizeCap ?? 2000,
+      // Plan v3 §1.3 (F3-A v0.3): pi-mono picks up POSIX-only commands from
+      // its training distribution and runs them on Windows where they fail
+      // (mkdir -p, cat, rm -rf). composeSystemPrompt substitutes the v3
+      // prompt's ${HOST_ENV_SECTION} placeholder with an OS-specific block,
+      // pre-emptively warning the model. process.platform is validated
+      // against an allow-list inside the loader.
+      hostOs: process.platform,
     });
     this.opts.operatorLogger?.debug("session_recreate", {
       prompt_chars: promptText.length,

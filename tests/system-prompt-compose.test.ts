@@ -22,11 +22,19 @@ afterEach(() => {
 });
 
 describe("composeSystemPrompt", () => {
+  // hostOs is required as of v0.3 §1.3 (composeSystemPrompt now substitutes
+  // ${HOST_ENV_SECTION} based on OS). These existing pointer-handling tests
+  // pass an arbitrary valid OS — the BASE_PROMPT fixture has no placeholder,
+  // so the substitution is a no-op and the pointer-truncation/sanitization
+  // behavior under test is unaffected by hostOs choice.
+  const HOST = "darwin" as const;
+
   test("returns base prompt unchanged when pointer file does not exist", () => {
     const out = composeSystemPrompt({
       basePromptPath: basePath,
       pointerPath: join(workdir, "missing.txt"),
       pointerSizeCap: 2000,
+      hostOs: HOST,
     });
     expect(out).toBe(BASE_PROMPT);
   });
@@ -35,6 +43,7 @@ describe("composeSystemPrompt", () => {
     const out = composeSystemPrompt({
       basePromptPath: basePath,
       pointerSizeCap: 2000,
+      hostOs: HOST,
     });
     expect(out).toBe(BASE_PROMPT);
   });
@@ -45,6 +54,7 @@ describe("composeSystemPrompt", () => {
       basePromptPath: basePath,
       pointerPath,
       pointerSizeCap: 2000,
+      hostOs: HOST,
     });
     expect(out).toContain(BASE_PROMPT);
     expect(out).toContain("<previous-context>");
@@ -58,6 +68,7 @@ describe("composeSystemPrompt", () => {
       basePromptPath: basePath,
       pointerPath,
       pointerSizeCap: 2000,
+      hostOs: HOST,
     });
     expect(out).toBe(BASE_PROMPT);
   });
@@ -71,6 +82,7 @@ describe("composeSystemPrompt", () => {
       basePromptPath: basePath,
       pointerPath,
       pointerSizeCap: 5,
+      hostOs: HOST,
     });
     // 5 graphemes: a, b, c, d, 😀 — body should contain the emoji intact.
     expect(out).toContain("abcd😀");
@@ -97,6 +109,7 @@ describe("composeSystemPrompt", () => {
       basePromptPath: basePath,
       pointerPath,
       pointerSizeCap: 2000,
+      hostOs: HOST,
     });
 
     // There must be exactly ONE opening + ONE closing previous-context tag —
@@ -117,6 +130,7 @@ describe("composeSystemPrompt", () => {
       basePromptPath: basePath,
       pointerPath: workdir,
       pointerSizeCap: 2000,
+      hostOs: HOST,
     });
     expect(out).toBe(BASE_PROMPT);
   });
