@@ -188,3 +188,27 @@ export function redactCredentialShapes(text: string): string {
   }
   return out;
 }
+
+/**
+ * Telegram bot token shape: `bot<8-12 digit id>:<≥30 url-safe-char secret>`.
+ *
+ * Per Ring of Elders v0.3 Round 1 Security Elder finding B1: grammY's
+ * `HttpError` messages can include the request URL with the embedded token
+ * (e.g. `https://api.telegram.org/bot<id>:<secret>/getUpdates failed`),
+ * which would leak via the operator log to disk if the channel/daemon
+ * surfaces the error verbatim.
+ *
+ * We replace ONLY the `<id>:<secret>` body and keep the literal `bot`
+ * prefix so error URLs stay human-parseable as
+ * `https://api.telegram.org/bot[REDACTED]/getUpdates`.
+ *
+ * Defense-in-depth helper. Integration into the channel error-log call
+ * sites is tracked separately (FIX-W2-A; IMPL-W1-G1's restart() uses an
+ * inline temporary).
+ */
+const TELEGRAM_BOT_TOKEN_SHAPE = /bot\d{8,12}:[A-Za-z0-9_-]{30,}/g;
+
+export function redactBotToken(s: string): string {
+  if (!s) return "";
+  return s.replace(TELEGRAM_BOT_TOKEN_SHAPE, "bot[REDACTED]");
+}

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
 import {
+  redactBotToken,
   redactCredentialShapes,
   sanitizeForPromptInjection,
 } from "../src/lib/sanitize.js";
@@ -262,5 +263,61 @@ describe("redactCredentialShapes", () => {
     const out = redactCredentialShapes(`SENTRY_DSN=${dsn} done`);
     expect(out).not.toContain(dsn);
     expect(out).toContain("[REDACTED:credential-shape]");
+  });
+});
+
+// ----- v0.3 Wave 1.1 G8: Telegram bot token shape redactor -----
+//
+// SECURITY NOTE: All bot tokens below are SYNTHETIC TEST FIXTURES. The Telegram
+// bot token shape is `bot<8-12 digit id>:<≥30 url-safe-char secret>`. grammY
+// HttpError messages can include the request URL with embedded token — leaks
+// via operator log to disk (Ring of Elders v0.3 Round 1, Security Elder B1).
+// The replacement marker keeps the literal `bot` prefix so error URLs remain
+// human-parseable: `https://api.telegram.org/bot[REDACTED]/getUpdates`.
+
+describe("redactBotToken", () => {
+  test("returns empty string for empty input (no throw)", () => {
+    expect(redactBotToken("")).toBe("");
+  });
+
+  test("redacts bot token in api.telegram.org URL", () => {
+    const out = redactBotToken(
+      "https://api.telegram.org/bot1234567890:AAAAA-_____ZZZZZ-AAAA1234567890/getUpdates failed",
+    );
+    expect(out).toBe(
+      "https://api.telegram.org/bot[REDACTED]/getUpdates failed",
+    );
+  });
+
+  test("leaves short suffix untouched (< 30 chars; not a real token)", () => {
+    const input = "bot12345678:short";
+    expect(redactBotToken(input)).toBe(input);
+  });
+
+  test("leaves benign text untouched", () => {
+    const input = "not a token";
+    expect(redactBotToken(input)).toBe(input);
+  });
+
+  test("redacts token in DNS/network error messages", () => {
+    const out = redactBotToken(
+      "Error: getaddrinfo ENOTFOUND api.telegram.org/bot987654321:ABCDEFGHIJKLMNOPQRSTUVWXYZ-abc",
+    );
+    expect(out).not.toContain("987654321:ABCDEFGHIJKLMNOPQRSTUVWXYZ-abc");
+    expect(out).toContain("bot[REDACTED]");
+    expect(out).toContain("Error: getaddrinfo ENOTFOUND");
+  });
+
+  test("redacts multiple tokens in one string (global flag)", () => {
+    const out = redactBotToken(
+      "first bot111111111:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA then bot222222222:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBB done",
+    );
+    expect(out).not.toContain("111111111:AAAA");
+    expect(out).not.toContain("222222222:BBBB");
+    const matches = out.match(/bot\[REDACTED\]/g) ?? [];
+    expect(matches.length).toBe(2);
+    expect(out).toContain("first");
+    expect(out).toContain("then");
+    expect(out).toContain("done");
   });
 });
