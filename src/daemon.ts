@@ -68,6 +68,7 @@ import {
 } from "./ipc/server.js";
 import { ensureTokenFile } from "./ipc/protocol.js";
 import { TelegramChannel, TelegramAuthError } from "./channels/telegram.js";
+import { monotonicMs as defaultMonotonicMs } from "./lib/clock.js";
 import {
   WhatsappChannel,
   BaileysNotInstalledError,
@@ -180,6 +181,317 @@ export interface RunningDaemon {
 }
 
 // ---------------------------------------------------------------------------
+// Telegram poll watchdog (Plan v3 §2.1b — F1 layer 2 self-healing)
+// ---------------------------------------------------------------------------
+
+/**
+ * Minimum allowed value for `telegramPollWatchdogStaleMs` — twice grammY's
+ * default long-poll timeout. A staleness threshold smaller than this would
+ * trigger restart-loops on healthy long-polls that legitimately return after
+ * `pollTimeoutSec` (PE Skeptic IMPORTANT-7). Default 30s × 2 = 60s.
+ */
+const GRAMMY_POLL_TIMEOUT_MS = 30_000;
+const WATCHDOG_STALE_MS_FLOOR = GRAMMY_POLL_TIMEOUT_MS * 2;
+
+/** Subset of TelegramChannel methods the watchdog actually calls. Lets tests
+ *  inject a partial mock without constructing a real `Bot`. */
+export interface WatchdogTelegramChannel {
+  isConnected(): boolean;
+  // Imported via `RestartReason` indirection so the watchdog file does not
+  // need to re-export the union — daemon.ts already imports the concrete
+  // `TelegramChannel` for production wiring.
+  restart(reason: "poll_silent_too_long" | "manual"): Promise<void>;
+}
+
+/** Subset of Heartbeat used by the watchdog (full snapshot for forensic log). */
+export interface WatchdogHeartbeat {
+  snapshot(): Promise<{
+    state: string;
+    ages: Record<string, number | null>;
+    fileAgeMs: number | null;
+  }>;
+}
+
+export interface TelegramPollWatchdogOpts {
+  telegramChannel: WatchdogTelegramChannel;
+  auditLog: AuditLog;
+  operatorLogger: OperatorLogger;
+  heartbeat: WatchdogHeartbeat;
+  /** ms between liveness checks. Throws if outside the [5s, 120s] band. */
+  tickMs: number;
+  /**
+   * ms after which a poll-attempt heartbeat is considered "stale" and
+   * a restart fires. Throws if <= WATCHDOG_STALE_MS_FLOOR (2× pollTimeoutSec).
+   */
+  staleMs: number;
+  /** Cooldown after 3 consecutive restart failures (Adversarial B3). */
+  failureCooldownMs: number;
+  /** Test injection: setInterval. Production defaults to global setInterval. */
+  setIntervalFn?: (handler: () => void, ms: number) => unknown;
+  /** Test injection: clearInterval. */
+  clearIntervalFn?: (handle: unknown) => void;
+  /** Test injection: monotonic clock (defaults to `monotonicMs()`). */
+  monotonicMsFn?: () => number;
+}
+
+/**
+ * Plan v3 §2.1b — Daemon-side watchdog that detects silent grammY long-polls
+ * and self-heals via `TelegramChannel.restart('poll_silent_too_long')`.
+ *
+ * Five-defense design (per Adversarial v3 + PE Skeptic Round 1):
+ *   1. **cooldown**: after 3 consecutive restart failures, suppress further
+ *      attempts for `failureCooldownMs` to prevent DoS amplification when the
+ *      underlying network condition (e.g., revoked token) means restart
+ *      cannot succeed.
+ *   2. **restartInFlight**: the previous restart is still pending — a fresh
+ *      tick MUST NOT fire a parallel restart (would race the bot reconstruction
+ *      and dirty the heartbeat mirror non-deterministically).
+ *   3. **isConnected**: only act on a connected channel. A channel mid-failed-
+ *      restart returns false here; the cooldown branch (defense 1) is what
+ *      eventually unsticks it.
+ *   4. **shuttingDown**: CAS guard flipped to `true` BEFORE clearInterval in
+ *      shutdown. Any in-flight tick reads the flag and bails. Without this,
+ *      shutdown can race a watchdog-initiated restart, stranding a fresh Bot
+ *      that the channel.stop() teardown won't reach.
+ *   5. **monotonic clock age**: uses `process.hrtime`-backed monotonic clock,
+ *      not `Date.now()`. Suspended-laptop wall-clock jumps don't surface as
+ *      phantom multi-hour age — the OS pauses hrtime alongside the process.
+ *
+ * **Construction** is side-effect-free; `start()` schedules the interval.
+ * Tests should NOT call `start()` if they want to drive ticks manually via
+ * the (test-only) injected `setIntervalFn`.
+ */
+export class TelegramPollWatchdog {
+  private readonly telegramChannel: WatchdogTelegramChannel;
+  private readonly auditLog: AuditLog;
+  private readonly operatorLogger: OperatorLogger;
+  private readonly heartbeat: WatchdogHeartbeat;
+  private readonly tickMs: number;
+  private readonly staleMs: number;
+  private readonly failureCooldownMs: number;
+  private readonly setIntervalFn: (handler: () => void, ms: number) => unknown;
+  private readonly clearIntervalFn: (handle: unknown) => void;
+  private readonly monotonicMs: () => number;
+
+  // Mutable state (all monotonic-clock-anchored; never wall-clock).
+  private timerHandle: unknown = null;
+  private restartInFlight: Promise<void> | null = null;
+  private consecutiveRestartFailures = 0;
+  private restartCooldownUntil = 0;
+  /**
+   * Monotonic-ms timestamp of the most recent poll-attempt observation. The
+   * Daemon's `onPoll` callback updates this via `notePollAttempt()` on every
+   * grammY transformer fire. `null` until the first poll arrives — the
+   * watchdog never restarts a never-polled channel (defense 5 in
+   * checkLiveness).
+   */
+  private lastPollAttemptMonotonicMs: number | null = null;
+  /**
+   * CAS guard. Flipped to true by `shutdown()` BEFORE `clearInterval` so any
+   * concurrent in-flight tick reads the flag and exits before invoking
+   * `restart()`. Pattern lifted from `session.ts` SessionManager shutdown.
+   */
+  private shuttingDown = false;
+
+  constructor(opts: TelegramPollWatchdogOpts) {
+    if (
+      !Number.isFinite(opts.tickMs) ||
+      opts.tickMs < 5_000 ||
+      opts.tickMs > 120_000
+    ) {
+      throw new Error(
+        `TelegramPollWatchdog: tickMs (${opts.tickMs}) must be in [5_000, 120_000]`
+      );
+    }
+    if (opts.staleMs <= WATCHDOG_STALE_MS_FLOOR) {
+      throw new Error(
+        `TelegramPollWatchdog: staleMs (${opts.staleMs}) must be > ${WATCHDOG_STALE_MS_FLOOR} (2× pollTimeoutMs) to avoid restart loops`
+      );
+    }
+    if (opts.failureCooldownMs < 60_000) {
+      throw new Error(
+        `TelegramPollWatchdog: failureCooldownMs (${opts.failureCooldownMs}) must be >= 60_000`
+      );
+    }
+    this.telegramChannel = opts.telegramChannel;
+    this.auditLog = opts.auditLog;
+    this.operatorLogger = opts.operatorLogger;
+    this.heartbeat = opts.heartbeat;
+    this.tickMs = opts.tickMs;
+    this.staleMs = opts.staleMs;
+    this.failureCooldownMs = opts.failureCooldownMs;
+    this.setIntervalFn =
+      opts.setIntervalFn ?? ((h, ms) => setInterval(h, ms));
+    this.clearIntervalFn =
+      opts.clearIntervalFn ??
+      ((handle) => clearInterval(handle as ReturnType<typeof setInterval>));
+    this.monotonicMs = opts.monotonicMsFn ?? defaultMonotonicMs;
+  }
+
+  /** Kick off the periodic liveness check. Idempotent. */
+  start(): void {
+    if (this.timerHandle !== null) return;
+    this.timerHandle = this.setIntervalFn(() => {
+      void this.checkLiveness().catch((e) => {
+        this.operatorLogger.error("telegram_poll_watchdog_error", {
+          error_class: e instanceof Error ? e.name : "unknown",
+        });
+      });
+    }, this.tickMs);
+    // Production setInterval handles get an `unref()` so a stuck watchdog
+    // doesn't pin the event loop open after every other resource is closed.
+    // Test-injected handles may lack the method.
+    const t = this.timerHandle as { unref?: () => void };
+    if (typeof t?.unref === "function") t.unref();
+  }
+
+  /**
+   * Stop the periodic liveness check. **Caller MUST set the shuttingDown
+   * flag BEFORE calling stop()** — otherwise a tick that fired between the
+   * shuttingDown=true assignment and clearInterval can still invoke restart.
+   * The Daemon shutdown sequence calls `markShuttingDown()` first.
+   */
+  stop(): void {
+    if (this.timerHandle !== null) {
+      this.clearIntervalFn(this.timerHandle);
+      this.timerHandle = null;
+    }
+  }
+
+  /** Flip the CAS shutdown guard. Idempotent. */
+  markShuttingDown(): void {
+    this.shuttingDown = true;
+  }
+
+  /**
+   * Update the monotonic mirror of the last poll-attempt heartbeat. Called
+   * from the Daemon's TelegramChannel `onPoll` callback (alongside the
+   * existing `heartbeat.touchAlive({source:"telegram-poll"})`). The mirror
+   * lives separately because the watchdog uses a monotonic clock and the
+   * Heartbeat class uses `Date.now()` — see Pitfall #4.
+   */
+  notePollAttempt(): void {
+    this.lastPollAttemptMonotonicMs = this.monotonicMs();
+  }
+
+  /**
+   * One liveness-check pass. Visible for tests; production code reaches it
+   * only via the setInterval-driven loop in `start()`.
+   *
+   * Returns a Promise that resolves when the tick's actions (audit appends,
+   * restart promise registration) have completed — useful for tests that
+   * `await` deterministic settling. Production callers fire-and-forget.
+   */
+  async checkLiveness(): Promise<void> {
+    // Defense 4 first — shutdown trumps everything (including audit emission
+    // for a stale-detected restart that we then have to abandon).
+    if (this.shuttingDown) return;
+
+    const now = this.monotonicMs();
+
+    // Defense 1: cooldown after consecutive failures.
+    if (now < this.restartCooldownUntil) return;
+
+    // Defense 2: don't fire restart if previous restart still in flight.
+    if (this.restartInFlight !== null) return;
+
+    // Defense 3: only act on connected channel.
+    if (!this.telegramChannel.isConnected()) return;
+
+    // Defense 5: monotonic-clock age (defends against suspend/resume).
+    if (this.lastPollAttemptMonotonicMs === null) return;
+    const ageMs = now - this.lastPollAttemptMonotonicMs;
+    if (ageMs < this.staleMs) return;
+
+    // Stale — emit warning + initiate restart. Snapshot the heartbeat ages
+    // for the operator-log payload (Observability I2: full snapshot).
+    let ages: Record<string, number | null> = {};
+    try {
+      const snap = await this.heartbeat.snapshot();
+      ages = snap.ages;
+    } catch {
+      /* heartbeat snapshot is best-effort; an empty `ages` is acceptable */
+    }
+    // OperatorLogger has no `warn` method (info/debug/error only — see
+    // src/utils/operator-logger.ts:46-49). Plan v3 §2.1b says `warn`; we
+    // adapt to `info` per the plan's "match G1's adaptation" guidance,
+    // since stale-restart is not an error (the daemon is self-healing) but
+    // is operator-visible.
+    this.operatorLogger.info("telegram_poll_stale_restart", {
+      age_ms: ageMs,
+      threshold_ms: this.staleMs,
+      // Flatten into `heartbeat_ages_<source>` so the OperatorLogger's
+      // scalar-only contract (LogValue = string|number|boolean|undefined|
+      // null|readonly string[]) is satisfied without nesting an object.
+      heartbeat_ages_pi_ping: ages["pi-ping"] ?? null,
+      heartbeat_ages_telegram_poll: ages["telegram-poll"] ?? null,
+      heartbeat_ages_baileys_poll: ages["baileys-poll"] ?? null,
+    });
+
+    this.restartInFlight = this.telegramChannel
+      .restart("poll_silent_too_long")
+      .then(() => {
+        this.consecutiveRestartFailures = 0;
+        // Reset the mirror to "fresh" so the next stale window starts at
+        // the moment of recovery — without this, the watchdog would re-fire
+        // immediately on the next tick because the monotonic age is still
+        // >= staleMs from the pre-restart window.
+        this.lastPollAttemptMonotonicMs = this.monotonicMs();
+      })
+      .catch(() => {
+        this.consecutiveRestartFailures++;
+        if (this.consecutiveRestartFailures >= 3) {
+          this.restartCooldownUntil =
+            this.monotonicMs() + this.failureCooldownMs;
+          this.operatorLogger.error("telegram_restart_giving_up", {
+            failures: this.consecutiveRestartFailures,
+            cooldown_ms: this.failureCooldownMs,
+          });
+          // Fire skipped audit so the operator can see the brake engaged.
+          void this.auditLog
+            .append({
+              event: "telegram_restart_skipped",
+              task_id: null,
+              channel: "telegram",
+              sender_id_hash: null,
+              extra: {
+                reason: "consecutive_failures_exceeded",
+                failures: this.consecutiveRestartFailures,
+              },
+            })
+            .catch(() => undefined);
+        }
+      })
+      .finally(() => {
+        this.restartInFlight = null;
+      });
+    // Tests may await this via the test-only accessor, but production
+    // callers (the setInterval handler) fire-and-forget so the next tick
+    // can still observe `restartInFlight !== null`.
+    await this.restartInFlight.catch(() => undefined);
+  }
+
+  /**
+   * Test-only accessor for the in-flight restart promise. Allows the
+   * harness to `await` the restart's settlement deterministically.
+   * Returns `null` when no restart is pending.
+   */
+  _getRestartInFlight(): Promise<void> | null {
+    return this.restartInFlight;
+  }
+
+  /** Test-only accessor for the consecutive-failure counter. */
+  _getConsecutiveFailures(): number {
+    return this.consecutiveRestartFailures;
+  }
+
+  /** Test-only accessor for the cooldown deadline (monotonic ms). */
+  _getCooldownUntil(): number {
+    return this.restartCooldownUntil;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Boot sequence
 // ---------------------------------------------------------------------------
 
@@ -191,6 +503,17 @@ export interface RunningDaemon {
 export async function start(opts: DaemonOpts = {}): Promise<RunningDaemon> {
   // 1. Load config (lifts env via dotenv side-effect on import).
   const config = opts.config ?? loadConfig();
+
+  // 1a. Plan v3 §2.1a runtime assertion: telegramPollWatchdogStaleMs MUST be
+  //     > 2× pollTimeoutMs (PE Skeptic IMPORTANT-7). The zod schema enforces
+  //     a min of 60_000 but a value of *exactly* 60_000 would still trigger
+  //     restart loops on a healthy long-poll that legitimately returns at
+  //     the 30s grammY default. Throw at boot so misconfiguration is loud.
+  if (config.telegramPollWatchdogStaleMs <= GRAMMY_POLL_TIMEOUT_MS * 2) {
+    throw new DaemonBootError(
+      `telegramPollWatchdogStaleMs (${config.telegramPollWatchdogStaleMs}) must be > 2× pollTimeoutMs (${GRAMMY_POLL_TIMEOUT_MS * 2}) to avoid restart loops`
+    );
+  }
 
   // 1b. AUDIT-D #4: Windows-without-explicit-opt-in gate.  The Windows
   //     sandbox (Job Objects) is not implemented in v1; running unsandboxed
@@ -570,6 +893,11 @@ async function bootAfterLock(
   // 14. Telegram + WhatsApp channels.  Bare-config daemons run terminal-only.
   let telegramChannel: TelegramChannel | null = null;
   let whatsappChannel: WhatsappChannel | null = null;
+  // Plan v3 §2.1b — daemon-side watchdog over telegram poll-attempt heartbeat.
+  // Started AFTER `telegramChannel.start()` succeeds (so it never observes a
+  // half-constructed channel) and stopped FIRST in shutdown (CAS guard set
+  // before clearInterval — see Pitfall #12).
+  let telegramPollWatchdog: TelegramPollWatchdog | null = null;
   const inboundProcessor: InboundProcessor = {
     async processInbound(msg: ChannelInboundMessage): Promise<void> {
       await handleChannelInbound(msg, {
@@ -596,6 +924,14 @@ async function bootAfterLock(
         operatorLogger,
         inboundRateLimiter,
         onPoll: () => {
+          // Plan v3 §2.1b — also update the watchdog's monotonic mirror.
+          // The mirror lives separately from the Heartbeat (which is
+          // wall-clock-anchored) so suspended-laptop wall-clock jumps don't
+          // surface as phantom multi-hour age in the stale-detect math
+          // (Pitfall #4 / Adversarial CONCERN-2). The watchdog is null until
+          // start() succeeds below; the optional-chain handles boot-window
+          // updates that arrive before assignment.
+          telegramPollWatchdog?.notePollAttempt();
           void heartbeat
             .touchAlive({ source: "telegram-poll" })
             .catch(() => undefined);
@@ -603,6 +939,22 @@ async function bootAfterLock(
       });
       await telegramChannel.start();
       sessionSinks.telegram = telegramChannel;
+      // Watchdog construction comes after start() so a getMe() failure
+      // surfaces as TelegramAuthError without dragging the watchdog along.
+      telegramPollWatchdog = new TelegramPollWatchdog({
+        telegramChannel,
+        auditLog,
+        operatorLogger,
+        heartbeat,
+        tickMs: config.telegramPollWatchdogTickMs,
+        staleMs: config.telegramPollWatchdogStaleMs,
+        failureCooldownMs: config.telegramRestartFailureCooldownMs,
+      });
+      // Seed the mirror at start so the watchdog has a baseline before the
+      // first transformer fire — prevents an immediate stale-restart on a
+      // long-poll that takes >staleMs to observe its first poll attempt.
+      telegramPollWatchdog.notePollAttempt();
+      telegramPollWatchdog.start();
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       operatorLogger.error("telegram_disconnect", {
@@ -924,6 +1276,16 @@ async function bootAfterLock(
       }
       shutdownInFlight = (async () => {
         operatorLogger.info("daemon_shutdown", { reason });
+        // Plan v3 §2.1b shutdown ordering (PE B2): flip the watchdog's CAS
+        // shutdown guard FIRST, then clearInterval. Any in-flight tick that
+        // wakes between guard-flip and clearInterval reads `shuttingDown=true`
+        // and bails before invoking restart() — preventing a fresh Bot from
+        // being constructed while the channel is being torn down. Pattern
+        // mirrors the SessionManager shutdown CAS in src/session.ts.
+        if (telegramPollWatchdog) {
+          telegramPollWatchdog.markShuttingDown();
+          telegramPollWatchdog.stop();
+        }
         clearInterval(heartbeatObserveTimer);
         clearInterval(periodicTickTimer);
         clearTimeout(auditPurgeKickoffTimer);

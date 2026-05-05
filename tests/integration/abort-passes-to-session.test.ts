@@ -52,6 +52,9 @@ function makeAppConfig(): AppConfig {
     piCommsDiagnosticMode: false,
     piCommsInboundRatePerSenderPerMin: 10,
     piCommsInboundRatePerChannelPerMin: 30,
+    telegramPollWatchdogTickMs: 30_000,
+    telegramPollWatchdogStaleMs: 120_000,
+    telegramRestartFailureCooldownMs: 600_000,
   };
 }
 

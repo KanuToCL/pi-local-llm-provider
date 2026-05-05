@@ -154,6 +154,38 @@ const envSchema = z.object({
     .int()
     .positive()
     .default(30),
+
+  // Telegram poll watchdog (Plan v3 §2.1a — F1 layer 2 self-healing).
+  // The watchdog runs `setInterval` at TICK_MS cadence, comparing the
+  // monotonic age of the last poll-attempt heartbeat against STALE_MS.
+  // When stale, it invokes `TelegramChannel.restart('poll_silent_too_long')`.
+  //
+  // STALE_MS MUST be > 2× pollTimeoutSec*1000 to avoid restart-loop on a
+  // healthy long-poll that's just legitimately quiet (PE Skeptic IMPORTANT-7).
+  // The default 120s gives 4× safety margin over grammY's 30s long-poll.
+  //
+  // FAILURE_COOLDOWN_MS gates re-attempts after 3 consecutive restart
+  // failures — defends against DoS amplification (Adversarial B3, Security W2)
+  // when the underlying network condition (e.g., revoked token) means restart
+  // can never succeed.
+  TELEGRAM_POLL_WATCHDOG_TICK_MS: z.coerce
+    .number()
+    .int()
+    .min(5_000)
+    .max(120_000)
+    .default(30_000),
+  TELEGRAM_POLL_WATCHDOG_STALE_MS: z.coerce
+    .number()
+    .int()
+    .min(60_000)
+    .max(600_000)
+    .default(120_000),
+  TELEGRAM_RESTART_FAILURE_COOLDOWN_MS: z.coerce
+    .number()
+    .int()
+    .min(60_000)
+    .max(3_600_000)
+    .default(600_000),
 });
 
 // -- Output types -----------------------------------------------------------
@@ -205,6 +237,11 @@ export interface AppConfig {
   // Inbound rate-limit caps (per minute).
   piCommsInboundRatePerSenderPerMin: number;
   piCommsInboundRatePerChannelPerMin: number;
+
+  // Telegram poll watchdog (Plan v3 §2.1a — F1 layer 2 self-healing).
+  telegramPollWatchdogTickMs: number;
+  telegramPollWatchdogStaleMs: number;
+  telegramRestartFailureCooldownMs: number;
 
   // WhatsApp (optional; present only when WHATSAPP_IDENTITY_MODEL is set)
   whatsapp?: WhatsAppConfig;
@@ -274,6 +311,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       data.PI_COMMS_INBOUND_RATE_PER_SENDER_PER_MIN,
     piCommsInboundRatePerChannelPerMin:
       data.PI_COMMS_INBOUND_RATE_PER_CHANNEL_PER_MIN,
+
+    telegramPollWatchdogTickMs: data.TELEGRAM_POLL_WATCHDOG_TICK_MS,
+    telegramPollWatchdogStaleMs: data.TELEGRAM_POLL_WATCHDOG_STALE_MS,
+    telegramRestartFailureCooldownMs:
+      data.TELEGRAM_RESTART_FAILURE_COOLDOWN_MS,
 
     whatsapp,
   };
