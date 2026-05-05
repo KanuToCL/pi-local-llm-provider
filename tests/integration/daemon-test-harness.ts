@@ -216,6 +216,10 @@ export interface DaemonWatchdogHarness {
    *  full liveness-check pass + any restart promise it kicks off (if no
    *  manual-resolution mode is active). */
   fireWatchdogTick(): Promise<void>;
+  /** Fire all pending fake setTimeouts whose delay <= the given threshold
+   *  (in fake-ms). Used by FIX-A tests to drive the restart hard-timeout
+   *  race deterministically without real wall-clock waits. */
+  fireSetTimeoutsAfter(thresholdMs: number): void;
   /** Tear down: flip CAS guard, stop interval, remove the temp audit dir. */
   shutdown(): Promise<void>;
 }
@@ -264,6 +268,30 @@ export function makeWatchdogHarness(
     scheduledHandler = null;
   });
 
+  // Fake setTimeout pool — captures pending timeouts queued by the watchdog's
+  // hard-timeout race (FIX-A). Each entry records the scheduled handler +
+  // its delay; tests use `fireSetTimeoutsAfter(thresholdMs)` to drain those
+  // whose delay is below the threshold.  We avoid `vi.useFakeTimers()` so
+  // the surrounding microtask queue (`setImmediate`, awaited promises)
+  // behaves naturally — only the watchdog's setTimeout is intercepted.
+  interface PendingTimeout {
+    handler: () => void;
+    delay: number;
+    cancelled: boolean;
+  }
+  const pendingTimeouts: PendingTimeout[] = [];
+  const setTimeoutFn = (handler: () => void, ms: number): unknown => {
+    const t: PendingTimeout = { handler, delay: ms, cancelled: false };
+    pendingTimeouts.push(t);
+    // Mimic Node.js Timeout shape with .unref() so the watchdog's
+    // `t.unref?.()` call doesn't crash.
+    return { _harness: t, unref: () => undefined };
+  };
+  const clearTimeoutFn = (handle: unknown): void => {
+    const inner = (handle as { _harness?: PendingTimeout })?._harness;
+    if (inner) inner.cancelled = true;
+  };
+
   // Fake monotonic clock — injectable via watchdog opts.
   let monotonicNow = opts.initialMonotonicMs ?? 1_000_000;
   const monotonicMsFn = () => monotonicNow;
@@ -278,6 +306,8 @@ export function makeWatchdogHarness(
     failureCooldownMs,
     setIntervalFn,
     clearIntervalFn,
+    setTimeoutFn,
+    clearTimeoutFn,
     monotonicMsFn,
   });
   watchdog.start();
@@ -325,6 +355,24 @@ export function makeWatchdogHarness(
       // we'd rather invoke checkLiveness directly so the test can `await` the
       // restart-promise side effects (audit appends, fail counter bumps).
       await watchdog.checkLiveness();
+    },
+    fireSetTimeoutsAfter(thresholdMs) {
+      // Fire (and remove) every queued, non-cancelled timeout whose delay
+      // is <= thresholdMs.  Does NOT advance any clock — just simulates
+      // "enough wall-time has elapsed for these timers to elapse".  The
+      // watchdog's hard-timeout race only relies on the timer firing, not
+      // on `monotonicMs()` agreeing — so we don't need to bump that here.
+      const toFire = pendingTimeouts.filter(
+        (t) => !t.cancelled && t.delay <= thresholdMs,
+      );
+      for (const t of toFire) {
+        t.cancelled = true; // mark fired so we don't double-fire
+        try {
+          t.handler();
+        } catch {
+          /* swallow — production has its own error handling */
+        }
+      }
     },
     async auditCalls() {
       // Audit appends are queued through AuditLog's internal serialization

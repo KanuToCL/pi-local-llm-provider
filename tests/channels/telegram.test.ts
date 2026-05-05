@@ -449,7 +449,14 @@ describe("TelegramChannel — restart()", () => {
     // that we KNOW the failure message will mention (we craft the
     // factory-throw to include the token literal) and asserts the log
     // payload does NOT contain the literal token.
-    const TOKEN = "1234567890:AAEaBbCcDdEeFfGgHhIiJjKkLlMmNnOoPpQ";
+    //
+    // FIX-W2-A: the consolidated `src/lib/sanitize.ts` redactBotToken
+    // matches the canonical `bot<id>:<secret>` shape that grammY URLs
+    // always carry (e.g. `https://api.telegram.org/bot<id>:<secret>/...`).
+    // The fixture must use that exact shape — bare `<id>:<secret>` (no
+    // `bot` prefix) was matched by the earlier inline regex but is
+    // intentionally NOT matched by the strict shared helper.
+    const TOKEN = "bot1234567890:AAEaBbCcDdEeFfGgHhIiJjKkLlMmNnOoPpQ";
     const errors: Array<{ event: string; payload: Record<string, unknown> }> =
       [];
     const operatorLogger = {

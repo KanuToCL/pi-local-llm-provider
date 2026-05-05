@@ -296,3 +296,73 @@ describe("TelegramPollWatchdog — construction validation", () => {
     }).rejects.toThrow(/failureCooldownMs/);
   });
 });
+
+// ---------------------------------------------------------------------------
+// FIX-A (post-AUDIT-G2 IMPORTANT-1) — restart() hard timeout
+// ---------------------------------------------------------------------------
+//
+// Without a hard timeout, a restart() that hangs forever (e.g. wedged
+// `bot.api.getMe()` against a network-partitioned Telegram, or a fresh
+// node-fetch agent that never opens its TCP handshake) would pin
+// `restartInFlight !== null` indefinitely. The watchdog's defense-2 guard
+// would then skip every subsequent tick — silently disabling the
+// self-healing entirely. The hard timeout (= 2× staleMs) caps how long any
+// single restart attempt can occupy the slot; on timeout it counts as a
+// consecutive failure (incrementing the cooldown counter), and the
+// in-flight slot is freed so the next watchdog tick can re-attempt.
+
+describe("TelegramPollWatchdog — restart hard timeout (FIX-A)", () => {
+  test("restart that hangs forever triggers hard timeout, increments consecutiveRestartFailures, clears restartInFlight", async () => {
+    // Manual mode so the stub's restart() returns a never-resolving promise
+    // until we explicitly resolve/reject it (which we never do here — the
+    // watchdog's own hard-timeout race is what must fire).
+    harness.channel.setManualResolution(true);
+    harness.notePollAttempt();
+    harness.advanceMonotonicMs(150_000); // > 120s staleMs
+
+    // Kick the watchdog. checkLiveness() awaits the in-flight promise; the
+    // hard timeout's `restart_hard_timeout` rejection is what we drive.
+    const tickPromise = harness.watchdog.checkLiveness();
+    // Yield once so the synchronous restartInFlight assignment runs and the
+    // setTimeout schedule lands.
+    await new Promise((r) => setImmediate(r));
+    expect(harness.channel.restartCalls.length).toBe(1);
+    expect(harness.watchdog._getRestartInFlight()).not.toBeNull();
+
+    // Advance the harness's fake setTimeout by 2× staleMs (the hard
+    // timeout). The harness will fire any pending timeouts that have
+    // elapsed (default staleMs=120_000 → hardTimeout=240_000).
+    harness.fireSetTimeoutsAfter(240_001);
+    await tickPromise;
+
+    // Restart-in-flight slot freed (so the next tick can re-fire).
+    expect(harness.watchdog._getRestartInFlight()).toBeNull();
+    // Counter incremented (timeout-as-failure path).
+    expect(harness.watchdog._getConsecutiveFailures()).toBe(1);
+  });
+
+  test("after hard timeout fires, watchdog re-fires restart on next tick", async () => {
+    // Same setup as above — restart hangs, hard timeout fires, counter
+    // increments. Then a fresh tick (still over staleMs because the mirror
+    // never reset on failure) must re-attempt restart.
+    harness.channel.setManualResolution(true);
+    harness.notePollAttempt();
+    harness.advanceMonotonicMs(150_000);
+
+    const tick1 = harness.watchdog.checkLiveness();
+    await new Promise((r) => setImmediate(r));
+    expect(harness.channel.restartCalls.length).toBe(1);
+    harness.fireSetTimeoutsAfter(240_001);
+    await tick1;
+    expect(harness.watchdog._getRestartInFlight()).toBeNull();
+
+    // Second tick — restart slot is free, mirror is stale (never reset on
+    // the failed attempt), so the watchdog must re-fire.
+    const tick2 = harness.watchdog.checkLiveness();
+    await new Promise((r) => setImmediate(r));
+    expect(harness.channel.restartCalls.length).toBe(2);
+    harness.fireSetTimeoutsAfter(240_001);
+    await tick2;
+    expect(harness.watchdog._getConsecutiveFailures()).toBe(2);
+  });
+});

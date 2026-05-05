@@ -68,6 +68,7 @@ import {
 } from "./ipc/server.js";
 import { ensureTokenFile } from "./ipc/protocol.js";
 import { TelegramChannel, TelegramAuthError } from "./channels/telegram.js";
+import type { RestartReason } from "./audit/schema.js";
 import { monotonicMs as defaultMonotonicMs } from "./lib/clock.js";
 import {
   WhatsappChannel,
@@ -197,10 +198,12 @@ const WATCHDOG_STALE_MS_FLOOR = GRAMMY_POLL_TIMEOUT_MS * 2;
  *  inject a partial mock without constructing a real `Bot`. */
 export interface WatchdogTelegramChannel {
   isConnected(): boolean;
-  // Imported via `RestartReason` indirection so the watchdog file does not
-  // need to re-export the union — daemon.ts already imports the concrete
-  // `TelegramChannel` for production wiring.
-  restart(reason: "poll_silent_too_long" | "manual"): Promise<void>;
+  // Use the canonical `RestartReason` type from audit/schema.ts so the
+  // watchdog and the channel agree on the closed enum at the call site
+  // (FIX-D — post-AUDIT-G2 NIT-7). Future RestartReason additions
+  // (e.g., "manual_panic") flow through schema → daemon → channel without
+  // the watchdog needing a separate string-union edit.
+  restart(reason: RestartReason): Promise<void>;
 }
 
 /** Subset of Heartbeat used by the watchdog (full snapshot for forensic log). */
@@ -230,6 +233,12 @@ export interface TelegramPollWatchdogOpts {
   setIntervalFn?: (handler: () => void, ms: number) => unknown;
   /** Test injection: clearInterval. */
   clearIntervalFn?: (handle: unknown) => void;
+  /** Test injection: setTimeout (FIX-A — restart hard timeout race).
+   *  Production defaults to global setTimeout. */
+  setTimeoutFn?: (handler: () => void, ms: number) => unknown;
+  /** Test injection: clearTimeout (cancels the hard-timeout race when the
+   *  real restart resolves first). */
+  clearTimeoutFn?: (handle: unknown) => void;
   /** Test injection: monotonic clock (defaults to `monotonicMs()`). */
   monotonicMsFn?: () => number;
 }
@@ -271,6 +280,8 @@ export class TelegramPollWatchdog {
   private readonly failureCooldownMs: number;
   private readonly setIntervalFn: (handler: () => void, ms: number) => unknown;
   private readonly clearIntervalFn: (handle: unknown) => void;
+  private readonly setTimeoutFn: (handler: () => void, ms: number) => unknown;
+  private readonly clearTimeoutFn: (handle: unknown) => void;
   private readonly monotonicMs: () => number;
 
   // Mutable state (all monotonic-clock-anchored; never wall-clock).
@@ -325,6 +336,11 @@ export class TelegramPollWatchdog {
     this.clearIntervalFn =
       opts.clearIntervalFn ??
       ((handle) => clearInterval(handle as ReturnType<typeof setInterval>));
+    this.setTimeoutFn =
+      opts.setTimeoutFn ?? ((h, ms) => setTimeout(h, ms));
+    this.clearTimeoutFn =
+      opts.clearTimeoutFn ??
+      ((handle) => clearTimeout(handle as ReturnType<typeof setTimeout>));
     this.monotonicMs = opts.monotonicMsFn ?? defaultMonotonicMs;
   }
 
@@ -403,15 +419,22 @@ export class TelegramPollWatchdog {
     const ageMs = now - this.lastPollAttemptMonotonicMs;
     if (ageMs < this.staleMs) return;
 
-    // Stale — emit warning + initiate restart. Snapshot the heartbeat ages
-    // for the operator-log payload (Observability I2: full snapshot).
-    let ages: Record<string, number | null> = {};
-    try {
-      const snap = await this.heartbeat.snapshot();
-      ages = snap.ages;
-    } catch {
-      /* heartbeat snapshot is best-effort; an empty `ages` is acceptable */
-    }
+    // Stale — emit warning + initiate restart.
+    //
+    // FIX-B (post-AUDIT-G2 IMPORTANT-2 / Architect B3): the `heartbeat
+    // .snapshot()` call previously sat HERE on the watchdog's decision
+    // path, performing an `fs.stat()` syscall. If the underlying root
+    // cause of the wedged poll is a slow/wedged disk, that stat would
+    // block the watchdog tick — disabling the very self-healing the
+    // watchdog exists to provide. Drop snapshot from the hot path and
+    // fire it best-effort AFTER the decision (see operator-log call below).
+    //
+    // FIX-C (post-AUDIT-G2 MINOR-3): emit `heartbeat_ages_json` so any
+    // future heartbeat source flows into operator logs without a code
+    // change here.  Empty object on the synchronous emit; the post-
+    // decision fire-and-forget snapshot enriches forensic context with
+    // the real ages.
+    //
     // OperatorLogger has no `warn` method (info/debug/error only — see
     // src/utils/operator-logger.ts:46-49). Plan v3 §2.1b says `warn`; we
     // adapt to `info` per the plan's "match G1's adaptation" guidance,
@@ -420,17 +443,54 @@ export class TelegramPollWatchdog {
     this.operatorLogger.info("telegram_poll_stale_restart", {
       age_ms: ageMs,
       threshold_ms: this.staleMs,
-      // Flatten into `heartbeat_ages_<source>` so the OperatorLogger's
-      // scalar-only contract (LogValue = string|number|boolean|undefined|
-      // null|readonly string[]) is satisfied without nesting an object.
-      heartbeat_ages_pi_ping: ages["pi-ping"] ?? null,
-      heartbeat_ages_telegram_poll: ages["telegram-poll"] ?? null,
-      heartbeat_ages_baileys_poll: ages["baileys-poll"] ?? null,
+      heartbeat_ages_json: JSON.stringify({}),
     });
 
-    this.restartInFlight = this.telegramChannel
-      .restart("poll_silent_too_long")
+    // FIX-B continued: fire-and-forget snapshot AFTER the decision is made.
+    // Latency here cannot block the restart — by the time this resolves
+    // the restart is already in flight (or already done).  Operator logs
+    // get the full forensic payload regardless of disk latency on the
+    // unhealthy host.
+    void this.heartbeat
+      .snapshot()
+      .then((snap) => {
+        this.operatorLogger.info("telegram_poll_stale_restart_full_snapshot", {
+          age_ms: ageMs,
+          threshold_ms: this.staleMs,
+          heartbeat_ages_json: JSON.stringify(snap.ages),
+          heartbeat_state: snap.state,
+        });
+      })
+      .catch(() => {
+        /* heartbeat snapshot is best-effort; failure simply omits the
+         * forensic-enrichment line */
+      });
+
+    // FIX-A (post-AUDIT-G2 IMPORTANT-1): wrap restart() with a hard
+    // timeout = 2× staleMs.  Without this, a hung restart()
+    // (e.g. wedged `bot.api.getMe()` against partitioned Telegram) pins
+    // `restartInFlight !== null` forever, defense-2 then skips every
+    // subsequent tick — silently disabling the watchdog.  On timeout the
+    // race rejects with `restart_hard_timeout`; the existing .catch()
+    // path counts it as a consecutive failure (cooldown / panic-ladder
+    // logic kicks in), and .finally() frees the slot for the next tick.
+    const restartHardTimeoutMs = this.staleMs * 2;
+    let timeoutHandle: unknown = null;
+    const restartP = this.telegramChannel.restart("poll_silent_too_long");
+    const timeoutP = new Promise<void>((_resolve, reject) => {
+      timeoutHandle = this.setTimeoutFn(
+        () => reject(new Error("restart_hard_timeout")),
+        restartHardTimeoutMs,
+      );
+      const t = timeoutHandle as { unref?: () => void };
+      if (typeof t?.unref === "function") t.unref();
+    });
+    this.restartInFlight = Promise.race([restartP, timeoutP])
       .then(() => {
+        // Cancel the timeout on success — frees the timer slot
+        // immediately (otherwise the timer stays scheduled until staleMs*2
+        // elapses, then no-ops because the race already settled).
+        if (timeoutHandle !== null) this.clearTimeoutFn(timeoutHandle);
         this.consecutiveRestartFailures = 0;
         // Reset the mirror to "fresh" so the next stale window starts at
         // the moment of recovery — without this, the watchdog would re-fire
@@ -439,6 +499,8 @@ export class TelegramPollWatchdog {
         this.lastPollAttemptMonotonicMs = this.monotonicMs();
       })
       .catch(() => {
+        // Both real restart errors AND restart_hard_timeout end up here.
+        if (timeoutHandle !== null) this.clearTimeoutFn(timeoutHandle);
         this.consecutiveRestartFailures++;
         if (this.consecutiveRestartFailures >= 3) {
           this.restartCooldownUntil =

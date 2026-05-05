@@ -32,6 +32,7 @@ import {
   InboundMediaStore,
   type InboundMediaSavedRef,
 } from "../lib/inbound-media.js";
+import { redactBotToken } from "../lib/sanitize.js";
 import type {
   ChannelEvent,
   InboundMessage,
@@ -344,7 +345,6 @@ export class TelegramChannel implements Sink {
       this.operatorLogger?.error("telegram_polling_error", {
         error_class: error instanceof Error ? error.name : "unknown",
         message: redactBotToken(
-          this.botToken,
           error instanceof Error ? error.message : String(error),
         ),
       });
@@ -458,7 +458,6 @@ export class TelegramChannel implements Sink {
         this.operatorLogger?.error("telegram_polling_error", {
           error_class: error instanceof Error ? error.name : "unknown",
           message: redactBotToken(
-            this.botToken,
             error instanceof Error ? error.message : String(error),
           ),
         });
@@ -474,9 +473,11 @@ export class TelegramChannel implements Sink {
       const errorClass = e instanceof Error ? e.name : "unknown";
       // Plan v3 §1.2d (Security B1): redact the failure message before it
       // hits the operator log — grammY errors can carry the bot token in
-      // embedded api.telegram.org URLs.
+      // embedded api.telegram.org URLs.  FIX-W2-A (post-AUDIT-G1 NIT-1):
+      // consolidated onto the shared `src/lib/sanitize.ts` helper so the
+      // regex lives in one place; matches the canonical
+      // `bot<id>:<secret>` shape that grammY URLs always carry.
       const message = redactBotToken(
-        this.botToken,
         e instanceof Error ? e.message : String(e),
       );
       this.operatorLogger?.error("telegram_restart_failed", {
@@ -987,41 +988,6 @@ export function formatChannelEvent(event: ChannelEvent): string {
 // ---------------------------------------------------------------------------
 // Internal — bot-token redactor (INLINE TEMPORARY for v0.3 Wave 1.1)
 // ---------------------------------------------------------------------------
-
-/**
- * Strip any occurrence of the literal bot token AND the canonical
- * `<digits>:<token>` shape from a string. Defense-in-depth so grammY
- * error messages — which can carry the token embedded in
- * api.telegram.org URLs — don't end up in operator logs (Security B1).
- *
- * Two redaction passes:
- *   1. Literal substring of the install's bot token (catches the raw form).
- *   2. The Telegram-bot-token shape (`<id>:<secret>`) anywhere in the
- *      string (catches URL-embedded forms regardless of which install
- *      the token belongs to — defense if a copy/paste mishap puts another
- *      bot's token through this code path).
- *
- * TODO(IMPL-W1-G8): replace inline with `src/lib/redact.ts` import once
- * the wave-sibling implementation lands. The signatures are intentionally
- * different right now (this one takes the install's token as a leading
- * arg for the literal-substring pass) so the integration commit can do
- * a focused review of the consolidated helper.
- */
-function redactBotToken(installToken: string, message: string): string {
-  if (!message) return "";
-  let out = message;
-  // Pass 1: the install's literal token. Cheap split/join (no regex
-  // escaping concerns).
-  if (installToken && installToken.length >= 16) {
-    out = out.split(installToken).join("[REDACTED]");
-  }
-  // Pass 2: any Telegram-bot-token-shaped substring.
-  out = out.replace(
-    /\b\d{8,12}:[A-Za-z0-9_-]{30,}\b/g,
-    "[REDACTED]",
-  );
-  return out;
-}
 
 /**
  * Quick non-salted hash for inline use during request handling.  The
