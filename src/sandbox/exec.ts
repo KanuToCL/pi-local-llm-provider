@@ -310,6 +310,14 @@ function spawnAndWait(
         env,
         stdio: ["ignore", "pipe", "pipe"],
         windowsHide: true,
+        // HARDENING NOTE (v0.3): Node + libuv default behavior is to NOT inherit
+        // non-stdio handles on Windows (sockets, pipes, etc). MIB-2026-05-05-1751 §4
+        // H1 candidate root cause posits Windows TCP socket handle inheritance by
+        // spawned cmd.exe. Defense in depth via native HANDLE_FLAG_INHERIT=false
+        // requires a native addon and is deferred to v0.4 pending empirical RCA.
+        // Setting `windowsVerbatimArguments: false`, `detached: false`, `shell: false`
+        // here would be NO-OP (these are already Node defaults) — explicit-default
+        // setting was rejected by Ring of Elders v0.3 Round 1 as cargo cult.
       });
     } catch (e) {
       // ENOENT (binary missing) and similar synchronous spawn failures land
