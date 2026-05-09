@@ -94,6 +94,8 @@ pi --provider unsloth-studio --model "unsloth/Qwen3.6-27B-GGUF" "list files in t
 
 If `~/.pi/agent/models.json` already exists, merge by hand — pi-mono accepts multiple providers in one file.
 
+**Export `UNSLOTH_API_KEY` in your shell rc** (`~/.bashrc` / `~/.zshrc`), not just your Studio venv's `activate` — pi-mono inherits the user's shell env, not venv state. Without it you'll get a 401 (or worse, pi-mono may ship the literal string `UNSLOTH_API_KEY` as the bearer per R2 in [`SECURITY.md`](./SECURITY.md)). The `pi-launch.sh` wrapper below catches this case loudly via [`scripts/check-env.js`](./scripts/check-env.js).
+
 ### Recommended: launch via `pi-launch.sh`
 
 Use the wrapper at [`scripts/pi-launch.sh`](./scripts/pi-launch.sh) (or [`scripts/pi-launch.ps1`](./scripts/pi-launch.ps1)) instead of calling `pi` directly. It runs [`scripts/check-env.js`](./scripts/check-env.js) first to confirm every env-var-named `apiKey` resolves to a non-empty value. Without that gate, an unset env var can cause pi-mono to ship the literal env-var name as the bearer token (R2 in [`SECURITY.md`](./SECURITY.md)).

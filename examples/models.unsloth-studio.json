@@ -1,5 +1,5 @@
 {
-  "_comment": "pi-mono custom-provider config for Unsloth Studio. Drop into ~/.pi/agent/models.json (or merge with existing). Pre-req: probe-toolcalls.js exits 0 against this endpoint. Schema reference: <pi-coding-agent>/docs/models.md.",
+  "_comment": "pi-mono custom-provider config for Unsloth Studio. Drop into ~/.pi/agent/models.json (or merge with existing). Pre-req: probe-toolcalls.js exits 0 against this endpoint. UNSLOTH_API_KEY must be an `sk-unsloth-<32 hex>` token minted in Studio Settings → API keys (NOT the admin bootstrap password — that's UI-only and will 401 against /v1). Export the token in your shell rc (~/.bashrc / ~/.zshrc), not just the Studio venv's activate, or pi-mono will see apiKey as undefined. Schema reference: <pi-coding-agent>/docs/models.md.",
 
   "providers": {
     "unsloth-studio": {
