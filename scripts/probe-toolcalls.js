@@ -93,6 +93,22 @@ try {
 
 if (!resp.ok) {
   const text = await resp.text();
+  if (resp.status === 401 || resp.status === 403) {
+    console.error(`ERR: HTTP ${resp.status} ${resp.statusText} — auth rejected.`);
+    console.error("");
+    console.error("     The backend is REACHABLE but rejected the bearer token.");
+    console.error("     Common causes:");
+    console.error("       * PROBE_API_KEY / UNSLOTH_API_KEY is empty or wrong.");
+    console.error("       * For Unsloth Studio: you may have used the bootstrap");
+    console.error("         admin password (UI-only). Mint an `sk-unsloth-...`");
+    console.error("         token in Studio Settings -> API keys, then export");
+    console.error("         it in your shell rc (~/.bashrc / ~/.zshrc).");
+    console.error("       * For Ollama: any non-empty string works (use 'ollama').");
+    console.error("");
+    console.error("     Server response (first 600 chars):");
+    console.error(text.slice(0, 600));
+    process.exit(2);
+  }
   console.error(`ERR: HTTP ${resp.status} ${resp.statusText}`);
   console.error(text.slice(0, 600));
   process.exit(2);
