@@ -243,23 +243,50 @@ Choose ONE based on your priority:
 
 ### Option A — Unsloth Studio (recommended for daily use)
 
-GUI + API. Loads GGUF models. Same flow as your existing 5070 setup.
+Studio loads GGUF models and exposes an OpenAI-compat `/v1` server. **On Linux/aarch64 it ships as a Python package** — no AppImage exists despite older docs (and Unsloth's web copy at the time of writing) implying otherwise. Empirically validated on GB10 / Ubuntu aarch64 / Python 3.12 (see `docs/MIB-2026-05-08-2256.md`).
 
 ```bash
-# Download the latest Studio AppImage from Unsloth's releases page
-# (URL changes per release — check unsloth.ai)
-chmod +x unsloth-studio-*.AppImage
-./unsloth-studio-*.AppImage
+# Reuse the venv from Step 4 (where unsloth itself is already installed)
+~/.venvs/unsloth/bin/pip install --upgrade pip
+~/.venvs/unsloth/bin/pip install unsloth-studio
+
+# torchvision wheel must match torch's +cuXXX tag — explicit upgrade
+# (without this, pip pulls a CPU-only or stale aarch64 build that breaks Studio)
+~/.venvs/unsloth/bin/pip install --index-url \
+  https://download.pytorch.org/whl/cu128 'torchvision>=0.26.0'
+
+# Studio backend deps (NOT pulled by unsloth-studio's setup.py — known upstream gap)
+~/.venvs/unsloth/bin/pip install -r \
+  ~/.venvs/unsloth/lib/python3.12/site-packages/studio/backend/requirements/studio.txt
+~/.venvs/unsloth/bin/pip install python-multipart  # referenced via runtime check, not in studio.txt
+
+# Launch — bootstrap admin password is printed ONCE on first run; SAVE IT
+~/.venvs/unsloth/bin/unsloth studio -p 8888
 ```
 
-Then in the UI: load your model (e.g., Qwen3.6-27B-GGUF UD-Q4_K_XL) and the API auto-exposes on `http://localhost:8888/v1`.
-
-Verify:
+Verify the server is up:
 ```bash
-curl http://localhost:8888/v1/models
+curl http://127.0.0.1:8888/api/health
+```
+
+**API key for pi-mono:** the bootstrap admin password is for the Studio web UI ONLY (`http://localhost:8888`). For pi-mono and probe scripts you need an `sk-unsloth-<32 hex>` token, minted in either:
+- Studio UI → **Settings → API keys → Create**
+- OR via `POST /api/auth/login` (with admin user + bootstrap password) to get a JWT, then `POST /api/auth/api-keys` to mint the bearer token
+
+Export it in your **shell rc** (NOT in `venv/bin/activate` — pi-mono inherits the user's shell env, not venv state, and will see `apiKey` as undefined):
+```bash
+echo 'export UNSLOTH_API_KEY=sk-unsloth-...' >> ~/.bashrc   # or ~/.zshrc
+```
+
+Then in the Studio UI: load your model (e.g., `unsloth/Qwen3.6-27B-GGUF`, BF16 if you have the RAM, otherwise UD-Q4_K_XL or Q5/Q8). Studio auto-exposes the loaded model on `/v1`.
+
+Verify the OpenAI-compat surface (this is the contract pi-mono uses):
+```bash
+curl -H "Authorization: Bearer $UNSLOTH_API_KEY" http://localhost:8888/v1/models
 curl -X POST http://localhost:8888/v1/chat/completions \
+  -H "Authorization: Bearer $UNSLOTH_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model":"any","messages":[{"role":"user","content":"Hello"}]}'
+  -d '{"model":"unsloth/Qwen3.6-27B-GGUF","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
 ### Option B — llama-server (lean, headless, scriptable)
