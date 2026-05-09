@@ -15,6 +15,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
 CHECK_ENV="${SCRIPT_DIR}/check-env.js"
+STUDIO_STATUS="${SCRIPT_DIR}/studio-status.js"
 
 if [[ ! -f "${CHECK_ENV}" ]]; then
   echo "pi-launch: missing helper at ${CHECK_ENV}" >&2
@@ -34,5 +35,17 @@ if ! command -v pi > /dev/null 2>&1; then
 fi
 
 node "${CHECK_ENV}"
+
+# Pre-launch banner: memory, loaded model/variant, suggested ctx, cached
+# variants. Best-effort — never blocks the launch. Skipped when
+# STUDIO_QUIET=1 or UNSLOTH_API_KEY is unset (the latter handled inside
+# the script). Only attempted for the Unsloth Studio provider.
+if [[ -f "${STUDIO_STATUS}" ]]; then
+  case " $* " in
+    *" --provider unsloth-studio "*|*" -p unsloth-studio "*)
+      node "${STUDIO_STATUS}" || true
+      ;;
+  esac
+fi
 
 exec pi "$@"
