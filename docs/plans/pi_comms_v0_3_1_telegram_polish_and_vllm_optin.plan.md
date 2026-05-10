@@ -1,4 +1,4 @@
-# Plan v2: pi-comms v0.3.1 — Telegram UX Polish + Studio Hygiene + vLLM Opt-in Backend
+# Plan v3: pi-comms v0.3.1 — Telegram UX Polish + Studio Hygiene + vLLM Opt-in Backend
 
 > **Source**: GB10 Claude's MIB-2026-05-09-{0103, 1126, 2305} bundle.
 > **Predecessor**: v0.3 SHIPPED CLEAN (8 elders BLESSED, 1005 tests pass).
@@ -695,6 +695,10 @@ process.on("SIGINT", signalHandler);
 // Step 17 — after IPC bind succeeds:
 bootCompleted = true;
 ```
+
+**Adversarial I-B fix**: REMOVE the existing `installSignalHandlers(handle, operatorLogger, opts.exitOnShutdown ?? false)` call at `src/daemon.ts:1471`. The early-install handler above subsumes both the boot-time and runtime cases via the `bootCompleted` flag check. Leaving both registrations stands gives you double-handler-per-signal (Node fires in registration order — non-deterministic teardown). IMPL-6 MUST delete that line and inline the runtime-shutdown logic into the `bootCompleted === true` branch above.
+
+Use `process.once(...)` (NOT `process.on`) per existing pattern at `src/daemon.ts:2048-2052` so a second SIGTERM during boot doesn't re-fire the handler concurrently with the in-flight `process.exit(2)`.
 
 **1.6c — Lift `STUDIO_MODEL_WAIT_MS` + `STUDIO_MODEL_POLL_MS` to `DaemonOpts`**:
 
