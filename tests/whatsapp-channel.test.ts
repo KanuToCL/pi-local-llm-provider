@@ -696,15 +696,20 @@ describe("WhatsappChannel — disconnect reason-code branching (V5-C)", () => {
 });
 
 describe("formatChannelEvent — coverage of all event types", () => {
-  test("task_completed has ✅ prefix and includes finalMessage", () => {
+  test("task_completed has 'pi:' prefix and includes finalMessage (no ✅ done.)", () => {
+    // F1 v0.3.1: the historic "pi: ✅ done. ..." prefix was DROPPED — its
+    // presence in the model's conversation history was the source of the
+    // false-prefix emission on plain reply turns. Now the daemon emits
+    // bare "pi: <finalMessage>" preserving the agent voice marker.
     const text = formatChannelEvent({
       type: "task_completed",
       taskId: "t-1",
       finalMessage: "All tests pass",
       ts: 0,
     });
-    expect(text).toContain("✅");
-    expect(text).toContain("All tests pass");
+    expect(text).toBe("pi: All tests pass");
+    expect(text).not.toContain("✅");
+    expect(text).not.toContain("done.");
   });
 
   test("system_notice severity-prefixes by level", () => {
@@ -729,6 +734,53 @@ describe("formatChannelEvent — coverage of all event types", () => {
     expect(info.startsWith("ℹ️")).toBe(true);
     expect(warn.startsWith("⚠️")).toBe(true);
     expect(err.startsWith("‼️")).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F1 v0.3.1 — false-success-prefix strip regressions (WhatsApp channel)
+//
+// Spec: docs/plans/pi_comms_v0_3_1_telegram_polish_and_vllm_optin.plan.md §1.1e
+// Helper unit tests live in tests/lib/sanitize.test.ts; these assertions
+// verify the wire-up at the formatChannelEvent boundary in BOTH the "reply"
+// branch AND the "task_completed" branch (NB-2: the backgrounded-task
+// mutation path in src/session.ts:1659-1668 emits via task_completed, so
+// the strip MUST cover both — otherwise the F1 regression survives the
+// mutation path the moment a long task exists).
+// ---------------------------------------------------------------------------
+
+describe("formatChannelEvent — F1 false-success-prefix strip (v0.3.1)", () => {
+  test("task_completed: bare finalMessage is wrapped 'pi: ...' with no ✅ done.", () => {
+    const text = formatChannelEvent({
+      type: "task_completed",
+      taskId: "t-1",
+      finalMessage: "All tests passed.",
+      ts: 0,
+    });
+    expect(text).toBe("pi: All tests passed.");
+  });
+
+  test("task_completed: NB-2 mutation-path defence — strip ALSO runs in this branch", () => {
+    // Backgrounded-task replies get mutated to task_completed via
+    // session.ts:1659-1668 with the model's reply text becoming finalMessage.
+    // If the model emits "✅ done. ..." inside finalMessage the strip MUST
+    // remove it here too — otherwise F1 leaks the moment a long task exists.
+    const text = formatChannelEvent({
+      type: "task_completed",
+      taskId: "t-2",
+      finalMessage: "✅ done. The actual answer.",
+      ts: 0,
+    });
+    expect(text).toBe("pi: The actual answer.");
+  });
+
+  test("reply: 'pi: ✅ done. <text>' production format is stripped", () => {
+    const text = formatChannelEvent({
+      type: "reply",
+      text: "pi: ✅ done. The sandbox is broken",
+      ts: 0,
+    });
+    expect(text).toBe("The sandbox is broken");
   });
 });
 

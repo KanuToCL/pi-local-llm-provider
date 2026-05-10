@@ -212,3 +212,58 @@ export function redactBotToken(s: string): string {
   if (!s) return "";
   return s.replace(TELEGRAM_BOT_TOKEN_SHAPE, "bot[REDACTED]");
 }
+
+// ----- v0.3.1 F1: defensive false-success-prefix strip -----
+//
+// Per gx10-831a MIB-2026-05-09-2305 §1 + Ring of Elders v0.3.1 Round 2.
+
+/**
+ * Strip model-emitted false-success markers from REPLY text BEFORE chunking.
+ *
+ * Per MIB-2026-05-09-2305 §1: the local Qwen3.6 over-generalizes from its
+ * own conversation history (where the daemon's task_completed formatter
+ * historically rendered "pi: ✅ done. ...") and emits the marker as a prefix
+ * on plain reply turns — including ones that say "the sandbox is having
+ * issues right now". This is a UX disaster on Telegram.
+ *
+ * Plan v0.3.1 has TWO mitigations:
+ *   1. Drop the "pi: ✅ done. " prefix from formatChannelEvent's
+ *      task_completed rendering (kills the pattern in the model's input
+ *      history at source).
+ *   2. This defensive strip — applied in formatChannelEvent for "reply"
+ *      AND "task_completed" events (NB-2 mutation-path defense; see
+ *      src/session.ts:1659-1668) — catches residual emissions while the
+ *      model's training-history influence fades.
+ *
+ * Anchored at start (with optional leading whitespace AND optional "pi:"
+ * prefix per Adversarial NB-3 — model can emit "  pi: ✅ done." or
+ * "\npi: ✅ done." with leading whitespace). Capped at 10 iterations to
+ * bound worst-case ReDoS surface. Mid-text occurrences are NEVER stripped
+ * (the model legitimately uses ✅ as inline content).
+ *
+ * Empty-result handling (Adversarial NB-4): if the strip leaves an empty
+ * string (e.g., model emitted literal "pi: ✅ done." with no content),
+ * return a fallback "pi: ok" instead. Otherwise telegram.ts:518's
+ * `if (!text) return` short-circuit silently drops the message — worse
+ * UX than the bug being fixed.
+ */
+// Plan v3 §1.1a regex spec was `/^\s*(?:pi:\s*)?(?:\s*✅\s*done\.?\s*\n?){1,10}/i`
+// but its `pi:` group sat OUTSIDE the {1,10} quantifier — it could only match
+// the prefix at iteration #1, not on stacked occurrences. The plan §1.1e
+// fixture `"pi: ✅ done.\npi: ✅ done. Let me try..."` → `"Let me try..."`
+// REQUIRES the `pi:` to repeat inside the iteration. Moved into the inner
+// group; same anchor + same {1,10} ReDoS cap; semantics match the plan's
+// stated intent (the fixture is the spec, the literal regex was a bug).
+const FALSE_SUCCESS_PREFIX_RE =
+  /^\s*(?:(?:pi:\s*)?\s*✅\s*done\.?\s*\n?){1,10}/i;
+
+export function stripFalseSuccessPrefix(text: string): string {
+  const stripped = text.replace(FALSE_SUCCESS_PREFIX_RE, "");
+  // NB-4: if the original text was non-empty but the strip emptied it,
+  // return a fallback so the channel's empty-text guard doesn't silently
+  // drop the message.
+  if (text.length > 0 && stripped.length === 0) {
+    return "pi: ok";
+  }
+  return stripped;
+}

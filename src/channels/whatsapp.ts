@@ -53,6 +53,7 @@ import {
   InboundMediaStore,
   type InboundMediaSavedRef,
 } from "../lib/inbound-media.js";
+import { stripFalseSuccessPrefix } from "../lib/sanitize.js";
 import type {
   ChannelEvent,
   InboundMessage,
@@ -1327,9 +1328,19 @@ export function formatChannelEvent(event: ChannelEvent): string {
     case "go_background_notice":
       return `pi: this is bigger than I thought — going async, will ping when done. (was: "${event.userMessagePreview}")`;
     case "reply":
-      return event.text;
+      // F1 v0.3.1: defensive strip of false-success-prefix that the local
+      // Qwen3.6 emits on plain reply turns (over-generalized from history).
+      // See src/lib/sanitize.ts stripFalseSuccessPrefix doc-block.
+      return stripFalseSuccessPrefix(event.text);
     case "task_completed":
-      return `pi: ✅ done. ${event.finalMessage}`;
+      // F1 v0.3.1: drop the historic "pi: ✅ done. " daemon prefix — its
+      // presence in conversation history is the SOURCE of the model's
+      // false-prefix emission. NB-2 defense-in-depth: backgrounded-task
+      // replies get mutated to task_completed in src/session.ts:1659-1668
+      // (model's reply text becomes finalMessage), so the strip MUST run
+      // here too — otherwise the F1 regression survives the mutation path
+      // the moment a long task exists.
+      return `pi: ${stripFalseSuccessPrefix(event.finalMessage)}`;
     case "system_notice": {
       const prefix =
         event.level === "error"
