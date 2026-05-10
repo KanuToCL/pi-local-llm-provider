@@ -289,6 +289,46 @@ curl -X POST http://localhost:8888/v1/chat/completions \
   -d '{"model":"unsloth/Qwen3.6-27B-GGUF","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
+### 5B — Known quirks (Studio on GB10 unified memory)
+
+Per gx10-831a MIB-2026-05-09-0103 §3 (empirically verified on GB10 / Ubuntu
+aarch64 / 128 GB unified pool).
+
+#### Studio's "Exceeds estimated VRAM" warning is cosmetic on GB10
+
+When the chat-settings slider goes above 4096, the UI may flash:
+  "Exceeds estimated VRAM capacity (4,096 tokens). The model may use
+   system RAM."
+
+Ignore it. The estimator anchors to `torch.cuda.mem_get_info`'s "free"
+field, which on Grace-Blackwell unified memory reflects a moment-in-time
+CPU-RAM-style measurement that excludes reclaimable page cache. Right
+after loading a 50+ GB BF16 GGUF, "free" can drop near zero even though
+100+ GB of unified pool is still available. KV cache for a 32k context
+on a 27B-class GQA model is ~8 GB — well within real headroom. Drag the
+slider to 32768 (or higher) freely.
+
+If you want the suggestion auto-derived from real available memory,
+`scripts/pi-launch.sh` prints a banner with `MemAvailable`, the loaded
+variant, and a recommended ctx before exec'ing pi (skip with
+`STUDIO_QUIET=1`). The banner uses real-Linux `MemAvailable` (not the
+`MemFree` field that lies about page-cache reclaimability), reads the
+loaded model + variant from `/api/inference/status`, lists cached GGUF
+variants on disk with the active one marked, and prints a per-token
+KV-cache estimate keyed off the parsed `<param>B` model size.
+
+**Implementation note for the curious.** The warning fires from
+`studio/backend/core/inference/llama_cpp.py:_fit_context_to_vram`
+(budgets `0.90 × free_VRAM` for KV cache) → `_get_gpu_free_memory`
+(line 807, calls `torch.cuda.mem_get_info`) → fallback ceiling at line
+2013 (`max_available_ctx = min(4096, native_ctx_for_cap)`) →
+`chat-settings-sheet.tsx:723` renders the warning whenever the slider
+exceeds that 4096 cap. Empirical proof the path is salvageable: loading
+UD-Q8_K_XL (35 GB) when free was higher gave `max_available_ctx =
+221440` automatically — same code path, useful number when its inputs
+reflected reality. The fix belongs upstream in `unsloth-studio` (a
+hardware-aware unified-memory branch), not patched from this side.
+
 ### Option B — llama-server (lean, headless, scriptable)
 
 If you don't want a GUI:

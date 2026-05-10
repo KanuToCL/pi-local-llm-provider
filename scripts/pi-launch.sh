@@ -48,4 +48,7 @@ if [[ -f "${STUDIO_STATUS}" ]]; then
   esac
 fi
 
+# Opt-in studio-doctor multiplicity scan (F4 v0.3.1; defaults off).
+[ "${STUDIO_DOCTOR:-0}" = "1" ] && node "${SCRIPT_DIR}/studio-doctor.js" || true
+
 exec pi "$@"

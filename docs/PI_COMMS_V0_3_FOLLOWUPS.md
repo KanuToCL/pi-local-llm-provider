@@ -355,6 +355,25 @@ Convergent findings folded into FIX-W5 polish commit:
 
 ---
 
+### #27 — `/unsand` first-session ack is unreachable from Telegram (mobile-friendly variant)
+
+**Source:** GB10 Claude MIB-2026-05-09-2305 §2 (live-use ergonomic gap on production-box).
+
+**Concern:** Documented behavior bit live. User tried `/unsand` from Telegram and got `first-session /unsand requires terminal ack — please run from your desk first.`, responded `hmm i cant`. Mobile user, desk unavailable, agent stuck on a sandbox-denial loop with no graceful escalation path. The first-session ack exists for sound threat-model reasons (per `docs/DESIGN.md` — the original `/unsand` threat model is exactly "untrusted Telegram message widens local filesystem access"), but there is no graceful degradation when the user is *legitimately* blocked from physical access.
+
+**Two options for v0.3-class follow-up — neither needed tonight:**
+
+a. **Time-bounded `/unsand` from a verified senderId.** A senderId that was authenticated at the desk in the past 24h could be allowed to `/unsand` remotely with a daemon-emitted confirmation prompt that the user must reply to within 60s. Ties trust to recency-of-physical-presence rather than every-session-from-scratch.
+b. **A reduced `/look-around` verb** that widens reads (and only reads) without needing the full `/unsand`. The MIB-2305 §2 transcript was a read-only recon attempt — the model wanted to *find* a thing, not modify anything. (b) is genuinely safer than (a) because it limits the blast radius of the looser policy to read-only ops, which is what the model's loop was actually trying to do anyway.
+
+**Why deferred:** Design conversation, not a code change. The threat-model conversation belongs in design review with Sergio (mobile UX vs. local-fs widening) before any implementer touches `/unsand`'s ack contract. F3's sandbox-denial loop-breaker (v0.3.1) reduces the urgency by giving the model an in-band rephrase-as-read-only escape route, but the underlying mobile-user gap remains.
+
+**v0.4 ticket:** Design-review conversation first — pick (a) or (b) (or a third), then implement. F3's escape-message copy already names "rephrase as read-only" alongside `/unsand` for exactly this case (see plan v0.3.1 §F3 finding 11).
+
+**File:** `src/channels/telegram.ts` (slash-command dispatcher, only after design lands), `docs/DESIGN.md` (threat-model section).
+
+---
+
 ## Out of scope (no v0.4 ticket — explicit deferral)
 
 - **Multi-tenant SaaS hardening** — pi-comms is single-user by design. v0.3's worst-case time-to-recovery from hung-restart (~390s) is acceptable for operator-on-phone semantics; not for multi-tenant.

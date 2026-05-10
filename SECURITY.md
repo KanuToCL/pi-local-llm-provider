@@ -239,6 +239,73 @@ refuses to compose the prompt" — loud, not silent.
 
 ---
 
+### R34 — vLLM auth surface (post-v0.3.1)
+
+The v0.3.1 vLLM opt-in backend (F7 — see plan
+`docs/plans/pi_comms_v0_3_1_telegram_polish_and_vllm_optin.plan.md` §F7)
+introduces a new auth surface alongside Studio. Three concrete risks:
+
+1. **Literal apiKey shipping as bearer.** `examples/models.vllm.json`'s
+   default is `apiKey: "VLLM_API_KEY"` (env-var name, validated by
+   `check-env.js`'s `^[A-Z_][A-Z0-9_]*$` regex). Operators MUST set the
+   env var before launching pi-mono. Mitigation parallels R2 — the
+   regression to watch for is a literal lowercase bearer-shaped string
+   slipping into the field (e.g. `"vllm"` or `"sk-..."`), which
+   `check-env.js` would NOT flag as an unset env var, so it would ship
+   verbatim to whoever binds `:8000`.
+2. **Supply-chain risk on `pip install vllm`.** `scripts/install-vllm.sh`
+   pins to a specific vLLM version (`pip install "vllm==<pinned>"`).
+   Operators reinstalling later get the same pinned version. Bumping the
+   pin requires re-probing the OpenAI-compat tool-call surface — see
+   `docs/INSTALL-VLLM.md` for the probe workflow. Unpinned `pip install
+   vllm` is a transitive-dependency exposure (vLLM pulls torch + many
+   CUDA wheels) and the install script intentionally rejects that path.
+3. **0.0.0.0 bind regression** (R9-class). vLLM's default bind is
+   `0.0.0.0:8000`. The daemon's `assertLoopbackUrl` (per v0.3) catches
+   this — refuses to start if `baseUrl` resolves to a non-loopback IP.
+   `docs/INSTALL-VLLM.md` MUST instruct `vllm serve --host 127.0.0.1`
+   explicitly. Operators copying vLLM's upstream README directly would
+   bind to 0.0.0.0 and the daemon would refuse to start — loud failure,
+   not silent egress, but worth documenting at install time.
+
+---
+
+### R35 — studio-doctor port scanner (post-v0.3.1)
+
+`scripts/studio-doctor.js` (F4 — see plan
+`docs/plans/pi_comms_v0_3_1_telegram_polish_and_vllm_optin.plan.md` §F4)
+scans loopback ports 8888–8908 for Studio responders. Three invariants
+load-bearing for the threat model:
+
+1. **Loopback-only by hardcode** — host is the literal `127.0.0.1`,
+   NOT a configurable env var. There is intentionally no
+   `STUDIO_DOCTOR_HOST` knob. Prevents R14-class probe-egress
+   regression (a future contributor cannot accidentally point the
+   scanner at `0.0.0.0` or a LAN IP via env var).
+2. **Strict input validation** on `STUDIO_DOCTOR_PORT_RANGE`: NaN, ranges
+   wider than 100 ports, missing dash, reversed ranges (`8908-8888`),
+   and non-positive integers all → `process.exit(2)` with a clear
+   stderr message. Bounds-check the range BEFORE any socket connect.
+3. **Content sanitization** on `/api/health` JSON response: the
+   `studio_root_id` and `loaded` model name fields are truncated to
+   ≤64 chars + filtered to ASCII-printable (`[\x20-\x7E]`) before being
+   logged or printed. Prevents terminal-hijack via ANSI escape sequences
+   from a malicious process binding a loopback port and returning
+   crafted JSON. The reasoning: a non-Studio process listening on
+   `127.0.0.1:8888` could return arbitrary bytes; if those bytes hit a
+   developer's terminal unfiltered, that's an interactive-shell
+   compromise vector.
+
+**Read-only by design.** `studio-doctor` does NOT kill ports, does NOT
+mutate Studio state, does NOT auto-rewrite `baseUrl`, does NOT call
+any Studio mutation endpoint. It connects, GETs `/api/health`, parses
++ sanitizes, prints + emits a structured operator-log line, exits.
+Per Plan v0.3.1 Pitfall #2 — "no port killing, no Studio mutation, no
+auto-baseUrl-rewrite" is the contract; future contributors adding
+write paths to this script require a fresh threat-model review.
+
+---
+
 ## What this repo does about R2 specifically
 
 R2 is the load-bearing risk for first-time users, because it triggers on the
