@@ -660,12 +660,23 @@ async function runRun(opts: RunOptions): Promise<number> {
   }
 
   // 6. Token is materialized at this point — load it and attach.
+  //    v0.3.1 §1.6e (F8): replace the legacy `.catch(() => 0)` swallow
+  //    with explicit error propagation.  The pre-fix swallow turned every
+  //    attach failure into a silent code-0 success, contributing to the
+  //    F8 root-cause where the user saw `pi-comms run` exit cleanly while
+  //    the daemon was actually broken.  Surface the error to stderr and
+  //    return a non-zero code so the parent shell sees the failure.
   const authToken = await loadAuthToken();
   await runAttach({
     full: opts.full,
     socketPath: opts.socketPath,
     authToken,
-  }).catch(() => 0);
+  }).catch((e) => {
+    process.stderr.write(
+      `pi-comms: attach failed: ${e instanceof Error ? e.message : String(e)}\n`,
+    );
+    return 1;
+  });
 
   // 7. Drain the child. After Ctrl-C it should already be in shutdown.
   await waitForChildExit(child, 5000);

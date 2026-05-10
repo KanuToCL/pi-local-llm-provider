@@ -69,6 +69,7 @@ import {
 import { ensureTokenFile } from "./ipc/protocol.js";
 import { TelegramChannel, TelegramAuthError } from "./channels/telegram.js";
 import type { RestartReason } from "./audit/schema.js";
+import { redactBotToken } from "./lib/sanitize.js";
 import { monotonicMs as defaultMonotonicMs } from "./lib/clock.js";
 import {
   WhatsappChannel,
@@ -139,8 +140,19 @@ const AUDIT_PURGE_INTERVAL_MS = 24 * 60 * 60 * 1000;
 // ---------------------------------------------------------------------------
 
 /** Thrown by the boot sequence on misconfiguration that the daemon refuses
- *  to start with (non-loopback Studio URL, schema-drift in models.json, etc.). */
+ *  to start with (non-loopback Studio URL, schema-drift in models.json, etc.).
+ *
+ *  v0.3.1 (F8): when `stderrEmitted=true`, the boot path has ALREADY written
+ *  a 3-line operator-friendly stderr message + a `daemon_boot_failed` audit
+ *  row.  Callers (e.g. `main()`) MUST NOT print a second message — exit
+ *  silently with code 2 to avoid duplicating the diagnostic. */
 export class DaemonBootError extends Error {
+  /** Set by `bootAfterLock` when stderr + audit were already emitted at
+   *  the failure site (Studio model-load timeout etc.).  Default false so
+   *  legacy DaemonBootError throwers (loopback assertion, lockfile race)
+   *  retain the legacy `main()` error-print path. */
+  public stderrEmitted: boolean = false;
+
   constructor(message: string) {
     super(message);
     this.name = "DaemonBootError";
@@ -168,6 +180,18 @@ export interface DaemonOpts {
   exitOnShutdown?: boolean;
   /** Inject a logger (for tests). */
   operatorLogger?: OperatorLogger;
+  /**
+   * Test injection: max time to wait for Studio model load (ms).  Defaults to
+   * `STUDIO_MODEL_WAIT_MS` (5min).  Plan v0.3.1 §1.6c — lifted to opts so
+   * the F8 hermetic test can drive a tight deadline without burning 5 minutes
+   * of wall-clock per test run.
+   */
+  studioModelWaitMs?: number;
+  /**
+   * Test injection: poll interval while waiting for the model to load (ms).
+   * Defaults to `STUDIO_MODEL_POLL_MS` (5s).  Plan v0.3.1 §1.6c.
+   */
+  studioModelPollMs?: number;
 }
 
 /** Returned by `start()` so callers (tests and the CLI entry) can drive the
@@ -721,28 +745,160 @@ async function bootAfterLock(
     sessions: "shared",
   });
 
+  // ---------------------------------------------------------------------
+  // 5c. v0.3.1 §1.6b (F8): EARLY signal-handler install — BEFORE Studio
+  //     readiness wait + IPC bind.  Pre-v0.3.1 the only signal handler
+  //     was installed AFTER IPC bind (line 1471 in pre-fix), so a SIGTERM
+  //     that arrived during the up-to-5min Studio model-load wait fell
+  //     through to Node's default handler (exit 143).  Worse, in the F8
+  //     root-cause scenario the parent's `waitForDaemonReady` (30s) timed
+  //     out FIRST and sent SIGTERM; the daemon's late-installed graceful-
+  //     shutdown handler then ran shutdown→exit 0; parent saw
+  //     `child.exitCode = 0` and reported success while the bot was
+  //     actually broken.
+  //
+  //     Two layers of fix:
+  //       1. Install handlers HERE (early), before any blocking await.
+  //       2. The handler closes over `bootCompleted`; before-bind signals
+  //          emit `daemon_boot_failed` audit + exit 2 (non-zero ⇒ parent
+  //          AND systemd see real failure).  After-bind signals delegate
+  //          to the runtime `handle.shutdown(...)` for graceful drain.
+  //
+  //     Adversarial I-1: the closure read of `bootCompleted` happens at
+  //     signal time, not registration time — so the "race window" between
+  //     bind-success and a SIGTERM milliseconds later is closed.
+  //     Adversarial I-B: the legacy `installSignalHandlers(handle, ...)`
+  //     call near the end of bootAfterLock is REMOVED — leaving both
+  //     registrations standing would double-fire on every signal.
+  //     Pattern: `process.once` (not `.on`) per the existing convention
+  //     so a second SIGTERM during boot doesn't re-fire the handler
+  //     concurrently with the in-flight `process.exit(2)`.
+  let bootCompleted = false;
+  const handleRef: { current: RunningDaemon | null } = { current: null };
+  const exitOnShutdown = opts.exitOnShutdown ?? false;
+  const earlySignalHandler = (sig: NodeJS.Signals) => {
+    if (!bootCompleted) {
+      // Boot-time shutdown.  Best-effort audit emit BEFORE non-zero exit
+      // so the forensic row reaches disk; NIT-4 (Architect) — never block
+      // process.exit on a logging failure.
+      operatorLogger.error("daemon_boot_aborted_by_signal", { signal: sig });
+      auditLog
+        .append({
+          event: "daemon_boot_failed",
+          task_id: null,
+          channel: "system",
+          sender_id_hash: null,
+          extra: {
+            reason: "boot_aborted_by_signal",
+            signal: sig,
+          },
+        })
+        .catch(() => undefined)
+        .finally(() => process.exit(2));
+      return;
+    }
+    // Runtime shutdown — delegate to the runtime handle.  Mirrors the
+    // logic that lived in `installSignalHandlers(handle, ...)` pre-v0.3.1
+    // (REMOVED below per Adversarial I-B).
+    operatorLogger.info("daemon_shutdown", { signal: sig });
+    const h = handleRef.current;
+    if (h === null) {
+      // Should be unreachable: bootCompleted=true ⇒ handleRef.current set.
+      // Defensive: exit non-zero so this stays loud rather than masking.
+      process.exit(2);
+      return;
+    }
+    void h.shutdown(`signal:${sig}`).then(() => {
+      if (exitOnShutdown) process.exit(0);
+    });
+  };
+  process.once("SIGINT", () => earlySignalHandler("SIGINT"));
+  process.once("SIGTERM", () => earlySignalHandler("SIGTERM"));
+  if (platform() !== "win32") {
+    process.once("SIGHUP", () => earlySignalHandler("SIGHUP"));
+  }
+
   // 6. Studio readiness — both the loopback assertion and Phase 4.4 model-
   //    loaded check. Skipped in test mode so the integration smoke can boot
   //    without a real Studio.  We also capture studioUrl + modelId for the
   //    cold-start probe wired into SessionManager (Pitfall #20 / FIX-B-1 #4).
+  //
+  //    v0.3.1 §1.6c: `studioModelWaitMs` and `studioModelPollMs` lifted to
+  //    `DaemonOpts` so the F8 hermetic test can drive a tight deadline
+  //    (default to module constants for backward compat — Pitfall #16).
+  //    v0.3.1 §1.6d (F8): the timeout case throws DaemonBootError; we
+  //    catch it HERE so we can emit a 3-line operator-friendly stderr
+  //    message + a `daemon_boot_failed` audit row WITH the rich context
+  //    (configured model id, studio URL, configured timeout) that
+  //    `main()` doesn't have access to.  redactBotToken applied
+  //    defensively (Security W4) even though models.json never contains
+  //    a bot token in practice.
   let coldStartStudioUrl: string | null = null;
   let coldStartModelId: string | null = null;
   const fetchFn = opts.fetchFn ?? fetch;
+  const studioModelWaitMs = opts.studioModelWaitMs ?? STUDIO_MODEL_WAIT_MS;
+  const studioModelPollMs = opts.studioModelPollMs ?? STUDIO_MODEL_POLL_MS;
   if (!testMode) {
-    const modelsJson = await loadModelsJsonOrFail(config, operatorLogger);
-    const studioUrl = extractStudioBaseUrl(modelsJson, config.piCommsDefaultModel);
-    assertLoopbackUrl(studioUrl);
-    coldStartStudioUrl = studioUrl;
-    coldStartModelId = await waitForStudioModelLoaded({
-      baseUrl: studioUrl,
-      modelId: extractModelId(config.piCommsDefaultModel),
-      apiKey: config.unslothApiKey,
-      fetchFn,
-      logger: operatorLogger,
-    });
-    operatorLogger.info("studio_swap_detection_armed", {
-      baseline_model: coldStartModelId,
-    });
+    let configuredModelId: string | null = null;
+    let studioUrl: string | null = null;
+    try {
+      const modelsJson = await loadModelsJsonOrFail(config, operatorLogger);
+      studioUrl = extractStudioBaseUrl(modelsJson, config.piCommsDefaultModel);
+      assertLoopbackUrl(studioUrl);
+      coldStartStudioUrl = studioUrl;
+      configuredModelId = extractModelId(config.piCommsDefaultModel);
+      coldStartModelId = await waitForStudioModelLoaded({
+        baseUrl: studioUrl,
+        modelId: configuredModelId,
+        apiKey: config.unslothApiKey,
+        fetchFn,
+        logger: operatorLogger,
+        waitMs: studioModelWaitMs,
+        pollMs: studioModelPollMs,
+      });
+      operatorLogger.info("studio_swap_detection_armed", {
+        baseline_model: coldStartModelId,
+      });
+    } catch (err) {
+      if (err instanceof DaemonBootError) {
+        // 3-line stderr per plan §1.6d format: what failed / what to do /
+        // where to learn more.  redactBotToken applied defensively
+        // (Security W4).
+        const message = redactBotToken(err.message);
+        const studioForMsg = studioUrl ?? "(not yet resolved)";
+        process.stderr.write(`pi-comms: cannot start — ${message}\n\n`);
+        process.stderr.write(
+          `Likely cause: open Studio's web UI (${studioForMsg}) and load the\n` +
+            `model named in ~/.pi/agent/models.json. Then re-run pi-comms run.\n\n` +
+            `If this is your first install: see docs/INSTALL.md §3.\n`,
+        );
+        // Await the audit append BEFORE re-throwing so the row flushes
+        // to disk before main()'s process.exit(2) fires (NIT-4 — Architect).
+        // try/catch guarantees a logging failure never blocks the exit.
+        // `extra` is constrained to scalars (string | number | boolean) by
+        // AuditEntrySchema; substitute "(unresolved)" when the field would
+        // otherwise be null so the row keeps grep-friendly content.
+        await auditLog
+          .append({
+            event: "daemon_boot_failed",
+            task_id: null,
+            channel: "system",
+            sender_id_hash: null,
+            extra: {
+              reason: "studio_model_load_timeout",
+              configured_model_id: configuredModelId
+                ? redactBotToken(configuredModelId)
+                : "(unresolved)",
+              studio_url: studioUrl ?? "(unresolved)",
+              timeout_ms: studioModelWaitMs,
+            },
+          })
+          .catch(() => undefined);
+        // Mark the error as already-printed so main() doesn't double-print.
+        err.stderrEmitted = true;
+      }
+      throw err;
+    }
   }
 
   // Audit a daemon_boot at the orchestrator level (the IPC server emits its
@@ -1220,6 +1376,13 @@ async function bootAfterLock(
   // 17. Bind the socket. After this, attached clients can connect.
   await ipcServer.start();
 
+  // v0.3.1 §1.6b (F8): IPC bind succeeded — flip the boot-vs-runtime
+  // discriminator so the early-installed signal handler routes a
+  // SIGTERM/SIGINT/SIGHUP to graceful shutdown instead of the boot-failed
+  // path.  The closure above reads this at signal time, not registration
+  // time — so the read sees the post-bind value (Adversarial I-1 race fix).
+  bootCompleted = true;
+
   // 18. Periodic drivers.  Three independent timers:
   //
   //     a) Heartbeat observation — runs `getState()` so a stale source
@@ -1468,7 +1631,14 @@ async function bootAfterLock(
     },
   };
 
-  installSignalHandlers(handle, operatorLogger, opts.exitOnShutdown ?? false);
+  // v0.3.1 §1.6b (F8): expose the runtime handle to the early-installed
+  // signal handler so post-bind SIGTERM/SIGINT/SIGHUP delegates to
+  // `handle.shutdown(...)` for graceful drain.  The legacy
+  // `installSignalHandlers(handle, ...)` call previously here has been
+  // REMOVED per Adversarial I-B — leaving both registrations standing
+  // would double-fire on every signal (Node fires in registration order,
+  // non-deterministic teardown).
+  handleRef.current = handle;
 
   return handle;
 }
@@ -1858,6 +2028,13 @@ interface StudioWaitOpts {
   apiKey: string;
   fetchFn: typeof fetch;
   logger: OperatorLogger;
+  /** Max time to wait for the model to load (ms).  Defaults to
+   *  `STUDIO_MODEL_WAIT_MS`.  Lifted out of the module-private constant so
+   *  `start()` can override it via `DaemonOpts.studioModelWaitMs` for the F8
+   *  hermetic test (Plan v0.3.1 §1.6c). */
+  waitMs?: number;
+  /** Poll interval while waiting (ms).  Defaults to `STUDIO_MODEL_POLL_MS`. */
+  pollMs?: number;
 }
 
 /**
@@ -1871,7 +2048,9 @@ interface StudioWaitOpts {
 const AUTO_MODEL = "auto";
 
 async function waitForStudioModelLoaded(opts: StudioWaitOpts): Promise<string> {
-  const deadline = Date.now() + STUDIO_MODEL_WAIT_MS;
+  const waitMs = opts.waitMs ?? STUDIO_MODEL_WAIT_MS;
+  const pollMs = opts.pollMs ?? STUDIO_MODEL_POLL_MS;
+  const deadline = Date.now() + waitMs;
   // The /api/inference/status endpoint lives at the Studio root, not under
   // /v1. baseUrl is typically "http://localhost:8888/v1"; trim that suffix
   // before composing.
@@ -1931,10 +2110,10 @@ async function waitForStudioModelLoaded(opts: StudioWaitOpts): Promise<string> {
         error: lastError,
       });
     }
-    await sleep(STUDIO_MODEL_POLL_MS);
+    await sleep(pollMs);
   }
   throw new DaemonBootError(
-    `Studio readiness check timed out after ${STUDIO_MODEL_WAIT_MS / 1000}s: ${
+    `Studio readiness check timed out after ${Math.round(waitMs / 1000)}s: ${
       lastError ?? "no response"
     }`
   );
@@ -2033,25 +2212,14 @@ function getCurrentTaskIdFromState(
 // ---------------------------------------------------------------------------
 // Signals
 // ---------------------------------------------------------------------------
-
-function installSignalHandlers(
-  handle: RunningDaemon,
-  logger: OperatorLogger,
-  exitOnShutdown: boolean
-): void {
-  const onSignal = (signal: NodeJS.Signals) => {
-    logger.info("daemon_shutdown", { signal });
-    void handle.shutdown(`signal:${signal}`).then(() => {
-      if (exitOnShutdown) process.exit(0);
-    });
-  };
-  process.once("SIGINT", () => onSignal("SIGINT"));
-  process.once("SIGTERM", () => onSignal("SIGTERM"));
-  // SIGHUP doesn't exist on Windows; guard the install.
-  if (platform() !== "win32") {
-    process.once("SIGHUP", () => onSignal("SIGHUP"));
-  }
-}
+// v0.3.1 §1.6b (F8) — REMOVED `installSignalHandlers(handle, logger, exit)`.
+// The boot-vs-runtime discriminator is now handled by the early-installed
+// closure in `bootAfterLock` (see step 5c above).  Both paths (boot abort
+// and runtime shutdown) live in the same `earlySignalHandler`, gated on the
+// `bootCompleted` flag.  Adversarial I-B: leaving this function alongside
+// the early install would double-fire on every signal (Node fires handlers
+// in registration order — non-deterministic teardown).
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Filesystem + token + salt helpers
@@ -2166,6 +2334,14 @@ async function main(): Promise<void> {
       err instanceof ModelsJsonValidationError ||
       err instanceof DaemonBootError
     ) {
+      // v0.3.1 §1.6d (F8): when `bootAfterLock` already emitted the 3-line
+      // operator-friendly stderr + the daemon_boot_failed audit row, exit
+      // silently with code 2 to avoid duplicating the diagnostic.  Other
+      // DaemonBootError throwers (loopback assertion, lockfile race) keep
+      // the legacy print path.
+      if (err instanceof DaemonBootError && err.stderrEmitted) {
+        process.exit(2);
+      }
       console.error(`[pi-comms] boot failed: ${err.message}`);
       process.exit(2);
     }
