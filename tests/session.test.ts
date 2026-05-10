@@ -2898,3 +2898,505 @@ describe("v0.2.2 §A.6 Test 9: cyclicity-normalize on stuck-completed state", ()
     await mgr.dispose();
   });
 });
+
+// ---------------------------------------------------------------------------
+// v0.3.1 — Sandbox-denial loop-breaker (Step 1.4, F3b, MIB-2305 §4).
+// SessionManager observes BashToolResult.details.sandboxDenied (canonical,
+// from IMPL-3) and counts consecutive denials per task. After N=3 the
+// loop-breaker fires once: a system_notice ChannelEvent on the originating
+// channel + a sandbox_denial_loop_broken audit row. One-shot per task;
+// successful results reset the counter.
+//
+// Negative-case discipline: command-not-found / file-not-found / OOM all
+// return isError=true with sandboxDenied=false → NEVER trip the counter.
+// classifier-block path returns errorResult("blocked: ...") with no
+// sandboxDenied flag → counter relies on the text-prefix predicate.
+// ---------------------------------------------------------------------------
+
+interface BashStubResult {
+  content: Array<{ type: "text"; text: string }>;
+  isError?: boolean;
+  details?: {
+    exitCode: number | null;
+    signal: NodeJS.Signals | null;
+    stdout: string;
+    stderr: string;
+    timedOut: boolean;
+    aborted: boolean;
+    sandboxed: boolean;
+    sandboxDenied?: boolean;
+  };
+}
+
+type BashExec = (
+  callId: string,
+  params: { command?: string; timeoutMs?: number },
+  signal: AbortSignal | undefined,
+) => Promise<BashStubResult>;
+
+interface CapturedTool {
+  name: string;
+  execute: BashExec;
+  /**
+   * v0.3.1 F3b testability seam — SessionManager's instrumented bash
+   * wrapper looks up the inner execute on this property at call-time
+   * (NOT a closure-captured local), so tests substitute this to inject
+   * canned BashToolResults without bypassing the loop-breaker observer.
+   * See `instrumentedBashDefineTool` in src/session.ts.
+   */
+  __sandbox_inner_execute__: BashExec;
+}
+
+/**
+ * Fake-SDK loader that captures the customTools[] array passed to
+ * createAgentSession so the test can drive the bash tool's `execute`
+ * directly (simulating what pi-mono would do at agent-loop time).
+ *
+ * The captured bash tool is the WRAPPED execute — the SessionManager has
+ * already intercepted it via its instrumented defineTool.  This is the
+ * only entry-point for the loop-breaker counter: drive the wrapped execute
+ * and the counter ticks.
+ */
+function makeFakeSdkLoaderWithCapture(session: FakeSession): {
+  loader: () => Promise<{
+    createAgentSession: (args: { customTools?: unknown[] }) => Promise<{ session: FakeSession }>;
+    defineTool: (def: unknown) => unknown;
+    raw: Record<string, unknown>;
+  }>;
+  capturedTools: { value: unknown[] | null };
+} {
+  const capturedTools: { value: unknown[] | null } = { value: null };
+  const loader = async () => ({
+    createAgentSession: async (args: { customTools?: unknown[] }) => {
+      capturedTools.value = args.customTools ?? [];
+      return { session };
+    },
+    defineTool: (def: unknown) => def,
+    raw: {} as Record<string, unknown>,
+  });
+  return { loader, capturedTools };
+}
+
+function findBashTool(tools: unknown[] | null): CapturedTool {
+  if (!tools) throw new Error("no customTools captured");
+  for (const t of tools) {
+    if (
+      typeof t === "object" &&
+      t !== null &&
+      (t as { name?: unknown }).name === "bash"
+    ) {
+      return t as unknown as CapturedTool;
+    }
+  }
+  throw new Error("bash tool not found in customTools");
+}
+
+/** Build a fake exec result so the loop-breaker fires (sandboxDenied=true). */
+function denialResult(stderr = "Permission denied") {
+  return {
+    content: [{ type: "text", text: `[exit 1]\n${stderr}` }],
+    isError: true,
+    details: {
+      exitCode: 1,
+      signal: null as NodeJS.Signals | null,
+      stdout: "",
+      stderr,
+      timedOut: false,
+      aborted: false,
+      sandboxed: true,
+      sandboxDenied: true,
+    },
+  };
+}
+
+/** Generic POSIX failure that must NOT trip the loop-breaker. */
+function genericFailureResult(stderr = "command not found") {
+  return {
+    content: [{ type: "text", text: `[exit 127]\n${stderr}` }],
+    isError: true,
+    details: {
+      exitCode: 127,
+      signal: null as NodeJS.Signals | null,
+      stdout: "",
+      stderr,
+      timedOut: false,
+      aborted: false,
+      sandboxed: true,
+      sandboxDenied: false,
+    },
+  };
+}
+
+/** Successful exec result (resets the counter). */
+function successResult() {
+  return {
+    content: [{ type: "text", text: "[exit 0]\nok" }],
+    isError: false,
+    details: {
+      exitCode: 0,
+      signal: null as NodeJS.Signals | null,
+      stdout: "ok",
+      stderr: "",
+      timedOut: false,
+      aborted: false,
+      sandboxed: true,
+      sandboxDenied: false,
+    },
+  };
+}
+
+/** Classifier-block path return shape: errorResult("blocked: ..."). */
+function classifierBlockResult(reason = "destructive command pattern") {
+  return {
+    content: [{ type: "text", text: `blocked: ${reason}` }],
+    isError: true,
+  };
+}
+
+describe("v0.3.1 sandbox-denial loop-breaker (Step 1.4, F3b)", () => {
+  test("3 consecutive sandboxDenied=true results → injection fires + audit row + emitted-flag", async () => {
+    const h = makeHarness();
+    const session = makeFakeSession();
+    const { loader, capturedTools } = makeFakeSdkLoaderWithCapture(session);
+
+    // Use a controllable monotonic clock so age math is deterministic.
+    let monoT = 1000;
+    const monotonicMsFn = () => monoT;
+
+    const mgr = new SessionManager({
+      config: h.config,
+      taskState: h.taskState,
+      pendingConfirms: h.pendingConfirms,
+      sandboxPolicy: h.sandboxPolicy,
+      auditLog: h.auditLog,
+      sinks: h.sinks,
+      basePromptPath: h.basePromptPath,
+      validateModelsJsonOverride: noopValidate,
+      loadSdkOverride: loader,
+      monotonicMsFn,
+    });
+    await mgr.init();
+
+    // Start a task so currentTaskId is non-null when the counter trips.
+    const inflight = mgr.handleInbound({ channel: "telegram", text: "go" });
+    await waitFor(() => session.promptCalls.length > 0);
+
+    // Wrap-bash hands the bash tool def into customTools; SessionManager
+    // wrapped its execute to observe results.  We grab the wrapped tool
+    // and stub the INNER execute so canned denial results flow back
+    // through SessionManager's observer (which still runs because we
+    // call the wrapper's execute, not the inner).
+    const bash = findBashTool(capturedTools.value);
+    const originalCmd = "rm -rf /etc/foo";
+    bash.__sandbox_inner_execute__ = (async (
+      _callId: string,
+      _params: { command?: string; timeoutMs?: number },
+      _signal: AbortSignal | undefined,
+    ) => {
+      monoT += 100; // 100ms between attempts
+      return denialResult();
+    }) as BashExec;
+
+    // Drive 3 denials via the WRAPPED execute (which calls the stubbed
+    // inner THEN ticks the loop-breaker observer).
+    await bash.execute("c1", { command: originalCmd }, undefined);
+    await bash.execute("c2", { command: originalCmd }, undefined);
+    await bash.execute("c3", { command: originalCmd }, undefined);
+
+    // Loop-breaker should have fired exactly ONE system_notice on the
+    // originating channel (telegram).
+    const notices = h.sinks.telegram.events.filter(
+      (e) => e.type === "system_notice",
+    );
+    expect(notices.length).toBe(1);
+    const notice = notices[0]!;
+    if (notice.type !== "system_notice") throw new Error("expected system_notice");
+    expect(notice.level).toBe("warn");
+    expect(notice.text).toContain("sandbox blocked 3 attempts");
+    expect(notice.text).toContain("/unsand");
+    expect(notice.text).toContain("/cancel");
+
+    // Audit row appended.
+    let row: Record<string, unknown> | undefined;
+    await waitFor(() => {
+      const lines = readAuditLines(join(workDir, "audit"));
+      row = lines.find((e) => e.event === "sandbox_denial_loop_broken");
+      return row !== undefined;
+    }, 500);
+    expect(row).toBeDefined();
+    expect(row!.channel).toBe("telegram");
+    expect(row!.task_id).toBeTruthy();
+    expect(row!.sender_id_hash).toBeNull();
+    const extra = row!.extra as Record<string, unknown>;
+    expect(extra.consecutive_denials).toBe(3);
+    expect(typeof extra.first_denial_age_ms).toBe("number");
+    // 1st denial at monoT=1100, 3rd injection at monoT=1300 → age = 200ms.
+    expect(extra.first_denial_age_ms).toBeGreaterThanOrEqual(0);
+    expect(typeof extra.last_cmd_hash_first8).toBe("string");
+    expect((extra.last_cmd_hash_first8 as string).length).toBe(8);
+
+    // Emitted-flag is one-shot — verified by driving 4th denial in next test.
+
+    session.resolveCurrentPrompt!();
+    await inflight;
+    await mgr.dispose();
+  });
+
+  test("4th denial after injection → NO second injection (one-shot per task)", async () => {
+    const h = makeHarness();
+    const session = makeFakeSession();
+    const { loader, capturedTools } = makeFakeSdkLoaderWithCapture(session);
+    const mgr = new SessionManager({
+      config: h.config,
+      taskState: h.taskState,
+      pendingConfirms: h.pendingConfirms,
+      sandboxPolicy: h.sandboxPolicy,
+      auditLog: h.auditLog,
+      sinks: h.sinks,
+      basePromptPath: h.basePromptPath,
+      validateModelsJsonOverride: noopValidate,
+      loadSdkOverride: loader,
+    });
+    await mgr.init();
+
+    const inflight = mgr.handleInbound({ channel: "telegram", text: "go" });
+    await waitFor(() => session.promptCalls.length > 0);
+
+    const bash = findBashTool(capturedTools.value);
+    bash.__sandbox_inner_execute__ = (async () => denialResult()) as BashExec;
+
+    // 3 denials → fires.
+    await bash.execute("c1", { command: "x" }, undefined);
+    await bash.execute("c2", { command: "x" }, undefined);
+    await bash.execute("c3", { command: "x" }, undefined);
+    // 4th + 5th denial → MUST NOT re-fire.
+    await bash.execute("c4", { command: "x" }, undefined);
+    await bash.execute("c5", { command: "x" }, undefined);
+
+    const notices = h.sinks.telegram.events.filter(
+      (e) => e.type === "system_notice",
+    );
+    expect(notices.length).toBe(1);
+
+    // Only ONE audit row.
+    await waitFor(() => {
+      const lines = readAuditLines(join(workDir, "audit"));
+      return lines.filter((e) => e.event === "sandbox_denial_loop_broken").length >= 1;
+    }, 500);
+    const lines = readAuditLines(join(workDir, "audit"));
+    const rows = lines.filter((e) => e.event === "sandbox_denial_loop_broken");
+    expect(rows.length).toBe(1);
+
+    session.resolveCurrentPrompt!();
+    await inflight;
+    await mgr.dispose();
+  });
+
+  test("successful tool call after 2 denials → counter resets; need 3 NEW denials to fire", async () => {
+    const h = makeHarness();
+    const session = makeFakeSession();
+    const { loader, capturedTools } = makeFakeSdkLoaderWithCapture(session);
+    const mgr = new SessionManager({
+      config: h.config,
+      taskState: h.taskState,
+      pendingConfirms: h.pendingConfirms,
+      sandboxPolicy: h.sandboxPolicy,
+      auditLog: h.auditLog,
+      sinks: h.sinks,
+      basePromptPath: h.basePromptPath,
+      validateModelsJsonOverride: noopValidate,
+      loadSdkOverride: loader,
+    });
+    await mgr.init();
+
+    const inflight = mgr.handleInbound({ channel: "telegram", text: "go" });
+    await waitFor(() => session.promptCalls.length > 0);
+
+    const bash = findBashTool(capturedTools.value);
+    const modeQueue: Array<"deny" | "ok"> = ["deny", "deny", "ok", "deny", "deny"];
+    bash.__sandbox_inner_execute__ = (async () => {
+      const m = modeQueue.shift();
+      if (m === "deny") return denialResult();
+      return successResult();
+    }) as BashExec;
+
+    // 2 denials, 1 success, 2 more denials → counter should be 2 at end.
+    await bash.execute("c1", { command: "x" }, undefined);
+    await bash.execute("c2", { command: "x" }, undefined);
+    await bash.execute("c3", { command: "x" }, undefined);
+    await bash.execute("c4", { command: "x" }, undefined);
+    await bash.execute("c5", { command: "x" }, undefined);
+
+    // No injection fired — only 2 consecutive after the success reset.
+    let notices = h.sinks.telegram.events.filter(
+      (e) => e.type === "system_notice",
+    );
+    expect(notices.length).toBe(0);
+
+    // Now ONE more denial → 3rd consecutive → fires.
+    bash.__sandbox_inner_execute__ = (async () => denialResult()) as BashExec;
+    await bash.execute("c6", { command: "x" }, undefined);
+
+    notices = h.sinks.telegram.events.filter(
+      (e) => e.type === "system_notice",
+    );
+    expect(notices.length).toBe(1);
+
+    session.resolveCurrentPrompt!();
+    await inflight;
+    await mgr.dispose();
+  });
+
+  test("cross-task: counter + emitted-flag reset at task-start; loop-breaker can fire again", async () => {
+    const h = makeHarness();
+    const session = makeFakeSession();
+    const { loader, capturedTools } = makeFakeSdkLoaderWithCapture(session);
+    const mgr = new SessionManager({
+      config: h.config,
+      taskState: h.taskState,
+      pendingConfirms: h.pendingConfirms,
+      sandboxPolicy: h.sandboxPolicy,
+      auditLog: h.auditLog,
+      sinks: h.sinks,
+      basePromptPath: h.basePromptPath,
+      validateModelsJsonOverride: noopValidate,
+      loadSdkOverride: loader,
+    });
+    await mgr.init();
+
+    // ── Task 1: trip the loop-breaker.
+    const inflight1 = mgr.handleInbound({ channel: "telegram", text: "task1" });
+    await waitFor(() => session.promptCalls.length > 0);
+    const bash = findBashTool(capturedTools.value);
+    bash.__sandbox_inner_execute__ = (async () => denialResult()) as BashExec;
+    await bash.execute("c1", { command: "x" }, undefined);
+    await bash.execute("c2", { command: "x" }, undefined);
+    await bash.execute("c3", { command: "x" }, undefined);
+    expect(
+      h.sinks.telegram.events.filter((e) => e.type === "system_notice").length,
+    ).toBe(1);
+
+    // Drain task 1 — emit a message_end so the subscriber fans out, then
+    // resolve the prompt so handleInbound's await returns and state goes
+    // back to idle.
+    session.emit({
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: "done" }] },
+    });
+    session.resolveCurrentPrompt!();
+    await inflight1;
+    await waitForMs(() => h.taskState.get().kind === "idle", 1000);
+    expect(h.taskState.get().kind).toBe("idle");
+
+    // ── Task 2: counter must be reset; new fire allowed.
+    const inflight2 = mgr.handleInbound({ channel: "telegram", text: "task2" });
+    await waitFor(() => session.promptCalls.length >= 2);
+    // Same wrapped bash tool — drive 3 more denials.
+    await bash.execute("d1", { command: "x" }, undefined);
+    await bash.execute("d2", { command: "x" }, undefined);
+    await bash.execute("d3", { command: "x" }, undefined);
+
+    const notices = h.sinks.telegram.events.filter(
+      (e) => e.type === "system_notice",
+    );
+    expect(notices.length).toBe(2);
+
+    // Two distinct audit rows total (one per task).
+    await waitFor(() => {
+      const lines = readAuditLines(join(workDir, "audit"));
+      return lines.filter((e) => e.event === "sandbox_denial_loop_broken").length >= 2;
+    }, 500);
+    const lines = readAuditLines(join(workDir, "audit"));
+    const rows = lines.filter((e) => e.event === "sandbox_denial_loop_broken");
+    expect(rows.length).toBe(2);
+    expect(rows[0]!.task_id).not.toBe(rows[1]!.task_id);
+
+    session.resolveCurrentPrompt!();
+    await inflight2;
+    await mgr.dispose();
+  });
+
+  test("3 consecutive command-not-found (sandboxDenied=false) → loop-breaker NEVER fires", async () => {
+    const h = makeHarness();
+    const session = makeFakeSession();
+    const { loader, capturedTools } = makeFakeSdkLoaderWithCapture(session);
+    const mgr = new SessionManager({
+      config: h.config,
+      taskState: h.taskState,
+      pendingConfirms: h.pendingConfirms,
+      sandboxPolicy: h.sandboxPolicy,
+      auditLog: h.auditLog,
+      sinks: h.sinks,
+      basePromptPath: h.basePromptPath,
+      validateModelsJsonOverride: noopValidate,
+      loadSdkOverride: loader,
+    });
+    await mgr.init();
+
+    const inflight = mgr.handleInbound({ channel: "telegram", text: "go" });
+    await waitFor(() => session.promptCalls.length > 0);
+
+    const bash = findBashTool(capturedTools.value);
+    bash.__sandbox_inner_execute__ = (async () =>
+      genericFailureResult("bash: foo: command not found")) as BashExec;
+
+    // 5 generic failures — must not trip.
+    for (let i = 0; i < 5; i++) {
+      await bash.execute(`c${i}`, { command: "foo" }, undefined);
+    }
+
+    const notices = h.sinks.telegram.events.filter(
+      (e) => e.type === "system_notice",
+    );
+    expect(notices.length).toBe(0);
+
+    // No audit row.
+    const lines = readAuditLines(join(workDir, "audit"));
+    expect(
+      lines.filter((e) => e.event === "sandbox_denial_loop_broken").length,
+    ).toBe(0);
+
+    session.resolveCurrentPrompt!();
+    await inflight;
+    await mgr.dispose();
+  });
+
+  test("3 consecutive 'blocked:' classifier-block results → DOES fire (alt predicate path)", async () => {
+    const h = makeHarness();
+    const session = makeFakeSession();
+    const { loader, capturedTools } = makeFakeSdkLoaderWithCapture(session);
+    const mgr = new SessionManager({
+      config: h.config,
+      taskState: h.taskState,
+      pendingConfirms: h.pendingConfirms,
+      sandboxPolicy: h.sandboxPolicy,
+      auditLog: h.auditLog,
+      sinks: h.sinks,
+      basePromptPath: h.basePromptPath,
+      validateModelsJsonOverride: noopValidate,
+      loadSdkOverride: loader,
+    });
+    await mgr.init();
+
+    const inflight = mgr.handleInbound({ channel: "telegram", text: "go" });
+    await waitFor(() => session.promptCalls.length > 0);
+
+    const bash = findBashTool(capturedTools.value);
+    bash.__sandbox_inner_execute__ = (async () => classifierBlockResult()) as BashExec;
+
+    await bash.execute("c1", { command: "rm -rf /" }, undefined);
+    await bash.execute("c2", { command: "rm -rf /" }, undefined);
+    await bash.execute("c3", { command: "rm -rf /" }, undefined);
+
+    const notices = h.sinks.telegram.events.filter(
+      (e) => e.type === "system_notice",
+    );
+    expect(notices.length).toBe(1);
+    if (notices[0]!.type !== "system_notice") throw new Error("type guard");
+    expect(notices[0]!.level).toBe("warn");
+
+    session.resolveCurrentPrompt!();
+    await inflight;
+    await mgr.dispose();
+  });
+});

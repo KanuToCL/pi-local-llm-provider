@@ -163,6 +163,19 @@ const icons: Record<string, string> = {
   telegram_poll_stale_restart: "🤔",
   telegram_poll_stale_restart_full_snapshot: "📊",
   telegram_poll_watchdog_error: "⚙️",
+
+  // v0.3.1 — Sandbox-denial loop-breaker (F3b, MIB-2305 §4) + daemon boot-
+  // failure surface (F8, MIB-2305 §5).
+  // `🪤` (trap) signifies the loop-breaker — pi noticed the model was
+  // looping into the sandbox and emitted an escape message.  New glyph,
+  // distinct from `🛡️` (classifier_block) so operators can tell the two
+  // apart at a glance: classifier-block = pre-exec policy refusal;
+  // loop-broken = post-exec attempt-counter trip.
+  // `💔` (broken-heart) reuses the studio_health_fail glyph for symmetry
+  // — both events represent a critical infrastructure failure surfaced
+  // to the operator (one is studio-side, one is daemon-boot-side).
+  sandbox_denial_loop_broken: "🪤",
+  daemon_boot_failed: "💔",
 };
 
 export function createOperatorLogger(options: OperatorLoggerOptions): OperatorLogger {

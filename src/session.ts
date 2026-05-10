@@ -45,6 +45,7 @@ import { createHash, randomBytes } from "node:crypto";
 
 import type { AppConfig } from "./config.js";
 import { GlobalQueue } from "./lib/chat-queue.js";
+import { monotonicMs as defaultMonotonicMs } from "./lib/clock.js";
 import {
   type SdkAgentSession,
   type SdkLoaded,
@@ -59,7 +60,10 @@ import {
   type TaskStateKind,
   TaskStateManager,
 } from "./lib/task-state.js";
-import { defineSandboxedBashTool } from "./sandbox/wrap-bash.js";
+import {
+  defineSandboxedBashTool,
+  type BashToolResult,
+} from "./sandbox/wrap-bash.js";
 import { classify } from "./guards/classifier.js";
 import type { SandboxPolicy } from "./sandbox/policy.js";
 import type { AuditLog } from "./audit/log.js";
@@ -210,6 +214,14 @@ export interface SessionManagerOpts {
   setTimeoutFn?: (handler: () => void, ms: number) => unknown;
   /** clearTimeout function (for fake-timer tests). Defaults to global clearTimeout. */
   clearTimeoutFn?: (handle: unknown) => void;
+  /**
+   * Monotonic clock injection (v0.3.1 F3b — sandbox-denial loop-breaker).
+   * Defaults to `monotonicMs` from `lib/clock.js` (process.hrtime-backed).
+   * Tests inject a controllable counter so `first_denial_age_ms` math is
+   * deterministic and not perturbed by `Date.now()` mocking elsewhere in
+   * the test (the `now` injection above only controls wall-clock).
+   */
+  monotonicMsFn?: () => number;
 }
 
 /**
@@ -228,6 +240,27 @@ const AUTO_PROMOTE_RE_ARM_DELAYS_MS = [
   300_000, // gap fire 2 → 3
   300_000, // gap fire 3 → 4 (cap)
 ];
+
+/**
+ * v0.3.1 F3b (sandbox-denial loop-breaker, MIB-2305 §4).  Threshold N=3:
+ * after this many CONSECUTIVE bash results that match the two-pronged
+ * denial predicate (`details.sandboxDenied === true` OR `isError &&
+ * content[0].text.startsWith("blocked:")`), SessionManager injects ONE
+ * `system_notice` ChannelEvent on the originating channel + appends ONE
+ * `sandbox_denial_loop_broken` audit row.  One-shot per task — once
+ * fired, additional denials within the same task are silent (the user
+ * already got the escape hatch).  Counter resets:
+ *   - on any successful (non-error) bash result;
+ *   - at task-start (handleInbound's CAS-to-running path).
+ *
+ * Why N=3 (not 2 / 5):
+ *   - N=2 too aggressive: a transient permission glitch followed by a
+ *     real denial would prematurely fire.
+ *   - N=5 too patient: by attempt 5 the model has burned ~30s on dead-
+ *     end attempts and the user is likely already wondering "is it
+ *     stuck?".  3 strikes hits the sweet spot per MIB-2305.
+ */
+const SANDBOX_DENIAL_LOOP_THRESHOLD = 3;
 
 // ---------------------------------------------------------------------------
 // Public — SessionManager
@@ -284,6 +317,20 @@ export class SessionManager {
   // `handleInbound` calls (per plan §"Pitfall #27").
   private readonly tellCooldownMap = new Map<string, number>();
 
+  // v0.3.1 F3b — sandbox-denial loop-breaker per-task counter state.
+  // ALL FOUR fields are reset to their initial values at task-start in
+  // `handleInbound` AFTER the CAS-to-running succeeds (per plan §1.4a +
+  // §"Pitfall #5").  `loopBreakerEmittedThisTask` is one-shot — once
+  // true, it stays true for the remainder of the task even if the
+  // counter resets via a successful bash result, so a model that hits
+  // the trap at attempt 3, recovers, then hits it again at attempt 8
+  // gets ONE notice, not two.  Reset enforces per-task isolation.
+  private consecutiveSandboxDenials = 0;
+  private loopBreakerEmittedThisTask = false;
+  private firstDenialMonotonicMs: number | null = null;
+  private lastCmdHashFirst8: string | null = null;
+  private readonly monotonicMsFn: () => number;
+
   constructor(opts: SessionManagerOpts) {
     this.opts = opts;
     this.globalQueue = opts.globalQueue ?? new GlobalQueue();
@@ -292,6 +339,7 @@ export class SessionManager {
       opts.setTimeoutFn ?? ((h, ms) => setTimeout(h, ms));
     this.clearTimeoutFn =
       opts.clearTimeoutFn ?? ((handle) => clearTimeout(handle as ReturnType<typeof setTimeout>));
+    this.monotonicMsFn = opts.monotonicMsFn ?? defaultMonotonicMs;
   }
 
   /**
@@ -612,6 +660,14 @@ export class SessionManager {
         }
         return;
       }
+
+      // v0.3.1 F3b — reset sandbox-denial loop-breaker counter at task-start.
+      // Per plan §1.4a + §"Pitfall #5": all four fields cleared so the new
+      // task starts with a fresh counter AND a cleared one-shot emitted-flag.
+      // Without this, a task that fired the loop-breaker followed by a NEW
+      // task that immediately hits 3 denials would be silenced (the flag
+      // would still be true from the prior task).
+      this.resetLoopBreakerStateForNewTask();
 
       this.opts.operatorLogger?.info("task_started", {
         task_id: taskId,
@@ -1754,6 +1810,70 @@ export class SessionManager {
       },
     };
 
+    // v0.3.1 F3b — instrumented defineTool used ONLY for the bash tool.
+    // We wrap the tool's `execute` so SessionManager observes every result
+    // (success or failure) without modifying wrap-bash.ts.  The wrapper
+    // forwards the call to the original execute, captures the cmd + result,
+    // then ticks the loop-breaker counter (`onBashResult`) before returning
+    // the result unchanged.  Other tools (tell, confirm, go_background) go
+    // through `sdk.defineTool` directly — no instrumentation needed there.
+    //
+    // The original execute is stored at `__sandbox_inner_execute__` on the
+    // wrapped object; the wrapper reads it from there at call-time (NOT a
+    // closure-captured local).  Tests substitute that property to inject
+    // canned BashToolResults without bypassing the loop-breaker observer
+    // (replacing `wrapped.execute` directly would defeat the wrapper).
+    // Production code never touches `__sandbox_inner_execute__` — it's a
+    // testability seam, not a public API.
+    const instrumentedBashDefineTool = (toolDef: unknown): unknown => {
+      // Defensive: only wrap if the def looks like a bash tool with the
+      // expected execute signature.  Anything else passes through untouched.
+      if (
+        typeof toolDef !== "object" ||
+        toolDef === null ||
+        (toolDef as { name?: unknown }).name !== "bash" ||
+        typeof (toolDef as { execute?: unknown }).execute !== "function"
+      ) {
+        return sdk.defineTool(toolDef);
+      }
+      const def = toolDef as {
+        name: string;
+        execute: (
+          callId: string,
+          params: { command?: string; timeoutMs?: number },
+          signal: AbortSignal | undefined,
+        ) => Promise<BashToolResult>;
+        [k: string]: unknown;
+      };
+      type InnerExec = (
+        callId: string,
+        params: { command?: string; timeoutMs?: number },
+        signal: AbortSignal | undefined,
+      ) => Promise<BashToolResult>;
+      const wrapped: typeof def & { __sandbox_inner_execute__: InnerExec } = {
+        ...def,
+        __sandbox_inner_execute__: def.execute as InnerExec,
+        execute: async (
+          callId: string,
+          params: { command?: string; timeoutMs?: number },
+          signal: AbortSignal | undefined,
+        ): Promise<BashToolResult> => {
+          const inner = wrapped.__sandbox_inner_execute__;
+          const result = await inner(callId, params, signal);
+          // Observer is best-effort — a thrown observer must NEVER crash
+          // the bash call (the agent is mid-tool-loop and a thrown tool
+          // result poisons the agent state).
+          try {
+            this.onBashResult(params.command ?? "", result);
+          } catch {
+            /* observer must never break the bash result */
+          }
+          return result;
+        },
+      };
+      return sdk.defineTool(wrapped);
+    };
+
     const bashTool = defineSandboxedBashTool({
       sandboxPolicy: this.opts.sandboxPolicy,
       classifier: { classify },
@@ -1785,7 +1905,7 @@ export class SessionManager {
         }
         return { approved: false, reason: "rejected" };
       },
-      defineTool: sdk.defineTool,
+      defineTool: instrumentedBashDefineTool,
       audit: {
         classifierBlock: (cmd, reason, severity) => {
           void this.opts.auditLog
@@ -1867,6 +1987,156 @@ export class SessionManager {
     });
 
     return [bashTool, sdk.defineTool(tellDef), sdk.defineTool(confirmDef), sdk.defineTool(goBgDef)];
+  }
+
+  // ---------------------------------------------------------------------
+  // Private — v0.3.1 F3b sandbox-denial loop-breaker
+  // ---------------------------------------------------------------------
+
+  /**
+   * Observer fired by the instrumented bash tool's `execute` wrapper for
+   * EVERY bash result (success, error, denial — all of them).
+   *
+   * Predicate (two-pronged, per plan §F3 architecture):
+   *   - `result.details?.sandboxDenied === true`  ← canonical wrap-bash flag
+   *     populated by IMPL-3 (786085f) from canonical stderr markers; the
+   *     primary signal that survives sandbox-exec / bwrap / locale shifts
+   *     because wrap-bash owns the regex.
+   *   - `result.isError && result.content[0]?.text?.startsWith("blocked:")`
+   *     ← classifier-block / confirm-deny path returning `errorResult()`
+   *     from wrap-bash.ts:354.  No `details` field in that branch (early
+   *     return BEFORE exec), so we fall back to text-prefix match.
+   *
+   * Negative-case discipline (handled implicitly by the predicate):
+   *   - command-not-found / file-not-found / OOM → exitCode != 0 but
+   *     sandboxDenied=false (canonical regex never matches) AND no
+   *     "blocked:" prefix → counter does NOT tick.
+   *   - aborted=true (AbortSignal cancellation) → wrap-bash explicitly
+   *     suppresses sandboxDenied per F3a discipline → no tick.
+   *
+   * Per-task isolation: `loopBreakerEmittedThisTask` is one-shot and only
+   * reset via `resetLoopBreakerStateForNewTask` at task-start (NOT here).
+   * This prevents a recovering-then-relapsing model from spamming the user.
+   */
+  private onBashResult(cmd: string, result: BashToolResult): void {
+    const isDenial =
+      result.details?.sandboxDenied === true ||
+      (result.isError === true &&
+        result.content[0]?.text?.startsWith("blocked:") === true);
+
+    if (isDenial) {
+      if (this.consecutiveSandboxDenials === 0) {
+        this.firstDenialMonotonicMs = this.monotonicMsFn();
+      }
+      this.consecutiveSandboxDenials++;
+      // SHA-256 first 8 hex chars (4 bytes of entropy — collision-resistant
+      // enough for forensic correlation across task lifetimes; matches the
+      // existing `sha256_first8` convention at session.ts:411 / audit-log
+      // schema).  We compute here even when no audit row will fire so the
+      // forensic snapshot is current at the moment of the trip.
+      this.lastCmdHashFirst8 = createHash("sha256")
+        .update(cmd, "utf8")
+        .digest("hex")
+        .slice(0, 8);
+
+      if (
+        this.consecutiveSandboxDenials >= SANDBOX_DENIAL_LOOP_THRESHOLD &&
+        !this.loopBreakerEmittedThisTask
+      ) {
+        const channel = this.currentChannel();
+        const taskId = this.currentTaskId();
+        // If state has drained back to idle between the bash result and
+        // the observer firing (race with /cancel or watchdog), there's no
+        // channel to emit on and no task_id for the audit row.  Silent
+        // drop is correct here: the task is already terminated and the
+        // user already knows.
+        if (channel) {
+          this.injectLoopBreakerNotice(channel);
+          this.loopBreakerEmittedThisTask = true;
+          const ageMs =
+            this.firstDenialMonotonicMs !== null
+              ? this.monotonicMsFn() - this.firstDenialMonotonicMs
+              : 0;
+          // Audit append is fire-and-forget — the forensic value is in the
+          // row landing eventually, NOT in synchronously confirming the
+          // write before returning to the agent.
+          void this.opts.auditLog
+            .append({
+              event: "sandbox_denial_loop_broken",
+              task_id: taskId,
+              channel,
+              sender_id_hash: null,
+              extra: {
+                consecutive_denials: this.consecutiveSandboxDenials,
+                first_denial_age_ms: ageMs,
+                last_cmd_hash_first8: this.lastCmdHashFirst8,
+              },
+            })
+            .catch(() => undefined);
+          this.opts.operatorLogger?.info("sandbox_denial_loop_broken", {
+            task_id: taskId,
+            channel,
+            consecutive_denials: this.consecutiveSandboxDenials,
+            first_denial_age_ms: ageMs,
+          });
+        }
+      }
+    } else if (result.isError !== true) {
+      // Successful tool call — reset the consecutive counter + the
+      // first-denial timestamp + the cmd hash.  The one-shot
+      // `loopBreakerEmittedThisTask` flag stays as-is (per Pitfall #5);
+      // it's reset only by `resetLoopBreakerStateForNewTask` at task-start.
+      this.consecutiveSandboxDenials = 0;
+      this.firstDenialMonotonicMs = null;
+      this.lastCmdHashFirst8 = null;
+    }
+    // else: isError=true but NOT a denial (generic POSIX failure like
+    // command-not-found) — don't tick the counter, don't reset it.  The
+    // counter survives unrelated failures so the model can hit a denial,
+    // hit `bash: foo: command not found` (typo), then hit two more
+    // denials → fires.  This matches the v0.3.1 plan §F3 spec.
+  }
+
+  /**
+   * Emit the user-facing loop-breaker `system_notice` ChannelEvent on the
+   * originating channel (NB-1 fix per plan §1.4b — `level: "warn"`, NOT
+   * `severity`; ChannelEvent declares `level` per src/channels/base.ts:152).
+   *
+   * NO `pi:` prefix — channel formatters add the `ℹ️`/`⚠️` glyph based on
+   * `level` per the v0.3.1 channel-prefix discipline (F1+F2).  Triple-line
+   * options listing keeps the message scannable on mobile (Telegram pre-
+   * formats the list naturally; WhatsApp may reflow but the bullet glyphs
+   * survive).
+   */
+  private injectLoopBreakerNotice(channel: ChannelId): void {
+    const target = this.sinkFor(channel);
+    if (!target) return;
+    const notice: ChannelEvent = {
+      type: "system_notice",
+      level: "warn",
+      text:
+        "sandbox blocked 3 attempts. options:\n" +
+        "  • /unsand from a terminal (one-time per first session)\n" +
+        '  • rephrase as read-only ("can you describe X")\n' +
+        "  • /cancel",
+      ts: this.now(),
+    };
+    void target.send(notice).catch(() => undefined);
+  }
+
+  /**
+   * Reset ALL FOUR per-task loop-breaker fields.  Called from
+   * `handleInbound` after CAS-to-running succeeds so the new task starts
+   * with a fresh counter AND a cleared one-shot emitted-flag.  Without
+   * this, a task that fired the loop-breaker followed by a NEW task that
+   * immediately hits 3 denials would be silenced (the flag would still
+   * be true from the prior task).
+   */
+  private resetLoopBreakerStateForNewTask(): void {
+    this.consecutiveSandboxDenials = 0;
+    this.loopBreakerEmittedThisTask = false;
+    this.firstDenialMonotonicMs = null;
+    this.lastCmdHashFirst8 = null;
   }
 
   // ---------------------------------------------------------------------
