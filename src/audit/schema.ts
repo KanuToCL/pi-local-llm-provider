@@ -175,6 +175,20 @@ export const AuditEventTypeSchema = z.enum([
   "telegram_restart",
   "telegram_restart_failed",
   "telegram_restart_skipped",
+  // v0.3.1 — Sandbox-denial loop-breaker (F3, MIB-2305 §4).
+  // Fires once per task when a per-task counter of consecutive sandbox-denial
+  // results crosses the configured threshold. Payload (extra) carries scalar
+  // forensics: `first_denial_age_ms` (number), `last_cmd_hash_first8`
+  // (string), plus top-level `sender_id_hash` / `channel` / `task_id`.
+  // Operator-logger icon: 🪤. See plan §F3 for the two-pronged predicate.
+  "sandbox_denial_loop_broken",
+  // v0.3.1 — Daemon boot-time failure surface (F8, MIB-2305 §5).
+  // Fires from `start()` BEFORE a non-zero exit (typically exit 2) when a
+  // boot-blocking step fails — most commonly studio-model wait timing out.
+  // Stderr emits a 3-line human-readable message run through redactBotToken
+  // alongside this structured audit row so post-incident review has both a
+  // grep-able event and a human breadcrumb. See plan §F8.
+  "daemon_boot_failed",
 ]);
 
 /**
