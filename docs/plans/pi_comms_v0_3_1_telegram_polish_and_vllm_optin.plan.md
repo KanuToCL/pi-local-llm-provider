@@ -4,10 +4,28 @@
 > **Predecessor**: v0.3 SHIPPED CLEAN (8 elders BLESSED, 1005 tests pass).
 > **Date**: 2026-05-10 PT
 > **Author**: Dev-box Claude (Mac orchestrator)
-> **Plan version**: v2 (folds Round 1 elder findings — 3 NOT-APPROVED + 5 APPROVED-WITH-CONCERNS-with-blockers; ~13 convergent items; major reframings on F1/F2/F3/F8)
+> **Plan version**: v3 (folds Round 2 Adversarial NB-1..NB-4 + Architect NIT-4 + UX I-UX-2..I-UX-3; v2 cleared Architect + UX but Adversarial caught 4 new blockers)
 > **Plan output dir**: `docs/plans/`
 
 **Goal**: Close the four telegram-side UX bugs GB10 found in live use AND ship vLLM as an opt-in backend variant — with empirically verified root causes, real predicates, and zero src/ changes for the backend swap itself.
+
+---
+
+## CHANGES FROM v2 (folded Adversarial Round 2 NEW BLOCKERS)
+
+Adversarial NOT-APPROVED in Round 2 with 4 NEW BLOCKERS that v2's reframings opened. Plan v3 folds:
+
+- **NB-1** — IMPL-4's `system_notice` payload field name `severity` → MUST be `level` per `src/channels/base.ts:150-152` (won't typecheck otherwise). Fixed in §1.4b.
+- **NB-2** — Strip applied at `case "reply"` ONLY misses the `task_completed` mutation path in `src/session.ts:1659-1668` (backgrounded task replies get mutated to task_completed with model's text as `finalMessage`; F1 strip never runs). **Fix**: also apply `stripFalseSuccessPrefix` in `case "task_completed"` against `event.finalMessage`. Defense-in-depth covers ALL emit paths. Fixed in §1.1d.
+- **NB-3** — Strip regex misses leading whitespace before `pi:` (`"  pi: ✅ done."` or `"\n\npi: ✅ done."`). **Fix**: prepend `\s*` to anchor: `/^\s*(?:pi:\s*)?(?:\s*✅\s*done\.?\s*\n?){1,10}/i`. Tests added. Fixed in §1.1a + §1.1e.
+- **NB-4** — `if (!text) return;` at telegram.ts:518 silently drops empty post-strip messages → worse UX than the bug being fixed. **Fix**: strip helper returns `"pi: ok"` if result is empty (instead of `""`). Test for it. Fixed in §1.1a + §1.1e.
+
+PLUS folded:
+- **Architect NIT-4** — `await auditLog.append(...)` (with try/catch) BEFORE `process.exit(2)` so the forensics row actually flushes. Fixed in §1.6d.
+- **Adversarial I-1** — `bootCompleted` flag race window between IPC bind and signal handler install. Install signal handlers BEFORE IPC bind; handlers reference `bootCompleted` via closure. Fixed in §1.6b.
+- **Adversarial I-2** — F8 hermetic test requires NEW harness (existing `daemon-test-harness.ts` only stubs `TelegramPollWatchdog`, not full daemon). Fixed in §1.6f — write minimal `tests/integration/run-cli-boot.test.ts` standalone, no harness dependency.
+- **UX I-UX-2** — F4 studio-doctor "STRANGER" marker mentioned in Architecture but not in implementation skeleton. Architecture line revised to drop the unimplemented promise; F4 stays as a pure scanner without identity-comparison logic (a clean v0.4 follow-up if useful).
+- **UX I-UX-3** — README backend matrix decision tree (above-matrix one-line, NOT additional column). Fixed in §1.5d.
 
 ---
 
@@ -41,7 +59,7 @@ Six independent subsystems, file-disjoint waves:
 
 - **F1 + F2 (unified)**: Kill `✅ done.` at source. Drop `pi: ✅ done. ${event.finalMessage}` prefix from `formatChannelEvent` `task_completed` in BOTH `src/channels/telegram.ts:971` AND `src/channels/whatsapp.ts:1332`. Replace with bare `pi: ${event.finalMessage}` (preserves agent voice marker, drops the marker the model is mimicking). PLUS defensive `stripFalseSuccessPrefix` in `src/lib/sanitize.ts`, applied in `formatChannelEvent` for `event.type === "reply"` ONLY (not post-format), as belt-and-suspenders against future model regression. Phase 5 (v4 prompt rewrite) **DROPPED** entirely — v3 has nothing to remove; v4 becomes a v0.4 ticket if ever needed.
 - **F3 (sandbox-denial loop-breaker)**: Real predicate via two prongs: (a) `BashToolResult.isError && content.text.startsWith("blocked:")` catches classifier-block / confirm-block (canonical per `wrap-bash.ts:215, 223, 236`); (b) NEW field `BashToolResult.details.sandboxDenied: boolean` populated by `runBash` when `result.exitCode !== 0` AND stderr matches `/Permission denied|Operation not permitted|EACCES|Read-only file system|Could not resolve host/`. Per-task counter; one-shot injection. Audit event `sandbox_denial_loop_broken` with extended scalar payload. Operator-logger icon 🪤. Escape message rewritten.
-- **F4 (`studio-doctor.js`)**: Read-only port scanner. Hardcoded `127.0.0.1` (no host env var). Strict input validation. Content sanitization (≤64 chars + ASCII printable). Parallel scans. Structured operator-log line in addition to stdout. Marks rows matching launch-studio.sh's `_EXPECTED_STUDIO_ROOT_ID` vs strangers.
+- **F4 (`studio-doctor.js`)**: Read-only port scanner. Hardcoded `127.0.0.1` (no host env var). Strict input validation. Content sanitization (≤64 chars + ASCII printable). Parallel scans. Structured operator-log line in addition to stdout. (Per UX I-UX-2: identity-comparison against `_EXPECTED_STUDIO_ROOT_ID` deferred to v0.4 — v0.3.1 ships pure scanner, no identity logic.)
 - **F5+F6 (docs)**: GB10 §5B "Known quirks" + `/unsand` mobile followup #27 + README backend-matrix decision tree (UX I-2).
 - **F7 (vLLM opt-in)**: Promote `examples/models.vllm.json` to passing matrix row. `apiKey: "VLLM_API_KEY"` (env-var pattern, NOT literal). `authHeader: false`. New `docs/INSTALL-VLLM.md`. New `scripts/install-vllm.sh` with pinned vLLM version + dry-run + GPU-contention warning + forensic-pointer section. SECURITY.md R34. Verdict marker PENDING until GB10 returns probe.
 - **F8 (`pi-comms run` boot fix)**: Real root cause = SIGTERM-during-boot triggers graceful-shutdown handler exit 0 (PE B1's analysis). Fix: daemon's signal handler distinguishes `bootCompleted` flag — if false, exit 2 not 0. Lift `STUDIO_MODEL_WAIT_MS` and `STUDIO_MODEL_POLL_MS` to `DaemonOpts` for hermetic testing. New `daemon_boot_failed` audit event with structured payload. Three-line stderr message run through `redactBotToken`.
@@ -186,14 +204,29 @@ git commit -m "feat(audit): v0.3.1 event kinds — sandbox_denial_loop_broken + 
  *      events ONLY (not post-format) — catches residual emissions while
  *      the model's training-history influence fades.
  *
- * Anchored at start with optional "pi:" prefix. Capped at 10 iterations
- * to bound worst-case ReDoS surface. Mid-text occurrences are NEVER
- * stripped (the model legitimately uses ✅ as inline content).
+ * Anchored at start (with optional leading whitespace AND optional "pi:"
+ * prefix per Adversarial NB-3 — model can emit "  pi: ✅ done." or
+ * "\npi: ✅ done." with leading whitespace). Capped at 10 iterations to
+ * bound worst-case ReDoS surface. Mid-text occurrences are NEVER stripped
+ * (the model legitimately uses ✅ as inline content).
+ *
+ * Empty-result handling (Adversarial NB-4): if the strip leaves an empty
+ * string (e.g., model emitted literal "pi: ✅ done." with no content),
+ * return a fallback "pi: ok" instead. Otherwise telegram.ts:518's
+ * `if (!text) return` short-circuit silently drops the message — worse
+ * UX than the bug being fixed.
  */
-const FALSE_SUCCESS_PREFIX_RE = /^(?:pi:\s*)?(?:\s*✅\s*done\.?\s*\n?){1,10}/i;
+const FALSE_SUCCESS_PREFIX_RE = /^\s*(?:pi:\s*)?(?:\s*✅\s*done\.?\s*\n?){1,10}/i;
 
 export function stripFalseSuccessPrefix(text: string): string {
-  return text.replace(FALSE_SUCCESS_PREFIX_RE, "");
+  const stripped = text.replace(FALSE_SUCCESS_PREFIX_RE, "");
+  // NB-4: if the original text was non-empty but the strip emptied it,
+  // return a fallback so the channel's empty-text guard doesn't silently
+  // drop the message.
+  if (text.length > 0 && stripped.length === 0) {
+    return "pi: ok";
+  }
+  return stripped;
 }
 ```
 
@@ -211,7 +244,7 @@ case "task_completed":
 
 **1.1c — Same change in `src/channels/whatsapp.ts:1331-1332`** (verify exact line; pattern is identical).
 
-**1.1d — Apply strip in `formatChannelEvent` for `case "reply"` ONLY** (both telegram.ts and whatsapp.ts):
+**1.1d — Apply strip in `formatChannelEvent` for `case "reply"` AND `case "task_completed"`** (both telegram.ts and whatsapp.ts):
 
 ```typescript
 import { stripFalseSuccessPrefix } from "../lib/sanitize.js";
@@ -219,9 +252,17 @@ import { stripFalseSuccessPrefix } from "../lib/sanitize.js";
 // In formatChannelEvent (both channels):
 case "reply":
   return stripFalseSuccessPrefix(event.text);
+
+case "task_completed":
+  // NB-2 defense-in-depth: backgrounded-task replies get mutated to
+  // task_completed in src/session.ts:1659-1668, with the model's reply
+  // text becoming finalMessage. Strip MUST run here too — otherwise the
+  // F1 regression survives through the mutation path the moment a long
+  // task exists.
+  return `pi: ${stripFalseSuccessPrefix(event.finalMessage)}`;
 ```
 
-NOT in the post-`formatChannelEvent` chunkOutbound boundary — that's where the daemon's own task_completed prefix lives, and we've already cleaned it via 1.1b.
+NOT in the post-`formatChannelEvent` chunkOutbound boundary — that's where mixed daemon-injected content lives. The two `case` branches above are the only model-text emission paths.
 
 **1.1e — Tests** (REQUIRED test set):
 
@@ -230,16 +271,22 @@ NOT in the post-`formatChannelEvent` chunkOutbound boundary — that's where the
 - `stripFalseSuccessPrefix("✅ done. text")` → `"text"`
 - `stripFalseSuccessPrefix("pi: ✅ done.\npi: ✅ done. Let me try...")` → `"Let me try..."` (multi-prefix; tests the `{1,10}` quantifier)
 - `stripFalseSuccessPrefix("Plain reply with ✅ done. embedded mid-text")` → unchanged (anchor protection)
-- `stripFalseSuccessPrefix("")` → `""`
+- `stripFalseSuccessPrefix("")` → `""` (empty input → empty output, NOT fallback)
 - `stripFalseSuccessPrefix("done.")` → `"done."` (no marker; unchanged)
-- `stripFalseSuccessPrefix("pi: ✅ done.")` → `""` (full strip; verify chunkOutbound's empty-handling is OK with this OR add a fallback to "pi: ok" if empty post-strip)
+- **NB-3 fixtures**: `stripFalseSuccessPrefix("  pi: ✅ done. text")` → `"text"` (leading whitespace before pi:)
+- **NB-3 fixtures**: `stripFalseSuccessPrefix("\npi: ✅ done. text")` → `"text"` (leading newline before pi:)
+- **NB-3 fixtures**: `stripFalseSuccessPrefix("\n\n  pi: ✅ done.\nfoo")` → `"foo"` (combined whitespace)
+- **NB-4 fixture**: `stripFalseSuccessPrefix("pi: ✅ done.")` → `"pi: ok"` (NOT `""` — fallback prevents silent drop downstream at telegram.ts:518)
+- **NB-4 fixture**: `stripFalseSuccessPrefix("✅ done.")` → `"pi: ok"` (same)
+- Case-insensitive: `stripFalseSuccessPrefix("PI: ✅ DONE. text")` → `"text"`
 
-`tests/telegram-channel.test.ts` regression assertion:
-- `formatChannelEvent({type: "task_completed", finalMessage: "All tests passed."})` → `"pi: All tests passed."` (verify the ✅ done. drop)
-- `formatChannelEvent({type: "reply", text: "pi: ✅ done. The sandbox is broken"})` → `"The sandbox is broken"` (verify strip applies here)
+`tests/telegram-channel.test.ts` regression assertions:
+- `formatChannelEvent({type: "task_completed", finalMessage: "All tests passed."})` → `"pi: All tests passed."` (verify the ✅ done. daemon-prefix drop)
+- `formatChannelEvent({type: "task_completed", finalMessage: "✅ done. The actual answer."})` → `"pi: The actual answer."` (NB-2: verify strip ALSO runs in task_completed branch — this is the backgrounded-task mutation path from session.ts:1659)
+- `formatChannelEvent({type: "reply", text: "pi: ✅ done. The sandbox is broken"})` → `"The sandbox is broken"` (verify strip applies in reply branch)
 
-`tests/whatsapp-channel.test.ts` parity assertion:
-- Same two tests as telegram, against WhatsApp channel.
+`tests/whatsapp-channel.test.ts` parity assertions:
+- Same three tests as telegram, against WhatsApp channel.
 
 **1.1f — Commit**:
 ```bash
@@ -461,7 +508,7 @@ Reset all four fields at task-start in handleInbound's task-creation path.
 private injectLoopBreakerNotice(): void {
   this.opts.sink.send({
     type: "system_notice",
-    severity: "warn",
+    level: "warn",  // NB-1: ChannelEvent declares `level` (not `severity`) per src/channels/base.ts:150-152
     text:
       "sandbox blocked 3 attempts. options:\n" +
       "  • /unsand from a terminal (one-time per first session)\n" +
@@ -471,7 +518,7 @@ private injectLoopBreakerNotice(): void {
 }
 ```
 
-NO `pi:` prefix. Channel formatter adds the `ℹ️`/`⚠️` prefix.
+NO `pi:` prefix. Channel formatter adds the `ℹ️`/`⚠️` prefix per `level`.
 
 **1.4c — Add icon in `src/utils/operator-logger.ts`**:
 
@@ -569,7 +616,11 @@ NOT trip the counter.  Per-task isolation; counter resets at task-start."
 
 **1.5d — Update `README.md`**:
 - Backends matrix: vLLM row → "PASS — verified by gx10-831a YYYY-MM-DD (PENDING)" with link to INSTALL-VLLM.md.
-- Add "Pick this backend if..." column or above-matrix decision tree (UX I-2).
+- **Per UX I-UX-3: pick above-matrix one-line decision tree, NOT additional column** (a 4-column matrix on mobile is unreadable; one-line scans). Format:
+  ```
+  **Pick:** Studio (default, easiest) | Ollama (lowest-config) | vLLM (Linux+CUDA, max throughput)
+  ```
+  One line. Three options. Verb-first guidance. Render this ABOVE the verdict matrix.
 
 **1.5e — Commit**:
 ```bash
@@ -605,14 +656,23 @@ Verdict marker PENDING until GB10 returns probe."
 
 **1.6b — Fix in `src/daemon.ts`**:
 
-Add `bootCompleted` boolean to daemon state. Set to `true` after IPC socket binds (step 17). Modify SIGTERM/SIGINT handler:
+Add `bootCompleted` boolean to daemon state. **Install signal handlers BEFORE IPC socket binds** (per Adversarial I-1 race-window concern), referencing `bootCompleted` via closure. Flip `bootCompleted = true` AFTER IPC bind succeeds (step 17). The handler captures the flag by reference so its current value is read at signal time, not registration time:
 
 ```typescript
+let bootCompleted = false;
+
+// Install handlers EARLY — BEFORE waitForStudioModelLoaded + IPC bind.
+// Otherwise SIGTERM during the boot window falls through to Node default
+// (exit 143) — non-zero so parent sees failure, but no audit row + no
+// graceful shutdown.
 const signalHandler = (sig: NodeJS.Signals) => {
   if (!bootCompleted) {
     // Boot-time shutdown — exit non-zero so parent + autostart see real failure
     operatorLogger.error("daemon_boot_aborted_by_signal", { signal: sig });
-    void auditLog.append({
+    // NIT-4 (Architect): AWAIT the audit append BEFORE exit so the forensics
+    // row actually flushes to disk. Wrapped in try/catch — never block exit
+    // on a logging failure.
+    auditLog.append({
       event: "daemon_boot_failed",
       task_id: null,
       channel: "system",
@@ -621,12 +681,19 @@ const signalHandler = (sig: NodeJS.Signals) => {
         reason: "boot_aborted_by_signal",
         signal: sig,
       },
-    });
-    process.exit(2);
+    }).catch(() => undefined).finally(() => process.exit(2));
+    return;
   }
   // Runtime shutdown — graceful exit 0
   void shutdown(sig).then(() => process.exit(0));
 };
+process.on("SIGTERM", signalHandler);
+process.on("SIGINT", signalHandler);
+
+// ... boot continues ...
+
+// Step 17 — after IPC bind succeeds:
+bootCompleted = true;
 ```
 
 **1.6c — Lift `STUDIO_MODEL_WAIT_MS` + `STUDIO_MODEL_POLL_MS` to `DaemonOpts`**:
@@ -658,7 +725,9 @@ const studioModelPollMs = opts.studioModelPollMs ?? STUDIO_MODEL_POLL_MS;
       `model named in ~/.pi/agent/models.json. Then re-run pi-comms run.\n\n` +
       `If this is your first install: see docs/INSTALL.md §3.\n`
     );
-    void auditLog.append({
+    // NIT-4 (Architect): await before exit so the row flushes; try/catch
+    // ensures we never block exit on a logging failure.
+    await auditLog.append({
       event: "daemon_boot_failed",
       task_id: null,
       channel: "system",
@@ -669,7 +738,7 @@ const studioModelPollMs = opts.studioModelPollMs ?? STUDIO_MODEL_POLL_MS;
         studio_url: studioUrl,
         timeout_ms: studioModelWaitMs,
       },
-    });
+    }).catch(() => undefined);
     process.exit(2);
   }
   throw e;
@@ -691,11 +760,46 @@ const attachExitCode = await runAttach({...}).catch((e) => {
 
 **1.6f — Hermetic test** (`tests/integration/run-cli-boot.test.ts` NEW):
 
-Use the daemon-test-harness with `studioModelWaitMs: 100` injection + a stubbed `fetchFn` that always returns "no models loaded". Assert:
-- `daemon_boot_failed` audit row fires within ~100ms.
-- `process.exit(2)` called.
-- Stderr contains the 3-line message format.
-- No `bot token`-shaped content in stderr.
+**Per Adversarial I-2: do NOT extend the existing `tests/integration/daemon-test-harness.ts`** — that harness only stubs `TelegramPollWatchdog`, not the full daemon boot path. Write a STANDALONE test that calls `start()` directly with options:
+
+```typescript
+import { start, type DaemonOpts } from "../../src/daemon.js";
+
+it("daemon_boot_failed audit + exit 2 when studio model never loads", async () => {
+  const auditCalls: any[] = [];
+  const stubAuditLog = { append: async (entry: any) => { auditCalls.push(entry); } };
+  let exitCode: number | undefined;
+  const origExit = process.exit;
+  // @ts-expect-error
+  process.exit = (code?: number) => { exitCode = code; throw new Error("__exited__"); };
+
+  const stubFetch: typeof fetch = async (url) => {
+    // Always return "no models loaded" so studio-readiness gate times out.
+    return new Response(JSON.stringify({ loaded: [] }), { status: 200 });
+  };
+
+  try {
+    await start({
+      // ... minimal config + injected fetch + tight timeout
+      fetchFn: stubFetch,
+      studioModelWaitMs: 100,
+      studioModelPollMs: 10,
+      // any other required test-mode opts ...
+    } as DaemonOpts);
+  } catch (e) {
+    // expected via __exited__ throw
+  } finally {
+    process.exit = origExit;
+  }
+
+  expect(exitCode).toBe(2);
+  expect(auditCalls.find((c) => c.event === "daemon_boot_failed")).toBeDefined();
+});
+```
+
+Negative case: same setup but stubFetch returns `{loaded: ["the-configured-model"]}` → `start()` succeeds, `bootCompleted = true`, no `daemon_boot_failed` row, no exit.
+
+Stderr-content assertions: capture `process.stderr.write` via spy; verify (a) 3-line format present, (b) no `bot token`-shaped content (use `redactBotToken` inverse check).
 
 **1.6g — Commit**:
 ```bash
@@ -1012,4 +1116,4 @@ Each subagent prompt MUST cite this plan + step number + skill names + commit-me
 
 ---
 
-*Last updated: 2026-05-10 by dev-box orchestrator (Mac), v2 — folds 13 convergent Round 1 elder findings + drops Phase 5 (F2 v4 prompt) per empirical disconfirmation. Ready for narrow re-bless of 3 NOT-APPROVED elders (Architect, Adversarial, UX Advocate).*
+*Last updated: 2026-05-10 by dev-box orchestrator (Mac), v3 — folds Adversarial Round 2 NB-1..NB-4 + Architect NIT-4 + UX I-UX-2..I-UX-3. Architect + UX cleared in Round 2. Ready for narrow Adversarial-only re-bless on plan v3.*
