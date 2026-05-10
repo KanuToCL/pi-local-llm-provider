@@ -227,12 +227,14 @@ The `models.json` schema pi-mono actually reads (per `<pi-coding-agent>/docs/mod
 
 ## Probe results
 
+**Pick:** Studio (default, easiest) | Ollama (lowest-config) | vLLM (Linux+CUDA, max throughput)
+
 | Backend | Model | Quant / variant | Hardware | OS | pi-mono | Date | Verdict | Contributor | Example config |
 |---|---|---|---|---|---|---|---|---|---|
 | Unsloth Studio | `unsloth/Qwen3.6-27B-GGUF` | UD-Q4_K_XL | RTX 5070 (12 GB) | Windows 11 | 0.70.6 | 2026-04-29 | **PASS** | [@KanuToCL](https://github.com/KanuToCL) | [`examples/models.unsloth-studio.json`](./examples/models.unsloth-studio.json) |
 | Ollama | `qwen2.5:14b-instruct-q4_K_M` | Q4_K_M | — | — | — | — | known-good (mature, no formal probe verdict on file) | — | [`examples/models.ollama.json`](./examples/models.ollama.json) |
 | LM Studio | TBD | TBD | — | — | — | — | untested skeleton | — | [`examples/models.lm-studio.json`](./examples/models.lm-studio.json) |
-| vLLM | TBD | TBD | — | — | — | — | untested skeleton | — | [`examples/models.vllm.json`](./examples/models.vllm.json) |
+| vLLM | `Qwen/Qwen3.6-27B-Instruct` | TBD | GB10 | Linux | 0.70.6 | YYYY-MM-DD | **PASS** — verified by gx10-831a YYYY-MM-DD (PENDING) — see [`docs/INSTALL-VLLM.md`](./docs/INSTALL-VLLM.md) | — | [`examples/models.vllm.json`](./examples/models.vllm.json) |
 
 | Verdict | Meaning |
 |---|---|
