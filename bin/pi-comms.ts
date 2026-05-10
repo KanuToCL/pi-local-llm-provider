@@ -667,7 +667,12 @@ async function runRun(opts: RunOptions): Promise<number> {
   //    the daemon was actually broken.  Surface the error to stderr and
   //    return a non-zero code so the parent shell sees the failure.
   const authToken = await loadAuthToken();
-  await runAttach({
+  // AUDIT-D MED fix (post-W2): capture attach exit code so attach failure
+  // surfaces as non-zero exit. Pre-fix the .catch returned 1 but the value
+  // was discarded — function still returned `child.exitCode ?? 0`, which
+  // silently became 0 when the daemon child stayed healthy after attach
+  // failure. That partially un-did F8's explicit-error-propagation intent.
+  const attachExitCode = await runAttach({
     full: opts.full,
     socketPath: opts.socketPath,
     authToken,
@@ -680,7 +685,10 @@ async function runRun(opts: RunOptions): Promise<number> {
 
   // 7. Drain the child. After Ctrl-C it should already be in shutdown.
   await waitForChildExit(child, 5000);
-  return child.exitCode ?? 0;
+  // Attach failure (non-zero) takes precedence over child exit; otherwise
+  // propagate the daemon's own exit code (preserves prior child-status
+  // propagation when attach succeeded).
+  return attachExitCode !== 0 ? attachExitCode : (child.exitCode ?? 0);
 }
 
 // ---------------------------------------------------------------------------
