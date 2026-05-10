@@ -14,13 +14,20 @@
  * synchronous spawn-failure path returns 127 instead of throwing.
  */
 
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir, platform } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 
+import * as exec from "../src/sandbox/exec.js";
 import { detectSandboxMode, execRaw, execSandboxed } from "../src/sandbox/exec.js";
+import {
+  runBash,
+  type BashClassifier,
+  type WrapBashOpts,
+} from "../src/sandbox/wrap-bash.js";
+import type { SandboxPolicy } from "../src/sandbox/policy.js";
 
 let workspace: string;
 const PLAT = platform();
@@ -255,4 +262,268 @@ describe("execSandboxed — timeout + abort", () => {
     },
     20_000
   );
+});
+
+// ---------------------------------------------------------------------------
+// F3a (v0.3.1): wrap-bash sandboxDenied flag from canonical stderr markers
+// ---------------------------------------------------------------------------
+//
+// Per docs/plans/pi_comms_v0_3_1_telegram_polish_and_vllm_optin.plan.md §1.3:
+// `BashToolResult.details.sandboxDenied` must be true iff the wrapped exec
+// returned non-zero AND its stderr matches a canonical sandbox-denial marker
+// (Permission denied / Operation not permitted / EACCES / Read-only file
+// system / Could not resolve host / cannot create directory.*Read-only).
+//
+// We exercise `runBash` with `vi.spyOn`-mocked exec so we can inject specific
+// stderr/exitCode/aborted combinations deterministically without depending
+// on the host sandbox primitive.  IMPL-4's loop-breaker counter consumes
+// this flag (sequential after IMPL-3 per W1.1).
+
+const ALLOW_CLASSIFIER: BashClassifier = {
+  classify: () => ({ decision: "allow" }),
+};
+
+function makeWrapOpts(sandboxed: boolean): WrapBashOpts {
+  return {
+    sandboxPolicy: { isSandboxed: () => sandboxed } as unknown as SandboxPolicy,
+    classifier: ALLOW_CLASSIFIER,
+    workspace: "/tmp/ws",
+    confirmTool: {},
+    invokeConfirm: async () => ({ approved: true }),
+    defineTool: (t) => t,
+  };
+}
+
+describe("wrap-bash details.sandboxDenied (F3a v0.3.1)", () => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let execSandboxedSpy: any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let execRawSpy: any;
+
+  beforeEach(() => {
+    execSandboxedSpy = vi.spyOn(exec, "execSandboxed");
+    execRawSpy = vi.spyOn(exec, "execRaw");
+  });
+
+  afterEach(() => {
+    execSandboxedSpy.mockRestore();
+    execRawSpy.mockRestore();
+  });
+
+  // ── Positive cases (sandboxDenied === true) ──────────────────────────────
+
+  test("Read-only file system (mkdir on /etc) → sandboxDenied=true", async () => {
+    execSandboxedSpy.mockResolvedValue({
+      exitCode: 1,
+      signal: null,
+      stdout: "",
+      stderr: "mkdir: cannot create directory '/etc/foo': Read-only file system\n",
+      timedOut: false,
+      aborted: false,
+    });
+    const r = await runBash(makeWrapOpts(true), { command: "mkdir /etc/foo" }, undefined);
+    expect(r.details?.sandboxDenied).toBe(true);
+    expect(r.details?.exitCode).toBe(1);
+    expect(r.details?.aborted).toBe(false);
+  });
+
+  test("Could not resolve host (bwrap --unshare-net) → sandboxDenied=true", async () => {
+    execSandboxedSpy.mockResolvedValue({
+      exitCode: 6,
+      signal: null,
+      stdout: "",
+      stderr: "curl: (6) Could not resolve host: example.com\n",
+      timedOut: false,
+      aborted: false,
+    });
+    const r = await runBash(
+      makeWrapOpts(true),
+      { command: "curl https://example.com" },
+      undefined
+    );
+    expect(r.details?.sandboxDenied).toBe(true);
+    expect(r.details?.exitCode).toBe(6);
+  });
+
+  test("Operation not permitted (sandbox-exec deny) → sandboxDenied=true", async () => {
+    execSandboxedSpy.mockResolvedValue({
+      exitCode: 1,
+      signal: null,
+      stdout: "",
+      stderr: "ln: /tmp/foo: Operation not permitted\n",
+      timedOut: false,
+      aborted: false,
+    });
+    const r = await runBash(
+      makeWrapOpts(true),
+      { command: "ln -s /etc/passwd /tmp/foo" },
+      undefined
+    );
+    expect(r.details?.sandboxDenied).toBe(true);
+  });
+
+  test("Permission denied (POSIX EACCES) → sandboxDenied=true", async () => {
+    execSandboxedSpy.mockResolvedValue({
+      exitCode: 1,
+      signal: null,
+      stdout: "",
+      stderr: "bash: /etc/shadow: Permission denied\n",
+      timedOut: false,
+      aborted: false,
+    });
+    const r = await runBash(
+      makeWrapOpts(true),
+      { command: "cat /etc/shadow" },
+      undefined
+    );
+    expect(r.details?.sandboxDenied).toBe(true);
+  });
+
+  test("EACCES embedded in interpreter trace → sandboxDenied=true", async () => {
+    execSandboxedSpy.mockResolvedValue({
+      exitCode: 1,
+      signal: null,
+      stdout: "",
+      stderr: "PermissionError: [Errno 13] EACCES: open '/etc/shadow'\n",
+      timedOut: false,
+      aborted: false,
+    });
+    const r = await runBash(
+      makeWrapOpts(true),
+      { command: "python -c \"open('/etc/shadow')\"" },
+      undefined
+    );
+    expect(r.details?.sandboxDenied).toBe(true);
+  });
+
+  test("raw-exec path also sets the flag (unsand mode)", async () => {
+    // Sanity: the predicate is in wrap-bash, not gated on sandboxed=true.
+    // Any non-zero exit + canonical marker trips it regardless of routing.
+    // (IMPL-4 still won't break a loop in unsand mode because /unsand is
+    // explicit user intent — but the FLAG itself is route-agnostic, which
+    // is the simpler/more honest design.)
+    execRawSpy.mockResolvedValue({
+      exitCode: 1,
+      signal: null,
+      stdout: "",
+      stderr: "Permission denied\n",
+      timedOut: false,
+      aborted: false,
+    });
+    const r = await runBash(
+      makeWrapOpts(false),
+      { command: "touch /etc/foo" },
+      undefined
+    );
+    expect(r.details?.sandboxDenied).toBe(true);
+    expect(r.details?.sandboxed).toBe(false);
+  });
+
+  // ── Negative cases (sandboxDenied === false) ──────────────────────────────
+
+  test("command not found (exit 127) → sandboxDenied=false", async () => {
+    execSandboxedSpy.mockResolvedValue({
+      exitCode: 127,
+      signal: null,
+      stdout: "",
+      stderr: "bash: foo: command not found\n",
+      timedOut: false,
+      aborted: false,
+    });
+    const r = await runBash(makeWrapOpts(true), { command: "foo" }, undefined);
+    expect(r.details?.sandboxDenied).toBe(false);
+    expect(r.details?.exitCode).toBe(127);
+  });
+
+  test("file not found (cat /tmp/missing) → sandboxDenied=false", async () => {
+    execSandboxedSpy.mockResolvedValue({
+      exitCode: 1,
+      signal: null,
+      stdout: "",
+      stderr: "cat: /tmp/missing: No such file or directory\n",
+      timedOut: false,
+      aborted: false,
+    });
+    const r = await runBash(
+      makeWrapOpts(true),
+      { command: "cat /tmp/missing" },
+      undefined
+    );
+    expect(r.details?.sandboxDenied).toBe(false);
+  });
+
+  test("OOM kill (SIGKILL exit 137 + 'Killed' stderr) → sandboxDenied=false", async () => {
+    execSandboxedSpy.mockResolvedValue({
+      exitCode: 137,
+      signal: null, // some platforms surface as exitCode rather than signal
+      stdout: "",
+      stderr: "Killed\n",
+      timedOut: false,
+      aborted: false,
+    });
+    const r = await runBash(
+      makeWrapOpts(true),
+      { command: "memory-hog" },
+      undefined
+    );
+    expect(r.details?.sandboxDenied).toBe(false);
+  });
+
+  test("clean success (exit 0, empty stderr) → sandboxDenied=false", async () => {
+    execSandboxedSpy.mockResolvedValue({
+      exitCode: 0,
+      signal: null,
+      stdout: "hi\n",
+      stderr: "",
+      timedOut: false,
+      aborted: false,
+    });
+    const r = await runBash(makeWrapOpts(true), { command: "echo hi" }, undefined);
+    expect(r.details?.sandboxDenied).toBe(false);
+    expect(r.details?.exitCode).toBe(0);
+  });
+
+  test("ABORTED with permission-denied stderr → sandboxDenied=false (aborted takes precedence)", async () => {
+    // Critical negative-case: a /cancel race where the child happened to
+    // hit a permission-denied error before the SIGTERM arrived. The user
+    // already broke any loop with /cancel, so the loop-breaker MUST NOT
+    // also fire on this. Aborted wins.
+    execSandboxedSpy.mockResolvedValue({
+      exitCode: 1,
+      signal: "SIGTERM" as NodeJS.Signals,
+      stdout: "",
+      stderr: "bash: /etc/shadow: Permission denied\n",
+      timedOut: false,
+      aborted: true,
+    });
+    const r = await runBash(
+      makeWrapOpts(true),
+      { command: "cat /etc/shadow" },
+      undefined
+    );
+    expect(r.details?.aborted).toBe(true);
+    expect(r.details?.sandboxDenied).toBe(false);
+  });
+
+  test("classifier-block path → no details object at all (separate predicate prong)", async () => {
+    // Sanity: classifier-block returns errorResult() with no details.
+    // IMPL-4 detects this branch via content[0].text.startsWith("blocked:")
+    // — the F3 predicate is two-pronged for exactly this reason (per plan
+    // §F3 prong-a vs prong-b). sandboxDenied is the prong-b real-exec
+    // signal; this test pins that prong-a does NOT leak through prong-b.
+    const blockClassifier: BashClassifier = {
+      classify: () => ({ decision: "block", reason: "rm -rf /", severity: "critical" }),
+    };
+    const opts: WrapBashOpts = {
+      ...makeWrapOpts(true),
+      classifier: blockClassifier,
+    };
+    const r = await runBash(opts, { command: "rm -rf /" }, undefined);
+    expect(r.isError).toBe(true);
+    expect(r.details).toBeUndefined();
+    expect(r.content[0]?.text.startsWith("blocked:")).toBe(true);
+    // exec was never called — classifier short-circuited.
+    expect(execSandboxedSpy).not.toHaveBeenCalled();
+    expect(execRawSpy).not.toHaveBeenCalled();
+  });
 });

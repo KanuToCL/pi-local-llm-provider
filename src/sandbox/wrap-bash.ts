@@ -157,8 +157,54 @@ export interface BashToolResult {
     timedOut: boolean;
     aborted: boolean;
     sandboxed: boolean;
+    /**
+     * v0.3.1 (F3a): true when the wrapped exec returned non-zero AND stderr
+     * matches a canonical sandbox-denial marker. Used by SessionManager's
+     * loop-breaker (per plan §F3 / IMPL-4) to count consecutive
+     * sandbox-denials and inject an escape message after threshold N.
+     *
+     * NOT set when:
+     *   - generic POSIX failures (file-not-found, command-not-found, OOM)
+     *   - classifier-block / confirm-block (those return errorResult("blocked: ...")
+     *     and are detected via the "blocked:" text prefix instead)
+     *   - aborted=true (AbortSignal-driven cancellation, NOT policy denial —
+     *     a /cancel race with a sandbox-denied stderr should NOT trip the
+     *     loop-breaker because the user already broke the loop)
+     *
+     * Canonical markers (regex SANDBOX_DENIAL_RE below):
+     *   /Permission denied|Operation not permitted|EACCES|Read-only file system|Could not resolve host|cannot create directory.*Read-only/
+     *
+     * The markers are bwrap/sandbox-exec failure modes; we observe them in
+     * stderr because the kernel emits them on the sandbox-denied syscall.
+     * Locale note: English-only markers; non-English locales (fr_FR, etc.)
+     * silently bypass — accepted limitation per v0.3.1 scope.
+     */
+    sandboxDenied?: boolean;
   };
 }
+
+/**
+ * Canonical stderr markers that indicate a sandbox / network / RO-FS denial.
+ *
+ *   - `Permission denied` — POSIX EACCES surface message (e.g. `bash: foo:
+ *     Permission denied`, `mkdir: Permission denied`).
+ *   - `Operation not permitted` — EPERM, the marker macOS sandbox-exec emits
+ *     when its profile denies a syscall.
+ *   - `EACCES` — bare error code, sometimes embedded in interpreter
+ *     diagnostics (e.g. python tracebacks).
+ *   - `Read-only file system` — EROFS, hit when bwrap mounts /usr ro.
+ *   - `Could not resolve host` — DNS failure under bwrap's `--unshare-net`.
+ *   - `cannot create directory.*Read-only` — narrower mkdir-on-RO-fs phrasing
+ *     coreutils emits on some platforms.
+ *
+ * Detection runs in `runBash` AFTER exec returns and is gated on
+ * `result.exitCode !== 0` AND `result.aborted === false` (see populate site).
+ *
+ * Locale: English markers only. Non-English locales (fr_FR, ja_JP, etc.)
+ * silently bypass — accepted limitation per v0.3.1 scope.
+ */
+const SANDBOX_DENIAL_RE =
+  /Permission denied|Operation not permitted|EACCES|Read-only file system|Could not resolve host|cannot create directory.*Read-only/;
 
 /**
  * Build the bash tool definition. Returns whatever `defineTool` returned
@@ -271,6 +317,19 @@ export async function runBash(
     /* audit sinks must never break the wrapper */
   }
 
+  // F3a (v0.3.1): populate the canonical sandbox-denial flag for IMPL-4's
+  // loop-breaker counter to consume.  Negative-case discipline:
+  //   - aborted=true ⇒ NEVER set (signal-driven cancellation, not policy denial)
+  //   - exitCode=0   ⇒ NEVER set (success can't be a denial)
+  // We deliberately do NOT also gate on `timedOut` because a sandbox-denied
+  // syscall that wedges the child past the timeout (rare but possible on
+  // Linux fork-bombs under cgroup limits) is still legitimately a denial —
+  // the timeout just won the kill race after the deny.
+  const sandboxDenied =
+    !result.aborted &&
+    result.exitCode !== 0 &&
+    SANDBOX_DENIAL_RE.test(result.stderr);
+
   return {
     content: [
       {
@@ -287,6 +346,7 @@ export async function runBash(
       timedOut: result.timedOut,
       aborted: result.aborted,
       sandboxed,
+      sandboxDenied,
     },
   };
 }
