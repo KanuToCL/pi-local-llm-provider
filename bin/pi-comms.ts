@@ -20,9 +20,13 @@
  *     daemon first (which materializes the token).
  */
 
+import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
+import { mkdir, open } from "node:fs/promises";
+import { connect } from "node:net";
 import { homedir, platform } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
 import { AuditLog } from "../src/audit/log.js";
@@ -448,6 +452,227 @@ async function runDoctor(): Promise<number> {
 }
 
 // ---------------------------------------------------------------------------
+// `pi-comms run` — foreground daemon + attach in one process group.
+//
+// Spawns the daemon as a child sharing this terminal's process group, waits
+// for the IPC socket to become connectable, then runs the normal attach
+// loop. SIGINT (Ctrl-C) is delivered by the kernel to the whole foreground
+// group, so the daemon shuts down gracefully on its own; the parent
+// suppresses its default exit until the child has drained.
+// ---------------------------------------------------------------------------
+
+interface RunOptions {
+  full: boolean;
+  socketPath: string;
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") return false;
+    if (code === "EPERM") return true;
+    return false;
+  }
+}
+
+function trySocketConnect(socketPath: string): Promise<boolean> {
+  return new Promise((res) => {
+    const s = connect(socketPath);
+    const done = (ok: boolean) => {
+      try {
+        s.destroy();
+      } catch {}
+      res(ok);
+    };
+    s.once("connect", () => done(true));
+    s.once("error", () => done(false));
+  });
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function waitForDaemonReady(args: {
+  socketPath: string;
+  child: ChildProcess;
+  timeoutMs: number;
+}): Promise<boolean> {
+  const deadline = Date.now() + args.timeoutMs;
+  while (Date.now() < deadline) {
+    if (args.child.exitCode !== null || args.child.signalCode !== null) {
+      return false;
+    }
+    if (await trySocketConnect(args.socketPath)) return true;
+    await delay(150);
+  }
+  return false;
+}
+
+function resolveDaemonInvocation():
+  | { cmd: string; args: string[]; cwd: string }
+  | null {
+  const here = fileURLToPath(import.meta.url);
+  // bin/pi-comms.ts → repoRoot; dist/bin/pi-comms.js → repoRoot/dist (then .. → repoRoot).
+  // Walk up looking for package.json so both dev and built layouts work.
+  let repoRoot = resolve(dirname(here), "..");
+  for (let i = 0; i < 4; i++) {
+    if (existsSync(join(repoRoot, "package.json"))) break;
+    const parent = dirname(repoRoot);
+    if (parent === repoRoot) return null;
+    repoRoot = parent;
+  }
+  if (!existsSync(join(repoRoot, "package.json"))) return null;
+
+  const distEntry = join(repoRoot, "dist", "src", "daemon.js");
+  if (existsSync(distEntry)) {
+    return { cmd: process.execPath, args: [distEntry], cwd: repoRoot };
+  }
+  const tsx = join(repoRoot, "node_modules", ".bin", "tsx");
+  const srcEntry = join(repoRoot, "src", "daemon.ts");
+  if (existsSync(tsx) && existsSync(srcEntry)) {
+    return { cmd: tsx, args: [srcEntry], cwd: repoRoot };
+  }
+  return null;
+}
+
+async function waitForChildExit(child: ChildProcess, graceMs: number): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  await new Promise<void>((res) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      res();
+    };
+    const term = setTimeout(() => {
+      try {
+        child.kill("SIGTERM");
+      } catch {}
+      const kill = setTimeout(() => {
+        try {
+          child.kill("SIGKILL");
+        } catch {}
+        finish();
+      }, 3000);
+      child.once("exit", () => {
+        clearTimeout(kill);
+        finish();
+      });
+    }, graceMs);
+    child.once("exit", () => {
+      clearTimeout(term);
+      finish();
+    });
+  });
+}
+
+async function runRun(opts: RunOptions): Promise<number> {
+  // 1. Refuse if a live daemon already holds the lock. Stale pidfiles are
+  //    fine — the daemon's own boot path reaps them.
+  const lockPath = join(DEFAULT_HOME, "daemon.pid");
+  if (existsSync(lockPath)) {
+    const raw = readFileSync(lockPath, "utf8").trim();
+    const pid = Number(raw);
+    if (Number.isFinite(pid) && pid > 0 && isProcessAlive(pid)) {
+      process.stderr.write(
+        `pi-comms: a daemon is already running (pid=${pid}).\n` +
+          `  attach:  pi-comms\n` +
+          `  stop it: pi-comms shutdown\n`
+      );
+      return 1;
+    }
+  }
+
+  // 2. Resolve the daemon entry. Prefer compiled JS; fall back to tsx.
+  const invocation = resolveDaemonInvocation();
+  if (!invocation) {
+    process.stderr.write(
+      "pi-comms: cannot start daemon — neither dist/daemon.js nor node_modules/.bin/tsx is present.\n" +
+        "  build:   npm run build\n" +
+        "  install: npm install\n"
+    );
+    return 2;
+  }
+
+  // 3. Open append-mode log files for the daemon's stdout/stderr so they
+  //    don't interleave with attach output.
+  await mkdir(DEFAULT_HOME, { recursive: true });
+  const stdoutLog = join(DEFAULT_HOME, "run.stdout.log");
+  const stderrLog = join(DEFAULT_HOME, "run.stderr.log");
+  const stdoutFh = await open(stdoutLog, "a");
+  const stderrFh = await open(stderrLog, "a");
+
+  const child = spawn(invocation.cmd, invocation.args, {
+    stdio: ["ignore", stdoutFh.fd, stderrFh.fd],
+    detached: false,
+    env: process.env,
+    // The daemon resolves prompts/coding-agent.v3.txt relative to cwd —
+    // match the convention used by `npm run daemon` and the systemd unit.
+    cwd: invocation.cwd,
+  });
+  // The child has duplicated the fds; release ours.
+  await stdoutFh.close();
+  await stderrFh.close();
+
+  process.stdout.write(
+    `pi-comms: daemon started (pid=${child.pid}). logs: ${stdoutLog}\n`
+  );
+
+  // 4. Suppress immediate parent exit on Ctrl-C — let the daemon, which
+  //    received the same SIGINT via the process group, drain first.
+  let interrupted = false;
+  const onSignal = (sig: NodeJS.Signals) => {
+    if (interrupted) return;
+    interrupted = true;
+    process.stderr.write(
+      `\npi-comms: ${sig} received — waiting for daemon to shut down...\n`
+    );
+  };
+  process.on("SIGINT", onSignal);
+  process.on("SIGTERM", onSignal);
+
+  // 5. Wait for the IPC socket to become connectable, or bail if the
+  //    daemon dies during boot.
+  const ready = await waitForDaemonReady({
+    socketPath: opts.socketPath,
+    child,
+    timeoutMs: 30_000,
+  });
+  if (!ready) {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      process.stderr.write(
+        `pi-comms: daemon exited before becoming ready (code=${child.exitCode}, signal=${child.signalCode}). See ${stderrLog}\n`
+      );
+      return child.exitCode ?? 1;
+    }
+    process.stderr.write(
+      `pi-comms: daemon did not become ready within 30s. See ${stderrLog}\n`
+    );
+    try {
+      child.kill("SIGTERM");
+    } catch {}
+    await waitForChildExit(child, 1000);
+    return 1;
+  }
+
+  // 6. Token is materialized at this point — load it and attach.
+  const authToken = await loadAuthToken();
+  await runAttach({
+    full: opts.full,
+    socketPath: opts.socketPath,
+    authToken,
+  }).catch(() => 0);
+
+  // 7. Drain the child. After Ctrl-C it should already be in shutdown.
+  await waitForChildExit(child, 5000);
+  return child.exitCode ?? 0;
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -458,6 +683,7 @@ function printUsage(): void {
       "",
       "Usage:",
       "  pi-comms                       # alias for `attach`",
+      "  pi-comms run [--full]          # start daemon in foreground + attach (Ctrl-C stops both)",
       "  pi-comms attach [--full]       # attach to the daemon's event stream",
       "  pi-comms status                # one-shot daemon status",
       "  pi-comms send <text>           # one-shot inject a user message",
@@ -502,6 +728,21 @@ async function main(): Promise<number> {
   }
 
   const socketPath = defaultSocketPath();
+
+  // `run` boots the daemon itself, so it loads the token AFTER spawn —
+  // skip the upfront token check.
+  if (sub === "run") {
+    const rest = argv.slice(1);
+    const parsed = parseArgs({
+      args: rest,
+      options: { full: { type: "boolean", default: false } },
+      allowPositionals: true,
+    });
+    return runRun({
+      full: !!parsed.values.full,
+      socketPath,
+    });
+  }
 
   // Token required for all daemon-touching subcommands.
   const authToken = await loadAuthToken();

@@ -14,6 +14,9 @@
   },
   "type": "module",
   "private": true,
+  "bin": {
+    "pi-comms": "bin/pi-comms.mjs"
+  },
   "engines": {
     "node": ">=20"
   },
@@ -23,6 +26,7 @@
     "spike": "tsx scripts/sdk-spike.ts",
     "daemon": "tsx src/daemon.ts",
     "cli": "tsx bin/pi-comms.ts",
+    "start": "tsx bin/pi-comms.ts run",
     "build": "tsc -p tsconfig.json",
     "test": "vitest run",
     "test:watch": "vitest",
